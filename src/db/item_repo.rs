@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -10,8 +10,8 @@ use crate::db::{
 };
 use crate::domain::fractional_index;
 use crate::domain::{
-    AssigneeId, DomainError, FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus,
-    MAX_FEATURE_DEPTH, Priority, ProjectId,
+    AssigneeId, DomainError, FeatureProgress, FeatureWorkItem, Item, ItemId, ItemKind,
+    ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +217,193 @@ pub fn query_feature_tree(
         .map_err(map_sqlite_err)?;
 
     rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+/// Executes the recursive Feature Tree CTE scoped to `root_feature_id` and its descendants.
+pub fn query_feature_subtree(
+    conn: &Connection,
+    project_id: ProjectId,
+    root_feature_id: ItemId,
+) -> Result<Vec<FeatureTreeNode>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE feature_tree AS (
+                SELECT
+                    id,
+                    project_id,
+                    parent_feature_id,
+                    item_key,
+                    title,
+                    status,
+                    priority,
+                    assignee_id,
+                    sort_order,
+                    0 AS depth,
+                    sort_order AS sort_path
+                FROM items
+                WHERE project_id = ?1
+                  AND id = ?2
+                  AND kind = 'feature'
+                  AND deleted_at IS NULL
+
+                UNION ALL
+
+                SELECT
+                    c.id,
+                    c.project_id,
+                    c.parent_feature_id,
+                    c.item_key,
+                    c.title,
+                    c.status,
+                    c.priority,
+                    c.assignee_id,
+                    c.sort_order,
+                    ft.depth + 1 AS depth,
+                    ft.sort_path || '/' || c.sort_order AS sort_path
+                FROM items c
+                JOIN feature_tree ft ON c.parent_feature_id = ft.id
+                WHERE c.kind = 'feature'
+                  AND c.deleted_at IS NULL
+                  AND ft.depth < 31
+            )
+            SELECT
+                id, project_id, parent_feature_id, item_key, title, status,
+                priority, assignee_id, sort_order, depth, sort_path
+            FROM feature_tree
+            ORDER BY sort_path ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(
+            params![uuid_to_sql(project_id.0), uuid_to_sql(root_feature_id.0)],
+            |row| {
+                let parent_opt: Option<String> = row.get(2)?;
+                let parent_feature_id = parent_opt
+                    .map(|raw| parse_uuid_col(2, raw).map(ItemId::from_uuid))
+                    .transpose()?;
+                let status_raw: String = row.get(5)?;
+                let status = parse_domain_col(5, ItemStatus::from_db_str(&status_raw))?;
+                let priority_raw: String = row.get(6)?;
+                let priority = parse_domain_col(6, Priority::from_db_str(&priority_raw))?;
+                let assignee_opt: Option<String> = row.get(7)?;
+                let assignee_id = assignee_opt
+                    .map(|raw| parse_uuid_col(7, raw).map(AssigneeId::from_uuid))
+                    .transpose()?;
+                let depth_i64: i64 = row.get(9)?;
+                let depth = usize::try_from(depth_i64).unwrap_or(0);
+
+                Ok(FeatureTreeNode {
+                    id: ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
+                    project_id: ProjectId::from_uuid(parse_uuid_col(1, row.get(1)?)?),
+                    parent_feature_id,
+                    item_key: row.get(3)?,
+                    title: row.get(4)?,
+                    status,
+                    priority,
+                    assignee_id,
+                    sort_order: row.get(8)?,
+                    depth,
+                    sort_path: row.get(10)?,
+                })
+            },
+        )
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+/// Executes the deduplicated subtree progress roll-up CTE (`DATA_MODEL.md` §4.5 / `INV-11`).
+pub fn query_feature_progress_rollup(
+    conn: &Connection,
+    project_id: ProjectId,
+) -> Result<HashMap<ItemId, FeatureProgress>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE feature_closure(root_id, descendant_id, hop) AS (
+                SELECT id, id, 0
+                FROM items
+                WHERE project_id = ?1
+                  AND kind = 'feature'
+                  AND deleted_at IS NULL
+                UNION ALL
+                SELECT fc.root_id, c.id, fc.hop + 1
+                FROM feature_closure fc
+                JOIN items c ON c.parent_feature_id = fc.descendant_id
+                WHERE c.kind = 'feature'
+                  AND c.deleted_at IS NULL
+                  AND fc.hop < 31
+            ),
+            distinct_subtree_wis AS (
+                SELECT DISTINCT
+                    fc.root_id AS feature_id,
+                    wi.id AS work_item_id,
+                    wi.status AS wi_status
+                FROM feature_closure fc
+                JOIN feature_work_items fwi ON fwi.feature_id = fc.descendant_id
+                JOIN items wi ON wi.id = fwi.work_item_id
+                WHERE wi.deleted_at IS NULL
+                  AND wi.status != 'cancelled'
+            ),
+            wi_rollup AS (
+                SELECT
+                    feature_id,
+                    COUNT(*) AS wi_total,
+                    SUM(CASE WHEN wi_status = 'done' THEN 1 ELSE 0 END) AS wi_done
+                FROM distinct_subtree_wis
+                GROUP BY feature_id
+            ),
+            descendant_feature_rollup AS (
+                SELECT
+                    fc.root_id AS feature_id,
+                    COUNT(*) AS feat_total,
+                    SUM(CASE WHEN df.status = 'done' THEN 1 ELSE 0 END) AS feat_done
+                FROM feature_closure fc
+                JOIN items df ON df.id = fc.descendant_id
+                WHERE fc.hop > 0
+                  AND df.status != 'cancelled'
+                GROUP BY fc.root_id
+            )
+            SELECT
+                f.id AS feature_id,
+                COALESCE(w.wi_done, 0) AS work_items_done,
+                COALESCE(w.wi_total, 0) AS work_items_total,
+                COALESCE(d.feat_done, 0) AS child_features_done,
+                COALESCE(d.feat_total, 0) AS child_features_total
+            FROM items f
+            LEFT JOIN wi_rollup w ON w.feature_id = f.id
+            LEFT JOIN descendant_feature_rollup d ON d.feature_id = f.id
+            WHERE f.project_id = ?1
+              AND f.kind = 'feature'
+              AND f.deleted_at IS NULL;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(project_id.0)], |row| {
+            let feature_id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+            let wi_done: i64 = row.get(1)?;
+            let wi_total: i64 = row.get(2)?;
+            let feat_done: i64 = row.get(3)?;
+            let feat_total: i64 = row.get(4)?;
+            Ok((
+                feature_id,
+                FeatureProgress {
+                    work_items_done: usize::try_from(wi_done).unwrap_or(0),
+                    work_items_total: usize::try_from(wi_total).unwrap_or(0),
+                    child_features_done: usize::try_from(feat_done).unwrap_or(0),
+                    child_features_total: usize::try_from(feat_total).unwrap_or(0),
+                },
+            ))
+        })
+        .map_err(map_sqlite_err)?;
+
+    let mut map = HashMap::new();
+    for pair in rows {
+        let (fid, progress) = pair.map_err(map_sqlite_err)?;
+        map.insert(fid, progress);
+    }
+    Ok(map)
 }
 
 /// Returns zero-based depth of a Feature (`0` for root Feature).

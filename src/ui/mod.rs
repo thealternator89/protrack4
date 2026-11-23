@@ -1,5 +1,6 @@
 pub mod inspector;
 pub mod modals;
+pub mod outline_view;
 pub mod shell;
 pub mod sidebar;
 pub mod unallocated_view;

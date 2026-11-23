@@ -188,6 +188,8 @@ pub fn load_project_snapshot(
         }
     }
 
+    let progress_by_feature = item_repo::query_feature_progress_rollup(conn, project_id)?;
+
     let trash_count_i64: i64 = conn
         .query_row(
             "SELECT COUNT(DISTINCT trash_root_id) FROM items WHERE project_id = ?1 AND deleted_at IS NOT NULL;",
@@ -205,6 +207,7 @@ pub fn load_project_snapshot(
         tags,
         feature_work_items,
         item_tags,
+        progress_by_feature,
         trash_count,
     })
 }
@@ -1718,6 +1721,283 @@ mod tests {
             vec![tag_a_ui.id]
         );
         assert_eq!(list_tags_for_project(&conn, proj_b.id).unwrap(), vec![tag_b_bug]);
+    }
+
+    #[test]
+    fn inv11_deduplicated_progress_rollup_cte_and_subtree_query() {
+        use rusqlite::TransactionBehavior;
+
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, UpdateItemFieldsInput, create_feature,
+            create_work_item, get_item, query_feature_progress_rollup, query_feature_subtree,
+            update_item_fields,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::domain::{FeatureProgress, ItemStatus, Priority, ProjectStatus};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "ProgressCteTest").unwrap();
+
+        let pid = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let p = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Rollup".to_string(),
+                    key_prefix: "ROL".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            p.id
+        };
+
+        let (f1, f2a, f2b, f_empty, f_sub_done, f_sub_todo, f_leaf, wi_todo) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let f1 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Parent F1".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                },
+            )
+            .unwrap();
+            let f2a = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: Some(f1.id),
+                    title: "Child F2a".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                },
+            )
+            .unwrap();
+            let f2b = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: Some(f1.id),
+                    title: "Child F2b".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                },
+            )
+            .unwrap();
+
+            // Shared Done WI attached to both F2a and F2b
+            let _wi_shared = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Shared done task".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Done,
+                    priority: Priority::High,
+                    feature_ids: vec![f2a.id, f2b.id],
+                },
+            )
+            .unwrap();
+
+            // Open WI on F2b
+            let wi_todo = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Remaining task".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Low,
+                    feature_ids: vec![f2b.id],
+                },
+            )
+            .unwrap();
+
+            // Cancelled WI on F2a (excluded from denominators)
+            let _wi_cancel = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Cancelled task".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Cancelled,
+                    priority: Priority::None,
+                    feature_ids: vec![f2a.id],
+                },
+            )
+            .unwrap();
+
+            // Empty-WI fallback tree: F_empty has 1 cancelled WI + 3 child Features (Done, Todo, Cancelled)
+            let f_empty = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Empty WI Feature".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::InProgress,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let f_sub_done = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: Some(f_empty.id),
+                    title: "Sub Done".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Done,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let f_sub_todo = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: Some(f_empty.id),
+                    title: "Sub Todo".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let _f_sub_cancel = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: Some(f_empty.id),
+                    title: "Sub Cancelled".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Cancelled,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let _wi_empty_cancel = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Cancelled in empty feature".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Cancelled,
+                    priority: Priority::None,
+                    feature_ids: vec![f_empty.id],
+                },
+            )
+            .unwrap();
+
+            let f_leaf = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Leaf Feature".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+            (f1, f2a, f2b, f_empty, f_sub_done, f_sub_todo, f_leaf, wi_todo)
+        };
+
+        let rollup = query_feature_progress_rollup(&conn, pid).unwrap();
+        let snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap.progress_by_feature, rollup);
+
+        // Shared WI counted once under F1; cancelled WI excluded: 1/2 (50%)
+        assert_eq!(
+            rollup.get(&f1.id).copied(),
+            Some(FeatureProgress {
+                work_items_done: 1,
+                work_items_total: 2,
+                child_features_done: 0,
+                child_features_total: 2,
+            })
+        );
+        assert_eq!(snap.feature_progress_detail(f1.id).detailed_label(), "1/2 (50%)");
+        assert_eq!(
+            rollup.get(&f2a.id).copied(),
+            Some(FeatureProgress {
+                work_items_done: 1,
+                work_items_total: 1,
+                child_features_done: 0,
+                child_features_total: 0,
+            })
+        );
+        assert_eq!(
+            rollup.get(&f2b.id).copied(),
+            Some(FeatureProgress {
+                work_items_done: 1,
+                work_items_total: 2,
+                child_features_done: 0,
+                child_features_total: 0,
+            })
+        );
+
+        // Empty-WI fallback: 1 Done / 2 non-cancelled child Features -> 50%
+        let empty_prog = snap.feature_progress_detail(f_empty.id);
+        assert!(empty_prog.is_using_feature_fallback());
+        assert_eq!(empty_prog.effective_counts(), (1, 2));
+        assert_eq!(empty_prog.detailed_label(), "1/2 (50%)");
+
+        // Truly empty leaf
+        let leaf_prog = snap.feature_progress_detail(f_leaf.id);
+        assert!(leaf_prog.is_empty());
+        assert_eq!(leaf_prog.detailed_label(), "—");
+
+        // Mark wi_todo Done -> F1 becomes 2/2 (100%), while F1 & F2b statuses stay Todo (INV-10)
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            update_item_fields(
+                &tx,
+                UpdateItemFieldsInput {
+                    item_id: wi_todo.id,
+                    status: Some(ItemStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let snap_after = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(
+            snap_after.feature_progress_detail(f1.id).detailed_label(),
+            "2/2 (100%)"
+        );
+        assert!(snap_after.feature_progress_detail(f1.id).is_complete());
+        assert_eq!(get_item(&conn, f1.id).unwrap().status, ItemStatus::Todo);
+        assert_eq!(get_item(&conn, f2b.id).unwrap().status, ItemStatus::Todo);
+
+        // query_feature_subtree scopes to F_empty and its descendants starting at depth 0
+        let subtree = query_feature_subtree(&conn, pid, f_empty.id).unwrap();
+        assert_eq!(subtree[0].id, f_empty.id);
+        assert_eq!(subtree[0].depth, 0);
+        let child_ids: Vec<_> = subtree[1..].iter().map(|n| n.id).collect();
+        assert!(child_ids.contains(&f_sub_done.id));
+        assert!(child_ids.contains(&f_sub_todo.id));
+        assert!(!child_ids.contains(&f1.id));
+        assert_eq!(subtree.len(), 4);
     }
 }
 

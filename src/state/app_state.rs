@@ -279,6 +279,17 @@ impl AppState {
 
                 app.project_store.update(cx, |store, cx| {
                     store.apply_workspace_overview(active_path, overview);
+                    if let Some(created_id) = effect.created_item_id
+                        && store
+                            .snapshot()
+                            .and_then(|s| s.item(created_id))
+                            .is_some_and(|item| {
+                                item.is_active()
+                                    && item.kind == crate::domain::ItemKind::Feature
+                            })
+                    {
+                        store.expand_feature(created_id);
+                    }
                     if let Some(item_id) = effect.selected_item_id {
                         store.expand_ancestors_of(item_id);
                         store.select_item(Some(item_id));

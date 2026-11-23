@@ -94,6 +94,7 @@ pub struct ProjectStore {
     snapshot: Option<ProjectSnapshot>,
     active_tab: CenterViewTab,
     selected_item_id: Option<ItemId>,
+    focused_feature_id: Option<ItemId>,
     expanded_features: HashSet<ItemId>,
     sidebar_open: bool,
     inspector_open: bool,
@@ -114,6 +115,10 @@ impl ProjectStore {
             .first()
             .map(|item| item.id)
             .or_else(|| snapshot.active_items().first().map(|item| item.id));
+        let focused_feature_id = snapshot
+            .child_features(None)
+            .first()
+            .map(|item| item.id);
 
         Self {
             workspace_path: None,
@@ -129,6 +134,7 @@ impl ProjectStore {
             snapshot: Some(snapshot),
             active_tab: CenterViewTab::Outline,
             selected_item_id,
+            focused_feature_id,
             expanded_features,
             sidebar_open: true,
             inspector_open: true,
@@ -145,6 +151,7 @@ impl ProjectStore {
             snapshot: None,
             active_tab: CenterViewTab::Outline,
             selected_item_id: None,
+            focused_feature_id: None,
             expanded_features: HashSet::new(),
             sidebar_open: !prefs.sidebar_collapsed,
             inspector_open: prefs.inspector_open,
@@ -203,6 +210,14 @@ impl ProjectStore {
             .filter(|item| item.is_active())
     }
 
+    pub fn focused_feature_id(&self) -> Option<ItemId> {
+        self.focused_feature_id
+    }
+
+    pub fn set_focused_feature(&mut self, id: Option<ItemId>) {
+        self.focused_feature_id = id;
+    }
+
     pub fn expanded_features(&self) -> &HashSet<ItemId> {
         &self.expanded_features
     }
@@ -225,6 +240,14 @@ impl ProjectStore {
 
     pub fn select_item(&mut self, id: Option<ItemId>) {
         self.selected_item_id = id;
+        if let Some(item_id) = id
+            && let Some(snapshot) = &self.snapshot
+            && let Some(item) = snapshot.item(item_id)
+            && item.is_active()
+            && item.kind == ItemKind::Feature
+        {
+            self.focused_feature_id = Some(item_id);
+        }
     }
 
     pub fn set_active_tab(&mut self, tab: CenterViewTab) {
@@ -331,12 +354,14 @@ impl ProjectStore {
         self.assignees.clear();
         self.snapshot = None;
         self.selected_item_id = None;
+        self.focused_feature_id = None;
         self.expanded_features.clear();
     }
 
     fn reconcile_selection(&mut self, reset_tree_and_selection: bool) {
         let Some(snapshot) = &self.snapshot else {
             self.selected_item_id = None;
+            self.focused_feature_id = None;
             self.expanded_features.clear();
             return;
         };
@@ -355,11 +380,19 @@ impl ProjectStore {
                 .first()
                 .map(|item| item.id)
                 .or_else(|| snapshot.active_items().first().map(|item| item.id));
+            self.focused_feature_id = snapshot.child_features(None).first().map(|item| item.id);
             return;
         }
 
         self.expanded_features
             .retain(|id| active_feature_ids.contains(id));
+
+        if !self
+            .focused_feature_id
+            .is_some_and(|id| active_feature_ids.contains(&id))
+        {
+            self.focused_feature_id = snapshot.child_features(None).first().map(|item| item.id);
+        }
 
         let selection_still_active = self
             .selected_item_id
@@ -662,7 +695,7 @@ pub fn sample_snapshot() -> ProjectSnapshot {
     item_tags.insert(w8_id, vec![ui_tag_id]);
     item_tags.insert(w9_id, vec![core_tag_id]);
 
-    ProjectSnapshot {
+    let mut snapshot = ProjectSnapshot {
         project: project.clone(),
         projects: vec![project],
         items,
@@ -670,8 +703,11 @@ pub fn sample_snapshot() -> ProjectSnapshot {
         tags,
         feature_work_items,
         item_tags,
+        progress_by_feature: HashMap::new(),
         trash_count: 0,
-    }
+    };
+    snapshot.progress_by_feature = snapshot.compute_progress_map();
+    snapshot
 }
 
 #[cfg(test)]

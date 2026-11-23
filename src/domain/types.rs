@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::DomainError;
+use crate::domain::{DomainError, FeatureProgress};
 
 pub const MAX_FEATURE_DEPTH: usize = 32;
 pub const VISUAL_MAX_INDENT_DEPTH: usize = 8;
@@ -343,6 +343,8 @@ pub struct ProjectSnapshot {
     pub tags: Vec<Tag>,
     pub feature_work_items: Vec<FeatureWorkItem>,
     pub item_tags: HashMap<ItemId, Vec<TagId>>,
+    #[serde(default)]
+    pub progress_by_feature: HashMap<ItemId, FeatureProgress>,
     pub trash_count: usize,
 }
 
@@ -432,7 +434,13 @@ impl ProjectSnapshot {
             .iter()
             .filter(|link| link.project_id == self.project.id && link.feature_id == feature_id)
             .collect();
-        links.sort_by(|a, b| a.sort_order.cmp(&b.sort_order));
+        links.sort_by(|a, b| {
+            a.sort_order.cmp(&b.sort_order).then_with(|| {
+                let a_num = self.item(a.work_item_id).map_or(i64::MAX, |i| i.item_number);
+                let b_num = self.item(b.work_item_id).map_or(i64::MAX, |i| i.item_number);
+                a_num.cmp(&b_num)
+            })
+        });
 
         let mut seen = HashSet::new();
         let mut items = Vec::new();
@@ -556,13 +564,13 @@ impl ProjectSnapshot {
         path
     }
 
-    /// Computes deduplicated active progress `(done, total)` across a Feature's subtree (`INV-11`).
-    pub fn feature_progress(&self, feature_id: ItemId) -> (usize, usize) {
+    /// Computes deduplicated active progress metrics across a Feature's subtree (`INV-11`).
+    pub fn compute_feature_progress(&self, feature_id: ItemId) -> FeatureProgress {
         let Some(root) = self.item(feature_id) else {
-            return (0, 0);
+            return FeatureProgress::default();
         };
         if !root.is_active() || root.kind != ItemKind::Feature {
-            return (0, 0);
+            return FeatureProgress::default();
         }
 
         let mut subtree_features = HashSet::new();
@@ -590,8 +598,8 @@ impl ProjectSnapshot {
             }
         }
 
-        let mut wi_done = 0usize;
-        let mut wi_total = 0usize;
+        let mut work_items_done = 0usize;
+        let mut work_items_total = 0usize;
         for wi_id in work_item_ids {
             if let Some(wi) = self.item(wi_id)
                 && wi.project_id == self.project.id
@@ -599,35 +607,93 @@ impl ProjectSnapshot {
                 && wi.kind == ItemKind::WorkItem
                 && !wi.status.is_cancelled()
             {
-                wi_total += 1;
+                work_items_total += 1;
                 if wi.status.is_done() {
-                    wi_done += 1;
+                    work_items_done += 1;
                 }
             }
         }
 
-        if wi_total > 0 {
-            return (wi_done, wi_total);
-        }
-
-        // Empty-subtree fallback (INV-11): count active non-cancelled descendant Features.
-        let mut feat_done = 0usize;
-        let mut feat_total = 0usize;
+        let mut child_features_done = 0usize;
+        let mut child_features_total = 0usize;
         for desc in descendant_features {
             if !desc.status.is_cancelled() {
-                feat_total += 1;
+                child_features_total += 1;
                 if desc.status.is_done() {
-                    feat_done += 1;
+                    child_features_done += 1;
                 }
             }
         }
-        (feat_done, feat_total)
+
+        FeatureProgress {
+            work_items_done,
+            work_items_total,
+            child_features_done,
+            child_features_total,
+        }
+    }
+
+    pub fn compute_progress_map(&self) -> HashMap<ItemId, FeatureProgress> {
+        let mut map = HashMap::new();
+        for item in &self.items {
+            if item.project_id == self.project.id
+                && item.is_active()
+                && item.kind == ItemKind::Feature
+            {
+                map.insert(item.id, self.compute_feature_progress(item.id));
+            }
+        }
+        map
+    }
+
+    pub fn feature_progress_detail(&self, feature_id: ItemId) -> FeatureProgress {
+        self.progress_by_feature
+            .get(&feature_id)
+            .copied()
+            .unwrap_or_else(|| self.compute_feature_progress(feature_id))
+    }
+
+    /// Computes deduplicated active progress `(done, total)` across a Feature's subtree (`INV-11`).
+    pub fn feature_progress(&self, feature_id: ItemId) -> (usize, usize) {
+        self.feature_progress_detail(feature_id).effective_counts()
     }
 
     pub fn visible_feature_tree_rows(&self, expanded: &HashSet<ItemId>) -> Vec<FeatureTreeRow> {
         let mut rows = Vec::new();
         let mut visited = HashSet::new();
         self.collect_tree_rows(None, 0, expanded, &mut visited, &mut rows);
+        rows
+    }
+
+    pub fn visible_feature_tree_rows_scoped(
+        &self,
+        root_feature_id: Option<ItemId>,
+        expanded: &HashSet<ItemId>,
+    ) -> Vec<FeatureTreeRow> {
+        let Some(root_id) = root_feature_id else {
+            return self.visible_feature_tree_rows(expanded);
+        };
+        let Some(root) = self.item(root_id) else {
+            return Vec::new();
+        };
+        if root.project_id != self.project.id
+            || !root.is_active()
+            || root.kind != ItemKind::Feature
+        {
+            return Vec::new();
+        }
+        let has_children = !self.child_features(Some(root_id)).is_empty();
+        let is_expanded = expanded.contains(&root_id);
+        let mut rows = vec![FeatureTreeRow {
+            item_id: root_id,
+            depth: 0,
+            has_children,
+            is_expanded,
+        }];
+        if has_children && is_expanded {
+            let mut visited = HashSet::from([root_id]);
+            self.collect_tree_rows(Some(root_id), 1, expanded, &mut visited, &mut rows);
+        }
         rows
     }
 
@@ -879,6 +945,7 @@ mod tests {
                 },
             ],
             item_tags: HashMap::new(),
+            progress_by_feature: HashMap::new(),
             trash_count: 0,
         };
 

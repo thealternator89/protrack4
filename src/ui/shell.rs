@@ -14,22 +14,23 @@ use gpui_kit::{
     Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::domain::{ItemId, ItemKind, ProjectSnapshot, clamped_depth_badge, visual_indent_px};
+use crate::domain::{ItemId, ItemKind, ProjectSnapshot};
 use crate::state::{AppState, CenterViewTab, LaunchConfig, ProjectStore, ThemePreference};
 use crate::ui::inspector::InspectorView;
 use crate::ui::modals::{open_new_project_modal, open_workspace_modal};
+use crate::ui::outline_view::OutlineView;
 use crate::ui::sidebar::render_sidebar;
 use crate::ui::unallocated_view::UnallocatedView;
 use crate::ui::{
     OpenWorkspace, ToggleInspector, ToggleSidebar, assignee_pill, build_project_switcher_menu,
-    domain_tag_chip, kind_badge, parse_hex_or, priority_badge, progress_pill, status_badge,
-    status_color, status_icon,
+    domain_tag_chip, kind_badge, parse_hex_or, priority_badge, status_badge,
 };
 
 pub struct WorkspaceShell {
     app_state: Entity<AppState>,
     store: Entity<ProjectStore>,
     inspector: Entity<InspectorView>,
+    outline_view: Entity<OutlineView>,
     unallocated_view: Entity<UnallocatedView>,
     focus_handle: FocusHandle,
     resizable_state: Entity<ResizableState>,
@@ -54,6 +55,8 @@ impl WorkspaceShell {
         let app_state = cx.new(|cx| AppState::new(config.clone(), cx));
         let store = app_state.read(cx).project_store().clone();
         let inspector = cx.new(|cx| InspectorView::new(app_state.clone(), store.clone(), window, cx));
+        let outline_view =
+            cx.new(|cx| OutlineView::new(app_state.clone(), store.clone(), window, cx));
         let unallocated_view =
             cx.new(|cx| UnallocatedView::new(app_state.clone(), store.clone(), window, cx));
         let prefs = app_state.read(cx).preferences().clone();
@@ -106,6 +109,7 @@ impl WorkspaceShell {
             app_state,
             store,
             inspector,
+            outline_view,
             unallocated_view,
             focus_handle,
             resizable_state,
@@ -128,6 +132,10 @@ impl WorkspaceShell {
 
     pub fn inspector(&self) -> &Entity<InspectorView> {
         &self.inspector
+    }
+
+    pub fn outline_view(&self) -> &Entity<OutlineView> {
+        &self.outline_view
     }
 
     pub fn unallocated_view(&self) -> &Entity<UnallocatedView> {
@@ -609,48 +617,10 @@ impl WorkspaceShell {
                             .child(format!("{} › {}", snapshot.project.name, active_tab.label())),
                     )
                     .child(Tag::secondary().xsmall().child(format!("{item_count} items"))),
-            )
-            .when(active_tab == CenterViewTab::Outline, |this| {
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new("outline-expand-all")
-                                .ghost()
-                                .xsmall()
-                                .label("Expand All")
-                                .on_click({
-                                    let store = self.store.clone();
-                                    move |_, _, cx| {
-                                        store.update(cx, |s, cx| {
-                                            s.expand_all_features();
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            Button::new("outline-collapse-all")
-                                .ghost()
-                                .xsmall()
-                                .label("Collapse All")
-                                .on_click({
-                                    let store = self.store.clone();
-                                    move |_, _, cx| {
-                                        store.update(cx, |s, cx| {
-                                            s.collapse_all_features();
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                )
-            });
+            );
 
         let body = match active_tab {
-            CenterViewTab::Outline => self
-                .render_outline_body(snapshot, selected_item_id, cx)
-                .into_any_element(),
+            CenterViewTab::Outline => self.outline_view.clone().into_any_element(),
             CenterViewTab::Table => self
                 .render_table_body(snapshot, selected_item_id, cx)
                 .into_any_element(),
@@ -664,239 +634,6 @@ impl WorkspaceShell {
             .bg(cx.theme().background)
             .child(header)
             .child(body)
-    }
-
-    fn render_outline_body(
-        &self,
-        snapshot: &ProjectSnapshot,
-        selected_item_id: Option<ItemId>,
-        cx: &App,
-    ) -> impl IntoElement {
-        let state = self.store.read(cx);
-        let tree_rows = snapshot.visible_feature_tree_rows(state.expanded_features());
-
-        let mut list = v_flex()
-            .flex_1()
-            .min_h_0()
-            .p_3()
-            .gap_1()
-            .overflow_y_scrollbar()
-            .id("center-outline-scroll");
-
-        for row in tree_rows {
-            let Some(feature) = snapshot.item(row.item_id) else {
-                continue;
-            };
-            let attached_wis = snapshot.work_items_for_feature(row.item_id);
-            let has_outline_children = row.has_children || !attached_wis.is_empty();
-            let is_expanded = state.is_feature_expanded(row.item_id);
-            let is_selected = selected_item_id == Some(row.item_id);
-            let (done, total) = snapshot.feature_progress(row.item_id);
-            let depth_badge = clamped_depth_badge(row.depth);
-            let tags = snapshot.tags_for_item(feature.id);
-            let assignee = feature.assignee_id.and_then(|aid| snapshot.assignee(aid));
-            let feat_id = feature.id;
-
-            list = list.child(
-                h_flex()
-                    .id(("outline-feature", feature.item_number as usize))
-                    .w_full()
-                    .pl(px(10.0 + visual_indent_px(row.depth)))
-                    .pr_3()
-                    .py_1p5()
-                    .gap_2()
-                    .items_center()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(if is_selected {
-                        cx.theme().primary.opacity(0.45)
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .bg(if is_selected {
-                        cx.theme().accent
-                    } else {
-                        cx.theme().transparent
-                    })
-                    .cursor_pointer()
-                    .when(!is_selected, |this| {
-                        this.hover(|s| s.bg(cx.theme().list_hover))
-                    })
-                    .on_click({
-                        let store = self.store.clone();
-                        move |_, _, cx| {
-                            store.update(cx, |s, cx| {
-                                s.select_item(Some(feat_id));
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .child(if has_outline_children {
-                        let chevron = if is_expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        };
-                        div()
-                            .id(("outline-chevron", feature.item_number as usize))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(18.))
-                            .flex_shrink_0()
-                            .rounded(px(4.))
-                            .hover(|s| s.bg(cx.theme().muted))
-                            .on_click({
-                                let store = self.store.clone();
-                                move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    store.update(cx, |s, cx| {
-                                        s.toggle_feature_expanded(feat_id);
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::new(chevron)
-                                    .xsmall()
-                                    .text_color(cx.theme().muted_foreground),
-                            )
-                            .into_any_element()
-                    } else {
-                        div().w(px(18.)).flex_shrink_0().into_any_element()
-                    })
-                    .child(
-                        Icon::new(IconName::Folder)
-                            .small()
-                            .text_color(cx.theme().primary),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_color(cx.theme().muted_foreground)
-                            .child(feature.item_key.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .font_semibold()
-                            .child(feature.title.clone()),
-                    )
-                    .when_some(depth_badge, |this, badge| {
-                        this.child(Tag::secondary().xsmall().child(badge))
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .children(tags.into_iter().map(|tag| domain_tag_chip(tag, cx))),
-                    )
-                    .child(progress_pill(done, total, cx))
-                    .when_some(assignee, |this, a| {
-                        this.child(assignee_pill(a, false, cx))
-                    })
-                    .child(status_badge(feature.status, cx)),
-            );
-
-            if is_expanded {
-                for wi in attached_wis {
-                    let wi_id = wi.id;
-                    let wi_selected = selected_item_id == Some(wi_id);
-                    let shared_count = snapshot.features_for_work_item(wi_id).len();
-                    let wi_tags = snapshot.tags_for_item(wi_id);
-                    let wi_assignee = wi.assignee_id.and_then(|aid| snapshot.assignee(aid));
-                    let wi_indent = visual_indent_px(row.depth + 1);
-
-                    list = list.child(
-                        h_flex()
-                            .id((
-                                "outline-wi",
-                                (feature.item_number as usize) * 10_000 + (wi.item_number as usize),
-                            ))
-                            .w_full()
-                            .pl(px(10.0 + wi_indent))
-                            .pr_3()
-                            .py_1()
-                            .gap_2()
-                            .items_center()
-                            .rounded(cx.theme().radius)
-                            .border_1()
-                            .border_color(if wi_selected {
-                                cx.theme().primary.opacity(0.45)
-                            } else {
-                                cx.theme().transparent
-                            })
-                            .bg(if wi_selected {
-                                cx.theme().accent
-                            } else {
-                                cx.theme().transparent
-                            })
-                            .cursor_pointer()
-                            .when(!wi_selected, |this| {
-                                this.hover(|s| s.bg(cx.theme().list_hover))
-                            })
-                            .on_click({
-                                let store = self.store.clone();
-                                move |_, _, cx| {
-                                    store.update(cx, |s, cx| {
-                                        s.select_item(Some(wi_id));
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .child(div().w(px(18.)).flex_shrink_0())
-                            .child(
-                                Icon::new(status_icon(wi.status))
-                                    .xsmall()
-                                    .text_color(status_color(wi.status, cx)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(wi.item_key.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_sm()
-                                    .child(wi.title.clone()),
-                            )
-                            .when(shared_count > 1, |this| {
-                                let extra = shared_count - 1;
-                                let label = if extra == 1 {
-                                    "Shared: +1 feature".to_string()
-                                } else {
-                                    format!("Shared: +{extra} features")
-                                };
-                                this.child(Tag::info().xsmall().outline().child(label))
-                            })
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .children(wi_tags.into_iter().map(|tag| domain_tag_chip(tag, cx))),
-                            )
-                            .child(priority_badge(wi.priority, cx))
-                            .when_some(wi_assignee, |this, a| {
-                                this.child(assignee_pill(a, false, cx))
-                            })
-                            .child(status_badge(wi.status, cx)),
-                    );
-                }
-            }
-        }
-
-        list
     }
 
     fn render_table_body(

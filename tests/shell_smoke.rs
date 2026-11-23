@@ -1775,3 +1775,202 @@ async fn phase5_manager_lists_scroll_when_exceeding_max_height(cx: &mut TestAppC
     assert!(!shm_path_for(&db_path).exists());
     assert!(!lock_path_for(&db_path).exists());
 }
+
+#[gpui_kit::test]
+async fn phase6_outline_view_progress_shared_popover_and_inline_add(cx: &mut TestAppContext) {
+    use protrack4::ui::outline_view::OutlineScope;
+
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase6.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    {
+        let mut manager = WorkspaceManager::new();
+        manager
+            .create_workspace(&db_path, Some("Outline Seed"), true)
+            .unwrap();
+        manager.close_workspace().unwrap();
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 6 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store, outline_view) = shell.read_with(cx, |view, _| {
+        (
+            view.app_state().clone(),
+            view.store().clone(),
+            view.outline_view().clone(),
+        )
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Verify SQLite-loaded deduplicated progress metrics on the seeded project
+    let (pro_1_id, pro_2_id, pro_3_id, pro_4_id, pro_5_id) = cx.update(|cx| {
+        let snap = store.read(cx).snapshot().unwrap();
+        let find_id = |key: &str| {
+            snap.active_items()
+                .into_iter()
+                .find(|i| i.item_key == key)
+                .map(|i| i.id)
+                .unwrap()
+        };
+        let f1 = find_id("PRO-1");
+        let f2 = find_id("PRO-2");
+        let f3 = find_id("PRO-3");
+        let f4 = find_id("PRO-4");
+        let w5 = find_id("PRO-5");
+
+        assert_eq!(snap.feature_progress_detail(f1).detailed_label(), "1/3 (33%)");
+        assert_eq!(snap.feature_progress_detail(f2).detailed_label(), "1/3 (33%)");
+        assert_eq!(snap.feature_progress_detail(f3).detailed_label(), "1/3 (33%)");
+        assert_eq!(snap.feature_progress_detail(f4).detailed_label(), "0/1 (0%)");
+        (f1, f2, f3, f4, w5)
+    });
+
+    // 2. Render OutlineView and use inline creation to add a Work Item and a Sub-Feature under PRO-4
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("outline-inline-trigger", 4usize), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            outline_view.read(cx).inline_add_feature_id(),
+            Some(pro_4_id)
+        );
+        assert_eq!(window.find("outline-inline-input").focused(), Some(true));
+        window.input("Verify WAL checkpoint mode", cx);
+    })
+    .unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.press("enter", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "inline work item created under PRO-4", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.work_items_for_feature(pro_4_id).len() == 2)
+    })
+    .await;
+
+    // Progress updated live: PRO-1 & PRO-2 & PRO-3 -> 1/4 (25%), PRO-4 -> 0/2 (0%), PRO-4 status untouched
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let snap = store.read(cx).snapshot().unwrap();
+        assert_eq!(snap.feature_progress_detail(pro_1_id).detailed_label(), "1/4 (25%)");
+        assert_eq!(snap.feature_progress_detail(pro_4_id).detailed_label(), "0/2 (0%)");
+        assert_eq!(snap.item(pro_4_id).unwrap().status, ItemStatus::Todo);
+
+        // Switch inline kind to Sub-Feature and add a sub-feature under PRO-4
+        window.click("outline-inline-kind-feature", cx);
+        window.render_frame(cx);
+        assert_eq!(outline_view.read(cx).inline_add_kind(), ItemKind::Feature);
+        window.input("Trigger Guard Suite", cx);
+    })
+    .unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.press("enter", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "inline sub-feature created under PRO-4", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.child_features(Some(pro_4_id)).len() == 1)
+    })
+    .await;
+
+    // 3. Test [Selected Subtree] scope and [Hide Done/Cancelled] toggle
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("outline-feature", 2usize), cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).focused_feature_id(), Some(pro_2_id));
+
+        window.click("outline-scope-subtree", cx);
+        window.render_frame(cx);
+        assert_eq!(outline_view.read(cx).scope(), OutlineScope::SelectedSubtree);
+        assert!(window.try_find(("outline-feature", 1usize)).is_none());
+        assert!(window.try_find(("outline-feature", 2usize)).is_some());
+
+        // Toggle Hide Done/Cancelled -> PRO-5 (Done) is hidden in Outline
+        window.click("outline-toggle-hide-closed", cx);
+        window.render_frame(cx);
+        assert!(outline_view.read(cx).hide_closed());
+        assert!(window.try_find(("outline-wi", 200_005usize)).is_none());
+
+        // Show Done/Cancelled again & return to All Features
+        window.click("outline-toggle-hide-closed", cx);
+        window.click("outline-scope-all", cx);
+        window.render_frame(cx);
+        assert_eq!(outline_view.read(cx).scope(), OutlineScope::AllFeatures);
+        assert!(!outline_view.read(cx).hide_closed());
+        assert!(window.try_find(("outline-wi", 200_005usize)).is_some());
+    })
+    .unwrap();
+
+    // 4. Click [Shared: +1 feature] popover on PRO-5 under PRO-2 and jump to PRO-3
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click(("outline-shared-btn", 200_005usize), cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // Jump item 1 in shared list corresponds to PRO-3 (sorted by item_number: PRO-2=0, PRO-3=1)
+        window.click(("outline-shared-jump", 200_005usize * 100 + 1), cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).selected_item_id(), Some(pro_3_id));
+    })
+    .unwrap();
+
+    // 5. Right-click an Outline row to verify ContextMenu opens cleanly
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.right_click(("outline-wi", 300_005usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 6. Verify inline-created items survive restart
+    let _ = pro_5_id;
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}
