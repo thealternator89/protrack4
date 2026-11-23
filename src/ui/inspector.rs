@@ -22,6 +22,7 @@ pub fn render_inspector(
 ) -> impl IntoElement {
     let state = store.read(cx);
     let snapshot = state.snapshot();
+    let has_workspace = state.has_workspace();
     let selected = state.selected_item();
 
     v_flex()
@@ -52,26 +53,22 @@ pub fn render_inspector(
                 .child(Tag::secondary().xsmall().child("Read-only")),
         )
         // Inspector Body
-        .child(match selected {
-            None => v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .p_6()
-                .gap_2()
-                .child(
-                    Icon::new(IconName::Inspector)
-                        .large()
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Select a Feature or Work Item to inspect its details."),
-                )
-                .into_any_element(),
-            Some(item) => {
+        .child(match (snapshot, selected) {
+            (None, _) => empty_inspector_message(
+                if has_workspace {
+                    "This workspace has no projects yet."
+                } else {
+                    "Open or create a .protrack workspace to inspect items."
+                },
+                cx,
+            )
+            .into_any_element(),
+            (Some(_), None) => empty_inspector_message(
+                "Select a Feature or Work Item to inspect its details.",
+                cx,
+            )
+            .into_any_element(),
+            (Some(snapshot), Some(item)) => {
                 let tags = snapshot.tags_for_item(item.id);
                 let assignee = item.assignee_id.and_then(|aid| snapshot.assignee(aid));
                 let convert_label = match item.kind {
@@ -542,4 +539,24 @@ pub fn render_inspector(
                     .into_any_element()
             }
         })
+}
+
+fn empty_inspector_message(message: &'static str, cx: &App) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .p_6()
+        .gap_2()
+        .child(
+            Icon::new(IconName::Inspector)
+                .large()
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(message),
+        )
 }

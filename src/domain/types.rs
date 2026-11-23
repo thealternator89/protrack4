@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::domain::DomainError;
+
 pub const MAX_FEATURE_DEPTH: usize = 32;
 pub const VISUAL_MAX_INDENT_DEPTH: usize = 8;
 
@@ -62,6 +64,27 @@ impl ProjectStatus {
             Self::Archived => "Archived",
         }
     }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Result<Self, DomainError> {
+        match s {
+            "active" => Ok(Self::Active),
+            "paused" => Ok(Self::Paused),
+            "completed" => Ok(Self::Completed),
+            "archived" => Ok(Self::Archived),
+            other => Err(DomainError::InvalidWorkspace(format!(
+                "invalid project status '{other}'"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +99,23 @@ impl ItemKind {
         match self {
             Self::Feature => "Feature",
             Self::WorkItem => "Work Item",
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Feature => "feature",
+            Self::WorkItem => "work_item",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Result<Self, DomainError> {
+        match s {
+            "feature" => Ok(Self::Feature),
+            "work_item" => Ok(Self::WorkItem),
+            other => Err(DomainError::InvalidWorkspace(format!(
+                "invalid item kind '{other}'"
+            ))),
         }
     }
 }
@@ -98,6 +138,29 @@ impl ItemStatus {
             Self::InProgress => "In Progress",
             Self::Done => "Done",
             Self::Cancelled => "Cancelled",
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Result<Self, DomainError> {
+        match s {
+            "backlog" => Ok(Self::Backlog),
+            "todo" => Ok(Self::Todo),
+            "in_progress" => Ok(Self::InProgress),
+            "done" => Ok(Self::Done),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(DomainError::InvalidWorkspace(format!(
+                "invalid item status '{other}'"
+            ))),
         }
     }
 
@@ -132,6 +195,29 @@ impl Priority {
             Self::Medium => "Medium",
             Self::High => "High",
             Self::Urgent => "Urgent",
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Result<Self, DomainError> {
+        match s {
+            "none" => Ok(Self::None),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "urgent" => Ok(Self::Urgent),
+            other => Err(DomainError::InvalidWorkspace(format!(
+                "invalid item priority '{other}'"
+            ))),
         }
     }
 }
@@ -213,6 +299,33 @@ pub struct FeatureTreeRow {
     pub depth: usize,
     pub has_children: bool,
     pub is_expanded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMeta {
+    pub schema_version: u32,
+    pub app_min_version: String,
+    pub workspace_name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainEvent {
+    WorkspaceSwitched,
+    ProjectsChanged,
+    ItemsChanged { project_id: ProjectId },
+    TrashChanged { project_id: ProjectId },
+    AssigneesChanged,
+    TagsChanged { project_id: ProjectId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceOverview {
+    pub meta: WorkspaceMeta,
+    pub projects: Vec<Project>,
+    pub assignees: Vec<Assignee>,
+    pub active_snapshot: Option<ProjectSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

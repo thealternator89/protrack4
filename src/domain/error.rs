@@ -27,4 +27,21 @@ pub enum DomainError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error(
+        "This workspace was created by a newer version of ProTrack (schema v{file_version}, max supported v{max_supported}). Please upgrade ProTrack to open it."
+    )]
+    ForwardSchemaVersion {
+        file_version: u32,
+        max_supported: u32,
+    },
+
+    #[error("This workspace is currently open in another ProTrack window ({path}).")]
+    WorkspaceLocked { path: String },
+
+    #[error("Workspace file not found: {path}")]
+    WorkspaceNotFound { path: String },
+
+    #[error("Invalid workspace file: {0}")]
+    InvalidWorkspace(String),
 }

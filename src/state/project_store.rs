@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui_kit::component::{Theme, ThemeMode};
@@ -8,8 +9,9 @@ use uuid::Uuid;
 
 use crate::domain::{
     Assignee, AssigneeId, FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus, Priority, Project,
-    ProjectId, ProjectSnapshot, ProjectStatus, Tag, TagId,
+    ProjectId, ProjectSnapshot, ProjectStatus, Tag, TagId, WorkspaceMeta, WorkspaceOverview,
 };
+use crate::workspace::AppPreferences;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CenterViewTab {
@@ -85,8 +87,11 @@ impl ThemePreference {
 }
 
 pub struct ProjectStore {
-    workspace_name: String,
-    snapshot: ProjectSnapshot,
+    workspace_path: Option<PathBuf>,
+    workspace_meta: Option<WorkspaceMeta>,
+    projects: Vec<Project>,
+    assignees: Vec<Assignee>,
+    snapshot: Option<ProjectSnapshot>,
     active_tab: CenterViewTab,
     selected_item_id: Option<ItemId>,
     expanded_features: HashSet<ItemId>,
@@ -111,8 +116,17 @@ impl ProjectStore {
             .or_else(|| snapshot.active_items().first().map(|item| item.id));
 
         Self {
-            workspace_name: "sample.protrack".to_string(),
-            snapshot,
+            workspace_path: None,
+            workspace_meta: Some(WorkspaceMeta {
+                schema_version: 1,
+                app_min_version: env!("CARGO_PKG_VERSION").to_string(),
+                workspace_name: "sample.protrack".to_string(),
+                created_at: snapshot.project.created_at,
+                updated_at: snapshot.project.updated_at,
+            }),
+            projects: snapshot.projects.clone(),
+            assignees: snapshot.assignees.clone(),
+            snapshot: Some(snapshot),
             active_tab: CenterViewTab::Outline,
             selected_item_id,
             expanded_features,
@@ -122,12 +136,56 @@ impl ProjectStore {
         }
     }
 
-    pub fn workspace_name(&self) -> &str {
-        &self.workspace_name
+    pub fn new_from_preferences(prefs: &AppPreferences) -> Self {
+        Self {
+            workspace_path: None,
+            workspace_meta: None,
+            projects: Vec::new(),
+            assignees: Vec::new(),
+            snapshot: None,
+            active_tab: CenterViewTab::Outline,
+            selected_item_id: None,
+            expanded_features: HashSet::new(),
+            sidebar_open: !prefs.sidebar_collapsed,
+            inspector_open: prefs.inspector_open,
+            theme_preference: prefs.theme,
+        }
     }
 
-    pub fn snapshot(&self) -> &ProjectSnapshot {
-        &self.snapshot
+    pub fn has_workspace(&self) -> bool {
+        self.workspace_meta.is_some()
+    }
+
+    pub fn workspace_path(&self) -> Option<&Path> {
+        self.workspace_path.as_deref()
+    }
+
+    pub fn workspace_meta(&self) -> Option<&WorkspaceMeta> {
+        self.workspace_meta.as_ref()
+    }
+
+    pub fn workspace_name(&self) -> String {
+        if let Some(path) = &self.workspace_path
+            && let Some(file_name) = path.file_name().and_then(|s| s.to_str())
+        {
+            return file_name.to_string();
+        }
+        if let Some(meta) = &self.workspace_meta {
+            return meta.workspace_name.clone();
+        }
+        "No Workspace".to_string()
+    }
+
+    pub fn projects(&self) -> &[Project] {
+        &self.projects
+    }
+
+    pub fn assignees(&self) -> &[Assignee] {
+        &self.assignees
+    }
+
+    pub fn snapshot(&self) -> Option<&ProjectSnapshot> {
+        self.snapshot.as_ref()
     }
 
     pub fn active_tab(&self) -> CenterViewTab {
@@ -139,8 +197,9 @@ impl ProjectStore {
     }
 
     pub fn selected_item(&self) -> Option<&Item> {
+        let snapshot = self.snapshot.as_ref()?;
         self.selected_item_id
-            .and_then(|id| self.snapshot.item(id))
+            .and_then(|id| snapshot.item(id))
             .filter(|item| item.is_active())
     }
 
@@ -179,7 +238,10 @@ impl ProjectStore {
     }
 
     pub fn expand_all_features(&mut self) {
-        for item in &self.snapshot.items {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        for item in &snapshot.items {
             if item.is_active() && item.kind == ItemKind::Feature {
                 self.expanded_features.insert(item.id);
             }
@@ -194,8 +256,16 @@ impl ProjectStore {
         self.sidebar_open = !self.sidebar_open;
     }
 
+    pub fn set_sidebar_open(&mut self, open: bool) {
+        self.sidebar_open = open;
+    }
+
     pub fn toggle_inspector(&mut self) {
         self.inspector_open = !self.inspector_open;
+    }
+
+    pub fn set_inspector_open(&mut self, open: bool) {
+        self.inspector_open = open;
     }
 
     pub fn cycle_theme_preference(&mut self) -> ThemePreference {
@@ -208,14 +278,78 @@ impl ProjectStore {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: ProjectSnapshot) {
-        self.snapshot = snapshot;
+        self.projects = snapshot.projects.clone();
+        self.assignees = snapshot.assignees.clone();
+        self.snapshot = Some(snapshot);
+        self.reconcile_selection(false);
+    }
+
+    pub fn apply_workspace_overview(&mut self, path: PathBuf, overview: WorkspaceOverview) {
+        let workspace_changed = self.workspace_path.as_ref() != Some(&path);
+        let new_project_id = overview.active_snapshot.as_ref().map(|s| s.project.id);
+        let old_project_id = self.snapshot.as_ref().map(|s| s.project.id);
+        let project_changed = workspace_changed || new_project_id != old_project_id;
+
+        self.workspace_path = Some(path);
+        self.workspace_meta = Some(overview.meta);
+        self.projects = overview.projects;
+        self.assignees = overview.assignees;
+        self.snapshot = overview.active_snapshot;
+
+        if workspace_changed {
+            self.active_tab = CenterViewTab::Outline;
+        }
+        self.reconcile_selection(project_changed);
+    }
+
+    pub fn clear_workspace(&mut self) {
+        self.workspace_path = None;
+        self.workspace_meta = None;
+        self.projects.clear();
+        self.assignees.clear();
+        self.snapshot = None;
+        self.selected_item_id = None;
+        self.expanded_features.clear();
+    }
+
+    fn reconcile_selection(&mut self, reset_tree_and_selection: bool) {
+        let Some(snapshot) = &self.snapshot else {
+            self.selected_item_id = None;
+            self.expanded_features.clear();
+            return;
+        };
+
+        let active_feature_ids: HashSet<ItemId> = snapshot
+            .items
+            .iter()
+            .filter(|item| item.is_active() && item.kind == ItemKind::Feature)
+            .map(|item| item.id)
+            .collect();
+
+        if reset_tree_and_selection {
+            self.expanded_features = active_feature_ids;
+            self.selected_item_id = snapshot
+                .child_features(None)
+                .first()
+                .map(|item| item.id)
+                .or_else(|| snapshot.active_items().first().map(|item| item.id));
+            return;
+        }
+
+        self.expanded_features
+            .retain(|id| active_feature_ids.contains(id));
+
         let selection_still_active = self
             .selected_item_id
-            .and_then(|id| self.snapshot.item(id))
+            .and_then(|id| snapshot.item(id))
             .is_some_and(|item| item.is_active());
 
         if !selection_still_active {
-            self.selected_item_id = self.snapshot.active_items().first().map(|item| item.id);
+            self.selected_item_id = snapshot
+                .child_features(None)
+                .first()
+                .map(|item| item.id)
+                .or_else(|| snapshot.active_items().first().map(|item| item.id));
         }
     }
 }
@@ -525,7 +659,7 @@ mod tests {
     #[test]
     fn seed_fixture_matches_phase_1_counts_and_depth() {
         let store = ProjectStore::new_with_seed();
-        let snap = store.snapshot();
+        let snap = store.snapshot().unwrap();
 
         assert_eq!(snap.projects.len(), 1);
         assert_eq!(snap.assignees.len(), 2);
@@ -557,7 +691,6 @@ mod tests {
             .count();
         assert_eq!(allocated_wi_count, 3);
 
-        // PRO-5 is shared across PRO-2 and PRO-3.
         let pro_5 = snap
             .active_items()
             .into_iter()
@@ -565,7 +698,6 @@ mod tests {
             .unwrap();
         assert_eq!(snap.features_for_work_item(pro_5.id).len(), 2);
 
-        // Deduplicated progress on PRO-1: PRO-5 (done), PRO-6 (in_progress), PRO-7 (todo) -> (1, 3).
         let pro_1 = snap
             .active_items()
             .into_iter()
@@ -580,6 +712,7 @@ mod tests {
         let mut store = ProjectStore::new_with_seed();
         let rows = store
             .snapshot()
+            .unwrap()
             .visible_feature_tree_rows(store.expanded_features());
         assert_eq!(rows.len(), 4);
 
@@ -587,6 +720,7 @@ mod tests {
         store.toggle_feature_expanded(pro_2_id);
         let collapsed_rows = store
             .snapshot()
+            .unwrap()
             .visible_feature_tree_rows(store.expanded_features());
         assert_eq!(collapsed_rows.len(), 2);
 

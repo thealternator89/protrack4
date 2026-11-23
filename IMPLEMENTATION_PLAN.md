@@ -38,7 +38,7 @@ When starting any phase in a fresh agent session, follow these 5 steps in order:
 | Done | Phase | Focus | Depends On | User-Visible Outcome |
 | :---: | :--- | :--- | :---: | :--- |
 | [x] | **Phase 1** | Bootable 3-Pane `gpui-kit` UI Shell (In-Memory Fixture) | — | Clickable themed 3-pane desktop window with sample project, tree, unallocated badge, and inspector |
-| [ ] | **Phase 2** | SQLite Persistence, Migrations & `.protrack` Lifecycle | Phase 1 | Real `.protrack` workspace open/create/switch, `preferences.json`, and async `DbService` snapshot loading |
+| [x] | **Phase 2** | SQLite Persistence, Migrations & `.protrack` Lifecycle | Phase 1 | Real `.protrack` workspace open/create/switch, `preferences.json`, and async `DbService` snapshot loading |
 | [ ] | **Phase 3** | Projects, Nested Features & Editable Inspector | Phase 2 | Create/edit Projects and recursive Features (`PRO-N`), edit Markdown description + Preview, persisted to SQLite |
 | [ ] | **Phase 4** | Work Items, Multi-Feature Membership & Unallocated Triage | Phase 3 | Brain-dump Work Items into Unallocated, allocate to 0..N Features, unallocate, and inspect memberships |
 | [ ] | **Phase 5** | Global Local Assignees & Project-Scoped Tags | Phase 4 | Manage global Assignees and per-Project colored Tags; assign and render pills/chips across views |
