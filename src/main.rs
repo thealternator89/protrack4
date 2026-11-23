@@ -17,7 +17,7 @@ fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("protrack4=info,warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    tracing::info!(db_override = ?db_override, "Starting ProTrack (Phase 2)");
+    tracing::info!(db_override = ?db_override, "Starting ProTrack (Phase 3)");
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)

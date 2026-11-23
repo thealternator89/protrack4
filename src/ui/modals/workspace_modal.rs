@@ -30,7 +30,7 @@ async fn finish_modal_workspace_task(
     success_toast: Option<String>,
 ) {
     let outcome = task.await;
-    let _ = modal_state.update(cx, |s, cx| {
+    modal_state.update(cx, |s, cx| {
         s.busy = false;
         cx.notify();
     });
@@ -47,7 +47,7 @@ async fn finish_modal_workspace_task(
 }
 
 fn mark_modal_busy(cx: &mut AsyncWindowContext, modal_state: &Entity<WorkspaceModalState>) {
-    let _ = modal_state.update(cx, |s, cx| {
+    modal_state.update(cx, |s, cx| {
         s.busy = true;
         cx.notify();
     });

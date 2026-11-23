@@ -6,10 +6,11 @@ use std::task::{Poll, Waker};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
+use crate::commands::{CommandEffect, UndoableCommand};
 use crate::db::migrations::{checkpoint_and_switch_to_delete_mode, seed_sample_project};
-use crate::db::{load_project_snapshot, load_workspace_overview};
+use crate::db::{load_project_snapshot, load_workspace_overview, map_sqlite_err};
 use crate::domain::{
     DomainError, DomainEvent, ProjectId, ProjectSnapshot, WorkspaceOverview,
 };
@@ -25,6 +26,10 @@ pub enum DbRequest {
     },
     SeedSampleProject {
         reply: oneshot::Sender<Result<ProjectId, DomainError>>,
+    },
+    ExecuteCommand {
+        command: Box<dyn UndoableCommand>,
+        reply: oneshot::Sender<Result<CommandEffect, DomainError>>,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), DomainError>>,
@@ -213,6 +218,32 @@ impl DbService {
             .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
     }
 
+    pub async fn execute_command(
+        &self,
+        command: Box<dyn UndoableCommand>,
+    ) -> Result<CommandEffect, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::ExecuteCommand {
+            command,
+            reply: reply_tx,
+        })?;
+        await_oneshot(reply_rx).await
+    }
+
+    pub fn execute_command_blocking(
+        &self,
+        command: Box<dyn UndoableCommand>,
+    ) -> Result<CommandEffect, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::ExecuteCommand {
+            command,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .recv()
+            .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
+    }
+
     pub fn shutdown(&self) -> Result<(), DomainError> {
         let result = if !self.inner.shutdown_started.swap(true, Ordering::SeqCst) {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -272,6 +303,22 @@ fn run_actor_loop(conn: Connection, rx: Receiver<DbRequest>, bus: Arc<DomainEven
                 if let Ok(project_id) = res {
                     bus.emit(DomainEvent::ProjectsChanged);
                     bus.emit(DomainEvent::ItemsChanged { project_id });
+                }
+                let _ = reply.send(res);
+            }
+            DbRequest::ExecuteCommand { mut command, reply } => {
+                let res = (|| -> Result<CommandEffect, DomainError> {
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(map_sqlite_err)?;
+                    let effect = command.execute(&tx)?;
+                    tx.commit().map_err(map_sqlite_err)?;
+                    Ok(effect)
+                })();
+                if let Ok(effect) = &res {
+                    for event in &effect.events {
+                        bus.emit(event.clone());
+                    }
                 }
                 let _ = reply.send(res);
             }

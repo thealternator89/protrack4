@@ -5,14 +5,22 @@ pub mod sidebar;
 
 pub use shell::WorkspaceShell;
 
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::select::SelectItem;
 use gpui_kit::component::{
-    ActiveTheme as _, Colorize as _, Icon, IconName, Sizable as _, StyledExt as _, tag::Tag,
+    ActiveTheme as _, Colorize as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    tag::Tag,
 };
 use gpui_kit::{
-    App, Hsla, IntoElement, KeyBinding, ParentElement as _, SharedString, Styled as _, div, px,
+    App, Context, Entity, Hsla, IntoElement, KeyBinding, ParentElement as _, SharedString,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::domain::{Assignee, ItemKind, ItemStatus, Priority, Tag as DomainTag};
+use crate::domain::{
+    Assignee, ItemKind, ItemStatus, Priority, Project, ProjectStatus, Tag as DomainTag,
+};
+use crate::state::AppState;
+use crate::ui::modals::{open_new_project_modal, open_project_settings_modal};
 
 gpui_kit::actions!(protrack, [ToggleSidebar, ToggleInspector, OpenWorkspace, Quit]);
 
@@ -186,4 +194,173 @@ pub fn progress_pill(done: usize, total: usize, cx: &App) -> impl IntoElement {
         .font_family(cx.theme().mono_font_family.clone())
         .text_color(color)
         .child(text)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusSelectOption(pub ItemStatus);
+
+impl SelectItem for StatusSelectOption {
+    type Value = ItemStatus;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.0.label())
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let color = status_color(self.0, cx);
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(Icon::new(status_icon(self.0)).xsmall().text_color(color))
+            .child(div().text_xs().child(self.0.label()))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+}
+
+pub fn all_status_options() -> Vec<StatusSelectOption> {
+    vec![
+        StatusSelectOption(ItemStatus::Backlog),
+        StatusSelectOption(ItemStatus::Todo),
+        StatusSelectOption(ItemStatus::InProgress),
+        StatusSelectOption(ItemStatus::Done),
+        StatusSelectOption(ItemStatus::Cancelled),
+    ]
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrioritySelectOption(pub Priority);
+
+impl SelectItem for PrioritySelectOption {
+    type Value = Priority;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.0.label())
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let color = priority_color(self.0, cx);
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(div().size(px(7.)).rounded(px(999.)).bg(color))
+            .child(div().text_xs().child(self.0.label()))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+}
+
+pub fn all_priority_options() -> Vec<PrioritySelectOption> {
+    vec![
+        PrioritySelectOption(Priority::None),
+        PrioritySelectOption(Priority::Low),
+        PrioritySelectOption(Priority::Medium),
+        PrioritySelectOption(Priority::High),
+        PrioritySelectOption(Priority::Urgent),
+    ]
+}
+
+pub fn build_project_switcher_menu(
+    mut menu: PopupMenu,
+    projects: Vec<Project>,
+    active_project: Option<Project>,
+    active_item_count: usize,
+    app_state: Entity<AppState>,
+    _cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let active_id = active_project.as_ref().map(|p| p.id);
+    menu = menu.min_w(px(240.)).label("PROJECTS");
+
+    if projects.is_empty() {
+        menu = menu.item(PopupMenuItem::label("No projects in workspace"));
+    } else {
+        for proj in projects {
+            let pid = proj.id;
+            let is_active = active_id == Some(pid);
+            let prefix = proj.key_prefix.clone();
+            let name = proj.name.clone();
+            let color_hex = proj.color.clone();
+            let status = proj.status;
+            let app_switch = app_state.clone();
+
+            menu = menu.item(
+                PopupMenuItem::element(move |_, cx| {
+                    let dot_color = parse_hex_or(&color_hex, cx.theme().primary);
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .child(div().size(px(8.)).flex_shrink_0().rounded(px(2.)).bg(dot_color))
+                        .child(
+                            div()
+                                .px_1()
+                                .rounded(px(3.))
+                                .bg(cx.theme().muted)
+                                .text_size(px(10.))
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(cx.theme().muted_foreground)
+                                .child(prefix.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .font_medium()
+                                .child(name.clone()),
+                        )
+                        .when(status != ProjectStatus::Active, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(status.label()),
+                            )
+                        })
+                })
+                .checked(is_active)
+                .on_click(move |_, _, cx| {
+                    app_switch
+                        .update(cx, |app, cx| app.switch_project(pid, cx))
+                        .detach();
+                }),
+            );
+        }
+    }
+
+    let app_new = app_state.clone();
+    let app_settings = app_state;
+    let active_for_settings = active_project;
+
+    menu.separator()
+        .item(
+            PopupMenuItem::new("New Project…")
+                .icon(IconName::Plus)
+                .on_click(move |_, window, cx| {
+                    open_new_project_modal(app_new.clone(), window, cx);
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Project Settings…")
+                .icon(IconName::Settings)
+                .disabled(active_for_settings.is_none())
+                .on_click(move |_, window, cx| {
+                    if let Some(proj) = active_for_settings.clone() {
+                        open_project_settings_modal(
+                            app_settings.clone(),
+                            proj,
+                            active_item_count,
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+        )
 }

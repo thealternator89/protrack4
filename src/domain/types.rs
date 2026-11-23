@@ -604,6 +604,90 @@ impl ProjectSnapshot {
         rows
     }
 
+    /// Traverses all active Features in deterministic `(sort_order, item_number)` DFS order.
+    pub fn active_features_dfs(&self) -> Vec<(&Item, usize)> {
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        self.collect_features_dfs(None, 0, &mut visited, &mut out);
+        out
+    }
+
+    fn collect_features_dfs<'a>(
+        &'a self,
+        parent_id: Option<ItemId>,
+        depth: usize,
+        visited: &mut HashSet<ItemId>,
+        out: &mut Vec<(&'a Item, usize)>,
+    ) {
+        if depth >= MAX_FEATURE_DEPTH {
+            return;
+        }
+        for feature in self.child_features(parent_id) {
+            if !visited.insert(feature.id) {
+                continue;
+            }
+            out.push((feature, depth));
+            self.collect_features_dfs(Some(feature.id), depth + 1, visited, out);
+        }
+    }
+
+    /// Returns all strict active descendant Feature IDs of `feature_id`.
+    pub fn descendant_feature_ids(&self, feature_id: ItemId) -> HashSet<ItemId> {
+        let mut descendants = HashSet::new();
+        let mut stack = Vec::new();
+        for child in self.child_features(Some(feature_id)) {
+            stack.push(child.id);
+        }
+        while let Some(id) = stack.pop() {
+            if id == feature_id || !descendants.insert(id) {
+                continue;
+            }
+            for child in self.child_features(Some(id)) {
+                stack.push(child.id);
+            }
+        }
+        descendants
+    }
+
+    /// Returns the maximum depth offset of active descendant Features (`0` for a leaf Feature).
+    pub fn feature_subtree_height(&self, feature_id: ItemId) -> usize {
+        let Some(root) = self.item(feature_id) else {
+            return 0;
+        };
+        if !root.is_active() || root.kind != ItemKind::Feature {
+            return 0;
+        }
+        let mut max_offset = 0usize;
+        let mut visited = HashSet::from([feature_id]);
+        let mut stack = vec![(feature_id, 0usize)];
+        while let Some((id, offset)) = stack.pop() {
+            max_offset = max_offset.max(offset);
+            if offset + 1 >= MAX_FEATURE_DEPTH {
+                continue;
+            }
+            for child in self.child_features(Some(id)) {
+                if visited.insert(child.id) {
+                    stack.push((child.id, offset + 1));
+                }
+            }
+        }
+        max_offset
+    }
+
+    /// Returns all ordered active sibling Features sharing the same `parent_feature_id`.
+    pub fn sibling_features(&self, feature_id: ItemId) -> Vec<&Item> {
+        let Some(feature) = self.item(feature_id) else {
+            return Vec::new();
+        };
+        if feature.project_id != self.project.id
+            || !feature.is_active()
+            || feature.kind != ItemKind::Feature
+        {
+            return Vec::new();
+        }
+        self.child_features(feature.parent_feature_id)
+    }
+
     fn collect_tree_rows(
         &self,
         parent_id: Option<ItemId>,

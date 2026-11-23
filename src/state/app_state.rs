@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{AppContext as _, Context, Entity, Task};
 
+use crate::commands::{CommandEffect, UndoableCommand};
 use crate::db::{DbService, DomainEventReceiver};
-use crate::domain::{DomainError, DomainEvent};
+use crate::domain::{DomainError, DomainEvent, ProjectId};
 use crate::state::{ProjectStore, ThemePreference};
 use crate::workspace::{
     AppPreferences, WorkspaceManager, default_preferences_path, normalize_protrack_path,
@@ -25,6 +26,7 @@ pub struct AppState {
     is_loading: bool,
     needs_welcome_modal: bool,
     last_error: Option<String>,
+    desired_project_id: Option<ProjectId>,
     project_store: Entity<ProjectStore>,
     event_listener_task: Option<Task<()>>,
     pending_workspace_task: Option<Task<()>>,
@@ -54,6 +56,7 @@ impl AppState {
             is_loading: false,
             needs_welcome_modal: false,
             last_error: None,
+            desired_project_id: None,
             project_store,
             event_listener_task: None,
             pending_workspace_task: None,
@@ -168,6 +171,7 @@ impl AppState {
             let project_id = db.seed_sample_project().await?;
             let overview = db.load_workspace_overview(Some(project_id)).await?;
             this.update(cx, |app, cx| {
+                app.desired_project_id = Some(project_id);
                 app.preferences
                     .set_active_project_for(&active_path, project_id);
                 app.persist_preferences_if_allowed();
@@ -180,6 +184,126 @@ impl AppState {
             .map_err(|_| DomainError::Storage("AppState dropped before seed completed".into()))?;
             Ok(())
         })
+    }
+
+    pub fn switch_project(
+        &mut self,
+        project_id: ProjectId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), DomainError>> {
+        let Some(handle) = self.workspace_manager.active() else {
+            return Task::ready(Err(DomainError::Validation(
+                "No workspace is currently open".to_string(),
+            )));
+        };
+        let db = handle.db.clone();
+        let active_path = handle.path.clone();
+
+        self.desired_project_id = Some(project_id);
+        self.preferences
+            .set_active_project_for(&active_path, project_id);
+        self.persist_preferences_if_allowed();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let overview = db.load_workspace_overview(Some(project_id)).await?;
+            this.update(cx, |app, cx| {
+                if app.desired_project_id == Some(project_id)
+                    && app.active_workspace_path() == Some(active_path.as_path())
+                {
+                    app.project_store.update(cx, |store, cx| {
+                        store.apply_workspace_overview(active_path, overview);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+            })
+            .map_err(|_| {
+                DomainError::Storage("AppState dropped before project switch completed".into())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn execute_command(
+        &mut self,
+        command: Box<dyn UndoableCommand>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CommandEffect, DomainError>> {
+        let Some(handle) = self.workspace_manager.active() else {
+            return Task::ready(Err(DomainError::Validation(
+                "No workspace is currently open".to_string(),
+            )));
+        };
+        let db = handle.db.clone();
+        let active_path = handle.path.clone();
+
+        cx.spawn(async move |this, cx| {
+            let effect = db.execute_command(command).await?;
+            let target_project_id = this
+                .update(cx, |app, cx| {
+                    if let Some(created_pid) = effect.created_project_id
+                        && app.active_workspace_path() == Some(active_path.as_path())
+                    {
+                        app.desired_project_id = Some(created_pid);
+                        app.preferences
+                            .set_active_project_for(&active_path, created_pid);
+                        app.persist_preferences_if_allowed();
+                    }
+
+                    effect
+                        .created_project_id
+                        .or(app.desired_project_id)
+                        .or_else(|| app.project_store.read(cx).snapshot().map(|s| s.project.id))
+                })
+                .map_err(|_| {
+                    DomainError::Storage("AppState dropped before command refresh".into())
+                })?;
+
+            let overview = db.load_workspace_overview(target_project_id).await?;
+            this.update(cx, |app, cx| {
+                if app.active_workspace_path() != Some(active_path.as_path()) {
+                    return;
+                }
+                if let Some(wanted) = app.desired_project_id
+                    && overview.projects.iter().any(|p| p.id == wanted)
+                    && overview.active_snapshot.as_ref().map(|s| s.project.id) != Some(wanted)
+                {
+                    return;
+                }
+                if let Some(snap) = &overview.active_snapshot {
+                    app.desired_project_id = Some(snap.project.id);
+                    app.preferences
+                        .set_active_project_for(&active_path, snap.project.id);
+                }
+
+                app.project_store.update(cx, |store, cx| {
+                    store.apply_workspace_overview(active_path, overview);
+                    if let Some(item_id) = effect.selected_item_id {
+                        store.expand_ancestors_of(item_id);
+                        store.select_item(Some(item_id));
+                    }
+                    cx.notify();
+                });
+                cx.notify();
+            })
+            .map_err(|_| DomainError::Storage("AppState dropped before UI refresh".into()))?;
+
+            Ok(effect)
+        })
+    }
+
+    /// Synchronously executes a command on the active DB actor during window-close flush.
+    pub fn execute_command_for_shutdown(
+        &self,
+        command: Box<dyn UndoableCommand>,
+    ) -> Result<CommandEffect, DomainError> {
+        let Some(handle) = self.workspace_manager.active() else {
+            return Err(DomainError::Validation(
+                "No workspace is currently open".to_string(),
+            ));
+        };
+        handle.db.execute_command_blocking(command)
     }
 
     fn open_or_create_workspace(
@@ -196,6 +320,7 @@ impl AppState {
                 let db = active.db.clone();
                 let active_path = active.path.clone();
                 let preferred = self.preferences.active_project_for(&active_path);
+                self.desired_project_id = preferred;
                 self.request_generation += 1;
                 let req_gen = self.request_generation;
                 self.is_loading = true;
@@ -240,6 +365,7 @@ impl AppState {
         cx.notify();
 
         let preferred_project_id = self.preferences.active_project_for(&path);
+        self.desired_project_id = preferred_project_id;
         let bg_path = path.clone();
 
         cx.spawn(async move |this, cx| {
@@ -315,8 +441,11 @@ impl AppState {
                         );
                     }
                     if let Some(snap) = &overview.active_snapshot {
+                        app.desired_project_id = Some(snap.project.id);
                         app.preferences
                             .set_active_project_for(&opened_path, snap.project.id);
+                    } else {
+                        app.desired_project_id = None;
                     }
                     if record_recents || !app.db_override_active || app.custom_preferences_path {
                         app.save_preferences();
@@ -368,10 +497,8 @@ impl AppState {
         self.event_listener_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = rx.recv().await {
                 let preferred_project_id = match this.read_with(cx, |app, cx| {
-                    app.project_store
-                        .read(cx)
-                        .snapshot()
-                        .map(|snap| snap.project.id)
+                    app.desired_project_id
+                        .or_else(|| app.project_store.read(cx).snapshot().map(|snap| snap.project.id))
                         .or_else(|| {
                             app.active_workspace_path()
                                 .and_then(|p| app.preferences.active_project_for(p))
@@ -384,7 +511,7 @@ impl AppState {
                 let target_project = match event {
                     DomainEvent::ItemsChanged { project_id }
                     | DomainEvent::TrashChanged { project_id }
-                    | DomainEvent::TagsChanged { project_id } => Some(project_id),
+                    | DomainEvent::TagsChanged { project_id } => preferred_project_id.or(Some(project_id)),
                     DomainEvent::WorkspaceSwitched
                     | DomainEvent::ProjectsChanged
                     | DomainEvent::AssigneesChanged => preferred_project_id,
@@ -393,6 +520,13 @@ impl AppState {
                 match db.load_workspace_overview(target_project).await {
                     Ok(overview) => {
                         let _ = this.update(cx, |app, cx| {
+                            if let Some(wanted) = app.desired_project_id
+                                && overview.projects.iter().any(|p| p.id == wanted)
+                                && overview.active_snapshot.as_ref().map(|s| s.project.id)
+                                    != Some(wanted)
+                            {
+                                return;
+                            }
                             if let Some(path) = app.active_workspace_path().map(Path::to_path_buf)
                             {
                                 app.project_store.update(cx, |store, cx| {
@@ -469,6 +603,7 @@ impl AppState {
 
     pub fn close_workspace_sync(&mut self, cx: &mut Context<Self>) -> Result<(), DomainError> {
         self.persist_preferences_if_allowed();
+        self.desired_project_id = None;
         self.event_listener_task.take();
         self.pending_workspace_task.take();
         let res = self.workspace_manager.close_workspace();

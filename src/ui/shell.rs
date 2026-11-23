@@ -1,4 +1,5 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -15,17 +16,19 @@ use gpui_kit::{
 
 use crate::domain::{ItemId, ItemKind, ProjectSnapshot, clamped_depth_badge, visual_indent_px};
 use crate::state::{AppState, CenterViewTab, LaunchConfig, ProjectStore, ThemePreference};
-use crate::ui::inspector::render_inspector;
-use crate::ui::modals::open_workspace_modal;
+use crate::ui::inspector::InspectorView;
+use crate::ui::modals::{open_new_project_modal, open_workspace_modal};
 use crate::ui::sidebar::render_sidebar;
 use crate::ui::{
-    OpenWorkspace, ToggleInspector, ToggleSidebar, assignee_pill, domain_tag_chip, kind_badge,
-    parse_hex_or, priority_badge, progress_pill, status_badge, status_color, status_icon,
+    OpenWorkspace, ToggleInspector, ToggleSidebar, assignee_pill, build_project_switcher_menu,
+    domain_tag_chip, kind_badge, parse_hex_or, priority_badge, progress_pill, status_badge,
+    status_color, status_icon,
 };
 
 pub struct WorkspaceShell {
     app_state: Entity<AppState>,
     store: Entity<ProjectStore>,
+    inspector: Entity<InspectorView>,
     focus_handle: FocusHandle,
     resizable_state: Entity<ResizableState>,
     sidebar_width: Pixels,
@@ -48,6 +51,7 @@ impl WorkspaceShell {
     ) -> Self {
         let app_state = cx.new(|cx| AppState::new(config.clone(), cx));
         let store = app_state.read(cx).project_store().clone();
+        let inspector = cx.new(|cx| InspectorView::new(app_state.clone(), store.clone(), window, cx));
         let prefs = app_state.read(cx).preferences().clone();
 
         prefs.theme.apply(Some(window), cx);
@@ -75,7 +79,9 @@ impl WorkspaceShell {
         });
 
         let app_for_close = app_state.clone();
+        let inspector_for_close = inspector.clone();
         window.on_window_should_close(cx, move |_, cx| {
+            inspector_for_close.update(cx, |view, cx| view.flush_pending_edits_for_shutdown(cx));
             if let Err(err) = app_for_close.update(cx, |app, cx| app.close_workspace_sync(cx)) {
                 tracing::warn!(error = %err, "Failed to close workspace cleanly on window close");
             }
@@ -95,6 +101,7 @@ impl WorkspaceShell {
         Self {
             app_state,
             store,
+            inspector,
             focus_handle,
             resizable_state,
             sidebar_width,
@@ -112,6 +119,10 @@ impl WorkspaceShell {
 
     pub fn store(&self) -> &Entity<ProjectStore> {
         &self.store
+    }
+
+    pub fn inspector(&self) -> &Entity<InspectorView> {
+        &self.inspector
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -322,15 +333,33 @@ impl WorkspaceShell {
                                 open_workspace_modal(this.app_state.clone(), window, cx);
                             })),
                     )
-                    .child(
-                        Button::new("toolbar-project-stub")
+                    .child({
+                        let projects = state.projects().to_vec();
+                        let active_project = snapshot.map(|s| s.project.clone());
+                        let active_item_count = snapshot.map_or(0, |s| s.items.len());
+                        let app_state_for_menu = self.app_state.clone();
+                        Button::new("toolbar-project-switcher")
                             .outline()
                             .small()
                             .dropdown_caret(true)
-                            .disabled(true)
-                            .tooltip("Project switcher & settings — Available in Phase 3")
-                            .child(project_pill),
-                    ),
+                            .disabled(!has_workspace)
+                            .tooltip(if has_workspace {
+                                "Switch Project, create a new Project, or open Project Settings"
+                            } else {
+                                "Open or create a workspace first"
+                            })
+                            .child(project_pill)
+                            .dropdown_menu(move |menu, _, cx| {
+                                build_project_switcher_menu(
+                                    menu,
+                                    projects.clone(),
+                                    active_project.clone(),
+                                    active_item_count,
+                                    app_state_for_menu.clone(),
+                                    cx,
+                                )
+                            })
+                    }),
             )
             // Center group: View tabs
             .child(tab_bar)
@@ -488,16 +517,29 @@ impl WorkspaceShell {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Project creation arrives in Phase 3. You can seed the starter sample project or switch workspaces."),
+                            .child("Create a new Project in this workspace, or seed the starter ProTrack v1 sample project."),
                     )
                     .child(
                         h_flex()
                             .gap_2()
                             .child(
-                                Button::new("center-seed-sample-btn")
+                                Button::new("center-new-project-btn")
                                     .primary()
                                     .small()
                                     .icon(IconName::Plus)
+                                    .label("New Project…")
+                                    .on_click({
+                                        let app_state = self.app_state.clone();
+                                        move |_, window, cx| {
+                                            open_new_project_modal(app_state.clone(), window, cx);
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("center-seed-sample-btn")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::FolderOpen)
                                     .label("Seed Sample Project")
                                     .on_click({
                                         let app_state = self.app_state.clone();
@@ -1233,7 +1275,7 @@ impl Render for WorkspaceShell {
                         .size(self.sidebar_width)
                         .size_range(px(200.)..px(400.))
                         .flex_none()
-                        .child(render_sidebar(&self.store, window, cx)),
+                        .child(render_sidebar(&self.app_state, &self.store, window, cx)),
                 )
             })
             .child(
@@ -1247,7 +1289,7 @@ impl Render for WorkspaceShell {
                         .size(self.inspector_width)
                         .size_range(px(300.)..px(540.))
                         .flex_none()
-                        .child(render_inspector(&self.store, window, cx)),
+                        .child(self.inspector.clone()),
                 )
             });
 

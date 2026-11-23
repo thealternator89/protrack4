@@ -1,4 +1,5 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
@@ -9,11 +10,15 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::domain::{clamped_depth_badge, visual_indent_px};
-use crate::state::{CenterViewTab, ProjectStore};
-use crate::ui::{parse_hex_or, progress_pill, status_color, status_icon};
+use crate::domain::{MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px};
+use crate::state::{AppState, CenterViewTab, ProjectStore};
+use crate::ui::modals::{open_create_feature_modal, open_project_settings_modal};
+use crate::ui::{
+    build_project_switcher_menu, parse_hex_or, progress_pill, status_color, status_icon,
+};
 
 pub fn render_sidebar(
+    app_state: &Entity<AppState>,
     store: &Entity<ProjectStore>,
     _window: &mut Window,
     cx: &mut App,
@@ -21,6 +26,9 @@ pub fn render_sidebar(
     let state = store.read(cx);
     let snapshot = state.snapshot();
     let has_workspace = state.has_workspace();
+    let projects = state.projects().to_vec();
+    let active_project = snapshot.map(|s| s.project.clone());
+    let active_item_count = snapshot.map_or(0, |s| s.items.len());
     let active_tab = state.active_tab();
     let selected_item_id = state.selected_item_id();
     let unallocated_count = snapshot.map_or(0, |s| s.unallocated_work_items().len());
@@ -36,16 +44,13 @@ pub fn render_sidebar(
     let amber_bg = amber.opacity(if cx.theme().is_dark() { 0.22 } else { 0.14 });
     let amber_border = amber.opacity(if cx.theme().is_dark() { 0.42 } else { 0.30 });
 
-    let project_header = if let Some(snap) = snapshot {
-        let project = &snap.project;
+    let switcher_label = if let Some(project) = &active_project {
         let project_color = parse_hex_or(&project.color, cx.theme().primary);
         h_flex()
-            .px_3()
-            .py_2p5()
+            .flex_1()
+            .min_w_0()
             .gap_2()
             .items_center()
-            .border_b_1()
-            .border_color(cx.theme().sidebar_border)
             .child(
                 div()
                     .size(px(10.))
@@ -76,20 +81,13 @@ pub fn render_sidebar(
                     .font_semibold()
                     .child(project.name.clone()),
             )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(project.status.label()),
-            )
+            .into_any_element()
     } else {
         h_flex()
-            .px_3()
-            .py_2p5()
+            .flex_1()
+            .min_w_0()
             .gap_2()
             .items_center()
-            .border_b_1()
-            .border_color(cx.theme().sidebar_border)
             .child(
                 div()
                     .size(px(10.))
@@ -113,14 +111,80 @@ pub fn render_sidebar(
                         "No Workspace"
                     }),
             )
+            .into_any_element()
     };
+
+    let project_header = h_flex()
+        .px_2()
+        .py_1p5()
+        .gap_1()
+        .items_center()
+        .border_b_1()
+        .border_color(cx.theme().sidebar_border)
+        .child(
+            div().flex_1().min_w_0().child(
+                Button::new("sidebar-project-switcher")
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .dropdown_caret(true)
+                    .disabled(!has_workspace)
+                    .tooltip(if has_workspace {
+                        "Switch Project or create a new Project"
+                    } else {
+                        "Open or create a workspace first"
+                    })
+                    .child(switcher_label)
+                    .dropdown_menu({
+                        let projects = projects.clone();
+                        let active_project = active_project.clone();
+                        let app_state = app_state.clone();
+                        move |menu, _, cx| {
+                            build_project_switcher_menu(
+                                menu,
+                                projects.clone(),
+                                active_project.clone(),
+                                active_item_count,
+                                app_state.clone(),
+                                cx,
+                            )
+                        }
+                    }),
+            ),
+        )
+        .child(
+            Button::new("sidebar-project-settings")
+                .ghost()
+                .xsmall()
+                .compact()
+                .icon(IconName::Settings)
+                .disabled(active_project.is_none())
+                .tooltip("Project Settings…")
+                .on_click({
+                    let app_state = app_state.clone();
+                    let active_project = active_project.clone();
+                    move |_, window, cx| {
+                        if let Some(project) = active_project.clone() {
+                            open_project_settings_modal(
+                                app_state.clone(),
+                                project,
+                                active_item_count,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }),
+        );
+
+    let active_project_id = active_project.as_ref().map(|p| p.id);
 
     v_flex()
         .size_full()
         .overflow_hidden()
         .bg(cx.theme().sidebar)
         .text_color(cx.theme().sidebar_foreground)
-        // Project header
+        // Project header / switcher
         .child(project_header)
         // Pinned Unallocated row
         .child(
@@ -196,30 +260,58 @@ pub fn render_sidebar(
                         .child("FEATURES"),
                 )
                 .child(
-                    Button::new("sidebar-toggle-expand-all")
-                        .ghost()
-                        .xsmall()
-                        .compact()
-                        .disabled(snapshot.is_none())
-                        .icon(IconName::ChevronsUpDown)
-                        .tooltip(if any_expanded {
-                            "Collapse all Features"
-                        } else {
-                            "Expand all Features"
-                        })
-                        .on_click({
-                            let store = store.clone();
-                            move |_, _, cx| {
-                                store.update(cx, |s, cx| {
-                                    if s.expanded_features().is_empty() {
-                                        s.expand_all_features();
-                                    } else {
-                                        s.collapse_all_features();
+                    h_flex()
+                        .gap_0p5()
+                        .items_center()
+                        .child(
+                            Button::new("sidebar-add-root-feature")
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .disabled(active_project_id.is_none())
+                                .icon(IconName::Plus)
+                                .tooltip("New Root Feature")
+                                .on_click({
+                                    let app_state = app_state.clone();
+                                    move |_, window, cx| {
+                                        if let Some(pid) = active_project_id {
+                                            open_create_feature_modal(
+                                                app_state.clone(),
+                                                pid,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        }
                                     }
-                                    cx.notify();
-                                });
-                            }
-                        }),
+                                }),
+                        )
+                        .child(
+                            Button::new("sidebar-toggle-expand-all")
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .disabled(snapshot.is_none())
+                                .icon(IconName::ChevronsUpDown)
+                                .tooltip(if any_expanded {
+                                    "Collapse all Features"
+                                } else {
+                                    "Expand all Features"
+                                })
+                                .on_click({
+                                    let store = store.clone();
+                                    move |_, _, cx| {
+                                        store.update(cx, |s, cx| {
+                                            if s.expanded_features().is_empty() {
+                                                s.expand_all_features();
+                                            } else {
+                                                s.collapse_all_features();
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
                 ),
         )
         // Nested Feature tree
@@ -230,11 +322,33 @@ pub fn render_sidebar(
                     .min_h_0()
                     .px_3()
                     .py_4()
+                    .gap_2()
+                    .items_start()
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child("No features in this project yet."),
+                    )
+                    .child(
+                        Button::new("sidebar-empty-add-feature")
+                            .outline()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .label("New Feature")
+                            .on_click({
+                                let app_state = app_state.clone();
+                                let pid = snap.project.id;
+                                move |_, window, cx| {
+                                    open_create_feature_modal(
+                                        app_state.clone(),
+                                        pid,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
                     )
                     .into_any_element()
             } else {
@@ -253,6 +367,9 @@ pub fn render_sidebar(
                         let depth_badge = clamped_depth_badge(row.depth);
                         let indent = visual_indent_px(row.depth);
                         let item_id = row.item_id;
+                        let project_id = item.project_id;
+                        let parent_label = format!("{} {}", item.item_key, item.title);
+                        let at_max_depth = row.depth + 1 >= MAX_FEATURE_DEPTH;
                         let s_color = status_color(item.status, cx);
 
                         Some(
@@ -260,7 +377,7 @@ pub fn render_sidebar(
                                 .id(("sidebar-feature", item.item_number as usize))
                                 .w_full()
                                 .pl(px(6.0 + indent))
-                                .pr_2()
+                                .pr_1p5()
                                 .py_1()
                                 .gap_1()
                                 .items_center()
@@ -347,7 +464,38 @@ pub fn render_sidebar(
                                             .child(badge),
                                     )
                                 })
-                                .child(progress_pill(done, total, cx)),
+                                .child(progress_pill(done, total, cx))
+                                .child(
+                                    Button::new((
+                                        "sidebar-add-subfeature",
+                                        item.item_number as usize,
+                                    ))
+                                    .ghost()
+                                    .xsmall()
+                                    .compact()
+                                    .disabled(at_max_depth)
+                                    .icon(IconName::Plus)
+                                    .tooltip(if at_max_depth {
+                                        "Maximum Feature nesting depth (32) reached"
+                                    } else {
+                                        "New Sub-Feature"
+                                    })
+                                    .on_click({
+                                        let app_state = app_state.clone();
+                                        let parent_label = parent_label.clone();
+                                        let depth = row.depth;
+                                        move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            open_create_feature_modal(
+                                                app_state.clone(),
+                                                project_id,
+                                                Some((item_id, parent_label.clone(), depth)),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                ),
                         )
                     }))
                     .into_any_element()

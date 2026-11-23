@@ -237,6 +237,28 @@ impl ProjectStore {
         }
     }
 
+    pub fn expand_feature(&mut self, id: ItemId) {
+        self.expanded_features.insert(id);
+    }
+
+    pub fn expand_ancestors_of(&mut self, item_id: ItemId) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(item) = snapshot.item(item_id) else {
+            return;
+        };
+        let mut cur = item.parent_feature_id;
+        let mut visited = HashSet::new();
+        while let Some(pid) = cur {
+            if !visited.insert(pid) {
+                break;
+            }
+            self.expanded_features.insert(pid);
+            cur = snapshot.item(pid).and_then(|parent| parent.parent_feature_id);
+        }
+    }
+
     pub fn expand_all_features(&mut self) {
         let Some(snapshot) = &self.snapshot else {
             return;
