@@ -3,13 +3,15 @@ pub mod meta_commands;
 
 use rusqlite::Transaction;
 
-use crate::domain::{DomainError, DomainEvent, ItemId, ProjectId};
+use crate::domain::{AssigneeId, DomainError, DomainEvent, ItemId, ProjectId, TagId};
 
 pub use item_commands::{
     AttachWorkItemToFeature, CreateFeature, CreateWorkItem, DetachWorkItemFromFeature,
-    ReparentFeature, ReorderSiblingFeatures, SetWorkItemFeatures, UpdateItemFields,
+    ReparentFeature, ReorderSiblingFeatures, SetItemTags, SetWorkItemFeatures, UpdateItemFields,
 };
-pub use meta_commands::{CreateProject, UpdateProject};
+pub use meta_commands::{
+    ArchiveAssignee, CreateProject, DeleteTag, UpdateProject, UpsertAssignee, UpsertTag,
+};
 
 /// Result emitted by executing or undoing a command inside a SQLite transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,6 +19,8 @@ pub struct CommandEffect {
     pub events: Vec<DomainEvent>,
     pub created_project_id: Option<ProjectId>,
     pub created_item_id: Option<ItemId>,
+    pub created_assignee_id: Option<AssigneeId>,
+    pub created_tag_id: Option<TagId>,
     pub selected_item_id: Option<ItemId>,
     pub toast: Option<String>,
 }
@@ -124,6 +128,7 @@ mod tests {
             description: Some("## Details".to_string()),
             status: Some(ItemStatus::InProgress),
             priority: Some(Priority::Urgent),
+            assignee_id: None,
         };
         {
             let tx = conn
@@ -181,6 +186,7 @@ mod tests {
             description: None,
             status: None,
             priority: None,
+            assignee_id: None,
         };
         {
             let tx = conn
@@ -286,5 +292,150 @@ mod tests {
         }
         let snap4 = load_project_snapshot(&conn, pid).unwrap();
         assert_eq!(snap4.unallocated_work_items().len(), 1);
+    }
+
+    #[test]
+    fn assignee_and_tag_commands_execute_atomically_and_enforce_isolation() {
+        use crate::db::load_project_snapshot;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "MetaCmdTest").unwrap();
+
+        let (pid_a, pid_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut ca = CreateProject::new("Alpha", "ALP", "", "#6366F1", ProjectStatus::Active);
+            let mut cb = CreateProject::new("Beta", "BET", "", "#10B981", ProjectStatus::Active);
+            let pa = ca.execute(&tx).unwrap().created_project_id.unwrap();
+            let pb = cb.execute(&tx).unwrap().created_project_id.unwrap();
+            tx.commit().unwrap();
+            (pa, pb)
+        };
+
+        let (wi_a, wi_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cwa =
+                CreateWorkItem::new(pid_a, "Alpha task", "", ItemStatus::Todo, Priority::High, vec![]);
+            let mut cwb =
+                CreateWorkItem::new(pid_b, "Beta task", "", ItemStatus::Todo, Priority::Low, vec![]);
+            let ia = cwa.execute(&tx).unwrap().created_item_id.unwrap();
+            let ib = cwb.execute(&tx).unwrap().created_item_id.unwrap();
+            tx.commit().unwrap();
+            (ia, ib)
+        };
+
+        // Create global Assignee and edit it
+        let mut create_assignee = UpsertAssignee::create(
+            "Mark Benson",
+            "MB",
+            "#6366F1",
+            Some("Founder".to_string()),
+            "Owner",
+        );
+        let assignee_eff = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let eff = create_assignee.execute(&tx).unwrap();
+            tx.commit().unwrap();
+            eff
+        };
+        let mb_id = assignee_eff.created_assignee_id.unwrap();
+        assert_eq!(assignee_eff.events, vec![DomainEvent::AssigneesChanged]);
+
+        // Assign MB to both Alpha and Beta items
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut ua = UpdateItemFields {
+                item_id: wi_a,
+                title: None,
+                description: None,
+                status: None,
+                priority: None,
+                assignee_id: Some(Some(mb_id)),
+            };
+            let mut ub = UpdateItemFields {
+                item_id: wi_b,
+                title: None,
+                description: None,
+                status: None,
+                priority: None,
+                assignee_id: Some(Some(mb_id)),
+            };
+            ua.execute(&tx).unwrap();
+            ub.execute(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Archive MB -> preserved on items, rejected on unassign/re-assign to new item
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut arch = ArchiveAssignee::new(mb_id, true);
+            let eff = arch.execute(&tx).unwrap();
+            assert_eq!(eff.events, vec![DomainEvent::AssigneesChanged]);
+            tx.commit().unwrap();
+        }
+
+        // Create Project A tag, attach to wi_a, verify Project B cannot attach it
+        let mut create_tag = UpsertTag::create(pid_a, "backend", "#8B5CF6");
+        let tag_id = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let eff = create_tag.execute(&tx).unwrap();
+            assert_eq!(eff.events, vec![DomainEvent::TagsChanged { project_id: pid_a }]);
+            tx.commit().unwrap();
+            eff.created_tag_id.unwrap()
+        };
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut set_ok = SetItemTags::new(wi_a, vec![tag_id]);
+            set_ok.execute(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut set_cross = SetItemTags::new(wi_b, vec![tag_id]);
+            assert_eq!(
+                set_cross.execute(&tx).unwrap_err(),
+                DomainError::CrossProjectReference
+            );
+        }
+
+        let snap_a = load_project_snapshot(&conn, pid_a).unwrap();
+        assert_eq!(snap_a.item(wi_a).unwrap().assignee_id, Some(mb_id));
+        assert_eq!(snap_a.tags_for_item(wi_a).len(), 1);
+
+        // Delete tag
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut del = DeleteTag::new(tag_id);
+            let eff = del.execute(&tx).unwrap();
+            assert_eq!(
+                eff.events,
+                vec![
+                    DomainEvent::TagsChanged { project_id: pid_a },
+                    DomainEvent::ItemsChanged { project_id: pid_a },
+                ]
+            );
+            tx.commit().unwrap();
+        }
+        let snap_a_after = load_project_snapshot(&conn, pid_a).unwrap();
+        assert!(snap_a_after.tags.is_empty());
+        assert!(snap_a_after.tags_for_item(wi_a).is_empty());
     }
 }

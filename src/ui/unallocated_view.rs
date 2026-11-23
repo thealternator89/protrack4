@@ -376,11 +376,13 @@ impl Render for UnallocatedView {
                                     .font_medium()
                                     .child(wi.title.clone()),
                             )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .children(tags.into_iter().map(|tag| domain_tag_chip(tag, cx))),
-                            )
+                            .when(!tags.is_empty(), |this| {
+                                this.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .children(tags.into_iter().map(|tag| domain_tag_chip(tag, cx))),
+                                )
+                            })
                             .child(priority_badge(wi.priority, cx))
                             .when_some(assignee, |this, a| {
                                 this.child(assignee_pill(a, false, cx))
@@ -492,12 +494,18 @@ impl Render for UnallocatedView {
                                                     .into_any_element()
                                             } else {
                                                 v_flex()
+                                                    .w_full()
                                                     .max_h(px(220.))
-                                                    .gap_0p5()
-                                                    .overflow_y_scrollbar()
-                                                    .id("unallocated-picker-scroll")
-                                                    .children(features.into_iter().map(
-                                                        |(feat, depth)| {
+                                                    .overflow_hidden()
+                                                    .child(
+                                                        div().flex_1().overflow_hidden().child(
+                                                            v_flex()
+                                                                .size_full()
+                                                                .gap_0p5()
+                                                                .overflow_y_scrollbar()
+                                                                .id("unallocated-picker-scroll")
+                                                                .children(features.into_iter().map(
+                                                                    |(feat, depth)| {
                                                             let fid = feat.id;
                                                             let checked = draft.contains(&fid);
                                                             let indent = if query.is_empty() {
@@ -514,6 +522,7 @@ impl Render for UnallocatedView {
                                                                 "unallocated-picker-feature",
                                                                 feat.item_number as usize,
                                                             ))
+                                                            .flex_shrink_0()
                                                             .w_full()
                                                             .pl(px(8.0 + indent))
                                                             .pr_2()
@@ -612,7 +621,9 @@ impl Render for UnallocatedView {
                                                                     ),
                                                             )
                                                         },
-                                                    ))
+                                                    )),
+                                                    ),
+                                                    )
                                                     .into_any_element()
                                             })
                                             .child(

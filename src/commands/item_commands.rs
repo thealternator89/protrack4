@@ -9,7 +9,10 @@ use crate::db::item_repo::{
     query_features_for_work_item, reparent_feature, reorder_sibling_features,
     set_work_item_features, update_item_fields,
 };
-use crate::domain::{DomainError, DomainEvent, ItemId, ItemStatus, Priority, ProjectId};
+use crate::db::tag_repo::set_item_tags;
+use crate::domain::{
+    AssigneeId, DomainError, DomainEvent, ItemId, ItemStatus, Priority, ProjectId, TagId,
+};
 
 #[derive(Debug, Clone)]
 pub struct CreateFeature {
@@ -66,10 +69,10 @@ impl UndoableCommand for CreateFeature {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
-            created_project_id: None,
             created_item_id: Some(item.id),
             selected_item_id: Some(item.id),
             toast: Some(format!("Created {} · {}", item.item_key, item.title)),
+            ..Default::default()
         })
     }
 
@@ -135,10 +138,10 @@ impl UndoableCommand for CreateWorkItem {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
-            created_project_id: None,
             created_item_id: Some(item.id),
             selected_item_id: Some(item.id),
             toast: Some(format!("Created {} · {}", item.item_key, item.title)),
+            ..Default::default()
         })
     }
 
@@ -156,6 +159,7 @@ pub struct UpdateItemFields {
     pub description: Option<String>,
     pub status: Option<ItemStatus>,
     pub priority: Option<Priority>,
+    pub assignee_id: Option<Option<AssigneeId>>,
 }
 
 impl UndoableCommand for UpdateItemFields {
@@ -172,6 +176,7 @@ impl UndoableCommand for UpdateItemFields {
                 description: self.description.clone(),
                 status: self.status,
                 priority: self.priority,
+                assignee_id: self.assignee_id,
             },
         )?;
 
@@ -179,10 +184,41 @@ impl UndoableCommand for UpdateItemFields {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
-            created_project_id: None,
-            created_item_id: None,
-            selected_item_id: None,
-            toast: None,
+            ..Default::default()
+        })
+    }
+
+    fn undo(&mut self, _tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        Err(DomainError::Validation(
+            "Undo is not yet enabled (Phase 12)".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetItemTags {
+    pub item_id: ItemId,
+    pub tag_ids: Vec<TagId>,
+}
+
+impl SetItemTags {
+    pub fn new(item_id: ItemId, tag_ids: Vec<TagId>) -> Self {
+        Self { item_id, tag_ids }
+    }
+}
+
+impl UndoableCommand for SetItemTags {
+    fn label(&self) -> String {
+        "Update Item Tags".to_string()
+    }
+
+    fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        let item = set_item_tags(tx, self.item_id, &self.tag_ids)?;
+        Ok(CommandEffect {
+            events: vec![DomainEvent::ItemsChanged {
+                project_id: item.project_id,
+            }],
+            ..Default::default()
         })
     }
 
@@ -220,10 +256,9 @@ impl UndoableCommand for ReparentFeature {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
-            created_project_id: None,
-            created_item_id: None,
             selected_item_id: Some(item.id),
             toast: Some(format!("Updated parent for {}", item.item_key)),
+            ..Default::default()
         })
     }
 
@@ -276,10 +311,8 @@ impl UndoableCommand for ReorderSiblingFeatures {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
-            created_project_id: None,
-            created_item_id: None,
             selected_item_id: Some(item.id),
-            toast: None,
+            ..Default::default()
         })
     }
 
@@ -327,10 +360,8 @@ impl UndoableCommand for SetWorkItemFeatures {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
-            created_project_id: None,
-            created_item_id: None,
-            selected_item_id: None,
             toast: Some(toast),
+            ..Default::default()
         })
     }
 
@@ -370,10 +401,8 @@ impl UndoableCommand for AttachWorkItemToFeature {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: link.project_id,
             }],
-            created_project_id: None,
-            created_item_id: None,
-            selected_item_id: None,
             toast: Some(format!("Attached {} to {}", wi.item_key, feat.item_key)),
+            ..Default::default()
         })
     }
 
@@ -421,10 +450,8 @@ impl UndoableCommand for DetachWorkItemFromFeature {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: wi.project_id,
             }],
-            created_project_id: None,
-            created_item_id: None,
-            selected_item_id: None,
             toast: Some(toast),
+            ..Default::default()
         })
     }
 

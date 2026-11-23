@@ -3,6 +3,7 @@ use std::cell::Cell;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
@@ -14,16 +15,23 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Subscription, TestSupportExt as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::commands::{CreateFeature, CreateProject, UndoableCommand, UpdateProject};
+use crate::commands::{
+    ArchiveAssignee, CreateFeature, CreateProject, DeleteTag, UndoableCommand, UpdateProject,
+    UpsertAssignee, UpsertTag,
+};
+use crate::db::assignee_repo::{validate_assignee_handle, validate_assignee_name};
 use crate::db::project_repo::{validate_hex_color, validate_key_prefix, validate_project_name};
-use crate::domain::{ItemId, ItemStatus, Priority, Project, ProjectId, ProjectStatus};
-use crate::state::AppState;
+use crate::db::tag_repo::validate_tag_name;
+use crate::domain::{
+    AssigneeId, ItemId, ItemStatus, Priority, Project, ProjectId, ProjectStatus, TagId,
+};
+use crate::state::{AppState, ProjectStore};
 use crate::ui::{
     PrioritySelectOption, StatusSelectOption, all_priority_options, all_status_options,
-    parse_hex_or,
+    assignee_pill, domain_tag_chip, parse_hex_or,
 };
 
 const PROJECT_COLOR_PRESETS: &[(&str, &str)] = &[
@@ -951,6 +959,1158 @@ pub fn open_create_feature_modal(
         dialog
             .width(px(440.))
             .title(title)
+            .content(move |content, _, _| content.child(view.clone()))
+    });
+}
+
+fn suggest_assignee_handle(name: &str) -> String {
+    let words: Vec<String> = name
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_uppercase())
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    if words.len() >= 2 {
+        words
+            .iter()
+            .filter_map(|w| w.chars().next())
+            .take(4)
+            .collect()
+    } else if let Some(first) = words.into_iter().next() {
+        first.chars().take(4).collect()
+    } else {
+        String::new()
+    }
+}
+
+fn render_error_banner(error: Option<String>, cx: &App) -> Option<impl IntoElement> {
+    let err = error?;
+    let danger = cx.theme().danger;
+    let danger_bg = danger.opacity(if cx.theme().is_dark() { 0.16 } else { 0.10 });
+    let danger_border = danger.opacity(if cx.theme().is_dark() { 0.42 } else { 0.30 });
+
+    Some(
+        h_flex()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .items_start()
+            .rounded(cx.theme().radius)
+            .bg(danger_bg)
+            .border_1()
+            .border_color(danger_border)
+            .child(Icon::new(IconName::TriangleAlert).small().text_color(danger))
+            .child(div().flex_1().text_xs().text_color(danger).child(err)),
+    )
+}
+
+pub struct AssigneesManagerModalView {
+    app_state: Entity<AppState>,
+    store: Entity<ProjectStore>,
+    editing_id: Option<AssigneeId>,
+    name_input: Entity<InputState>,
+    handle_input: Entity<InputState>,
+    role_input: Entity<InputState>,
+    notes_input: Entity<TextareaState>,
+    selected_color: String,
+    handle_edited_manually: bool,
+    suppress_handle_change: bool,
+    error: Option<String>,
+    busy: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl AssigneesManagerModalView {
+    fn new(
+        app_state: Entity<AppState>,
+        store: Entity<ProjectStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g., Mark Benson"));
+        let handle_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g., MB"));
+        let role_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Optional role (e.g., Founder)"));
+        let notes_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(2)
+                .soft_wrap(true)
+                .placeholder("Optional local notes…")
+        });
+
+        let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
+
+        let name_sub = cx.subscribe_in(
+            &name_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.error = None;
+                    if this.editing_id.is_none() && !this.handle_edited_manually {
+                        let name_val = this.name_input.read(cx).value();
+                        let suggested = suggest_assignee_handle(&name_val);
+                        this.suppress_handle_change = true;
+                        this.handle_input.update(cx, |inp, cx| {
+                            inp.set_value(suggested, window, cx);
+                        });
+                        this.suppress_handle_change = false;
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.submit(window, cx);
+                }
+                _ => {}
+            },
+        );
+
+        let handle_sub = cx.subscribe_in(
+            &handle_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    if !this.suppress_handle_change {
+                        this.handle_edited_manually = true;
+                        this.error = None;
+                        cx.notify();
+                    }
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.submit(window, cx);
+                }
+                _ => {}
+            },
+        );
+
+        let role_sub = cx.subscribe_in(
+            &role_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit(window, cx);
+                }
+            },
+        );
+
+        Self {
+            app_state,
+            store,
+            editing_id: None,
+            name_input,
+            handle_input,
+            role_input,
+            notes_input,
+            selected_color: "#64748B".to_string(),
+            handle_edited_manually: false,
+            suppress_handle_change: false,
+            error: None,
+            busy: false,
+            _subscriptions: vec![store_sub, name_sub, handle_sub, role_sub],
+        }
+    }
+
+    fn reset_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_id = None;
+        self.handle_edited_manually = false;
+        self.selected_color = "#64748B".to_string();
+        self.error = None;
+        self.suppress_handle_change = true;
+        self.name_input.update(cx, |inp, cx| {
+            inp.set_value("", window, cx);
+            inp.focus(window, cx);
+        });
+        self.handle_input
+            .update(cx, |inp, cx| inp.set_value("", window, cx));
+        self.role_input
+            .update(cx, |inp, cx| inp.set_value("", window, cx));
+        self.notes_input
+            .update(cx, |inp, cx| inp.set_value("", window, cx));
+        self.suppress_handle_change = false;
+        cx.notify();
+    }
+
+    fn start_editing(&mut self, id: AssigneeId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(assignee) = self
+            .store
+            .read(cx)
+            .assignees()
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.editing_id = Some(id);
+        self.handle_edited_manually = true;
+        self.selected_color = assignee.color;
+        self.error = None;
+        self.suppress_handle_change = true;
+        self.name_input.update(cx, |inp, cx| {
+            inp.set_value(assignee.name, window, cx);
+            inp.focus(window, cx);
+        });
+        self.handle_input
+            .update(cx, |inp, cx| inp.set_value(assignee.handle, window, cx));
+        self.role_input.update(cx, |inp, cx| {
+            inp.set_value(assignee.role.unwrap_or_default(), window, cx)
+        });
+        self.notes_input
+            .update(cx, |inp, cx| inp.set_value(assignee.notes, window, cx));
+        self.suppress_handle_change = false;
+        cx.notify();
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+
+        let name = match validate_assignee_name(&self.name_input.read(cx).value()) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let handle = match validate_assignee_handle(&self.handle_input.read(cx).value()) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let color = match validate_hex_color(&self.selected_color) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        let role_raw = self.role_input.read(cx).value();
+        let role = (!role_raw.trim().is_empty()).then(|| role_raw.trim().to_string());
+        let notes = self.notes_input.read(cx).value().to_string();
+
+        let command: Box<dyn UndoableCommand> = match self.editing_id {
+            Some(id) => Box::new(UpsertAssignee::update(id, name, handle, color, role, notes)),
+            None => Box::new(UpsertAssignee::create(name, handle, color, role, notes)),
+        };
+
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+
+        let task = self
+            .app_state
+            .update(cx, |app, cx| app.execute_command(command, cx));
+        let view = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = task.await;
+                let _ = cx.update(|window, cx| match outcome {
+                    Ok(effect) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.reset_form(window, cx);
+                        });
+                        if let Some(msg) = effect.toast {
+                            window.push_notification(Notification::success(msg), cx);
+                        }
+                    }
+                    Err(err) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.error = Some(err.to_string());
+                            cx.notify();
+                        });
+                    }
+                });
+            })
+            .detach();
+    }
+
+    fn toggle_archive(
+        &mut self,
+        assignee_id: AssigneeId,
+        archived: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+
+        let command = Box::new(ArchiveAssignee::new(assignee_id, archived));
+        let task = self
+            .app_state
+            .update(cx, |app, cx| app.execute_command(command, cx));
+        let view = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = task.await;
+                let _ = cx.update(|window, cx| match outcome {
+                    Ok(effect) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            cx.notify();
+                        });
+                        if let Some(msg) = effect.toast {
+                            window.push_notification(Notification::success(msg), cx);
+                        }
+                    }
+                    Err(err) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.error = Some(err.to_string());
+                            cx.notify();
+                        });
+                    }
+                });
+            })
+            .detach();
+    }
+}
+
+impl Render for AssigneesManagerModalView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let assignees = self.store.read(cx).assignees().to_vec();
+        let name_ok = validate_assignee_name(&self.name_input.read(cx).value()).is_ok();
+        let handle_raw = self.handle_input.read(cx).value();
+        let handle_err = if handle_raw.trim().is_empty() {
+            None
+        } else {
+            validate_assignee_handle(&handle_raw).err()
+        };
+        let handle_ok = validate_assignee_handle(&handle_raw).is_ok();
+        let can_submit = !self.busy && name_ok && handle_ok;
+        let is_editing = self.editing_id.is_some();
+
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Local assignees are shared globally across all Projects in this workspace. Archived assignees remain visible on historical items."),
+            )
+            .when_some(render_error_banner(self.error.clone(), cx), |this, banner| {
+                this.child(banner)
+            })
+            // Existing Assignees list
+            .child(if assignees.is_empty() {
+                div()
+                    .px_3()
+                    .py_4()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No assignees in this workspace yet. Add one below.")
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .id("assignee-list-viewport")
+                    .test_support()
+                    .w_full()
+                    .max_h(px(210.))
+                    .overflow_hidden()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div().flex_1().overflow_hidden().child(
+                            v_flex()
+                                .size_full()
+                                .gap_1p5()
+                                .p_2()
+                                .overflow_y_scrollbar()
+                                .id("assignee-list-scroll")
+                                .children(assignees.into_iter().enumerate().map(|(ix, a)| {
+                                    let aid = a.id;
+                                    let is_archived = a.is_archived();
+                                    let is_being_edited = self.editing_id == Some(aid);
+                                    let notes_preview = a.notes.trim().to_string();
+
+                                    h_flex()
+                                        .id(("assignee-row", ix))
+                                        .test_support()
+                                        .flex_shrink_0()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(cx.theme().radius * 0.75)
+                                        .bg(if is_being_edited {
+                                            cx.theme().accent
+                                        } else {
+                                            cx.theme().muted.opacity(0.35)
+                                        })
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_0p5()
+                                                .child(assignee_pill(&a, true, cx))
+                                                .when(!notes_preview.is_empty(), |this| {
+                                                    this.child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
+                                                            .child(notes_preview),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .child(
+                                                    Button::new(("assignee-row-edit", ix))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("Edit")
+                                                        .disabled(self.busy)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.start_editing(aid, window, cx);
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new(("assignee-row-archive", ix))
+                                                        .outline()
+                                                        .xsmall()
+                                                        .label(if is_archived {
+                                                            "Restore"
+                                                        } else {
+                                                            "Archive"
+                                                        })
+                                                        .disabled(self.busy)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.toggle_archive(
+                                                                    aid,
+                                                                    !is_archived,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                })),
+                        ),
+                    )
+                    .into_any_element()
+            })
+            // Create / Edit form
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2p5()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted.opacity(0.35))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .child(if is_editing {
+                                        "Edit Assignee"
+                                    } else {
+                                        "New Assignee"
+                                    }),
+                            )
+                            .when(is_editing, |this| {
+                                this.child(
+                                    Button::new("assignee-modal-cancel-edit")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Cancel Edit")
+                                        .disabled(self.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.reset_form(window, cx);
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(div().text_xs().font_medium().child("Name"))
+                                    .child(
+                                        Input::new(&self.name_input)
+                                            .id("assignee-modal-name")
+                                            .small()
+                                            .disabled(self.busy),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(px(120.))
+                                    .gap_1()
+                                    .child(div().text_xs().font_medium().child("Handle"))
+                                    .child(
+                                        Input::new(&self.handle_input)
+                                            .id("assignee-modal-handle")
+                                            .small()
+                                            .disabled(self.busy),
+                                    )
+                                    .when_some(handle_err, |this, err| {
+                                        this.child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(cx.theme().danger)
+                                                .child(err.to_string()),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(px(140.))
+                                    .gap_1()
+                                    .child(div().text_xs().font_medium().child("Role"))
+                                    .child(
+                                        Input::new(&self.role_input)
+                                            .id("assignee-modal-role")
+                                            .small()
+                                            .disabled(self.busy),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_xs().font_medium().child("Pill Color"))
+                                    .child(
+                                        h_flex().gap_1p5().children(
+                                            PROJECT_COLOR_PRESETS.iter().enumerate().map(
+                                                |(ix, (hex, label))| {
+                                                    let is_selected = self
+                                                        .selected_color
+                                                        .eq_ignore_ascii_case(hex);
+                                                    let swatch =
+                                                        parse_hex_or(hex, cx.theme().primary);
+                                                    let hex_owned = (*hex).to_string();
+
+                                                    div()
+                                                        .id(("assignee-color-swatch", ix))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .size(px(22.))
+                                                        .rounded(px(999.))
+                                                        .cursor_pointer()
+                                                        .border_2()
+                                                        .border_color(if is_selected {
+                                                            cx.theme().foreground
+                                                        } else {
+                                                            cx.theme().transparent
+                                                        })
+                                                        .tooltip(move |window, cx| {
+                                                            Tooltip::new(*label).build(window, cx)
+                                                        })
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            if !this.busy {
+                                                                this.selected_color =
+                                                                    hex_owned.clone();
+                                                                cx.notify();
+                                                            }
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .size(px(14.))
+                                                                .rounded(px(999.))
+                                                                .bg(swatch),
+                                                        )
+                                                },
+                                            ),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                Button::new("assignee-modal-submit")
+                                    .primary()
+                                    .small()
+                                    .label(if is_editing {
+                                        "Save Assignee"
+                                    } else {
+                                        "Add Assignee"
+                                    })
+                                    .disabled(!can_submit)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().font_medium().child("Notes"))
+                            .child(
+                                Textarea::new(&self.notes_input)
+                                    .small()
+                                    .h(px(56.))
+                                    .disabled(self.busy),
+                            ),
+                    ),
+            )
+            .child(
+                DialogFooter::new().pt_1().child(
+                    Button::new("assignee-modal-close")
+                        .outline()
+                        .small()
+                        .label("Done")
+                        .disabled(self.busy)
+                        .on_click(|_, window, cx| {
+                            window.close_dialog(cx);
+                        }),
+                ),
+            )
+    }
+}
+
+pub struct TagsManagerModalView {
+    app_state: Entity<AppState>,
+    store: Entity<ProjectStore>,
+    project_id: ProjectId,
+    project_name: String,
+    key_prefix: String,
+    editing_id: Option<TagId>,
+    name_input: Entity<InputState>,
+    selected_color: String,
+    error: Option<String>,
+    busy: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl TagsManagerModalView {
+    fn new(
+        app_state: Entity<AppState>,
+        store: Entity<ProjectStore>,
+        project_id: ProjectId,
+        project_name: String,
+        key_prefix: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g., bug, core, tech-debt"));
+
+        let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
+        let name_sub = cx.subscribe_in(
+            &name_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.error = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.submit(window, cx);
+                }
+                _ => {}
+            },
+        );
+
+        Self {
+            app_state,
+            store,
+            project_id,
+            project_name,
+            key_prefix,
+            editing_id: None,
+            name_input,
+            selected_color: "#8B5CF6".to_string(),
+            error: None,
+            busy: false,
+            _subscriptions: vec![store_sub, name_sub],
+        }
+    }
+
+    fn reset_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_id = None;
+        self.selected_color = "#8B5CF6".to_string();
+        self.error = None;
+        self.name_input.update(cx, |inp, cx| {
+            inp.set_value("", window, cx);
+            inp.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn start_editing(&mut self, tag_id: TagId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tag) = self
+            .store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.tags.iter().find(|t| t.id == tag_id).cloned())
+        else {
+            return;
+        };
+        self.editing_id = Some(tag_id);
+        self.selected_color = tag.color;
+        self.error = None;
+        self.name_input.update(cx, |inp, cx| {
+            inp.set_value(tag.name, window, cx);
+            inp.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let name = match validate_tag_name(&self.name_input.read(cx).value()) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let color = match validate_hex_color(&self.selected_color) {
+            Ok(v) => v,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        let command: Box<dyn UndoableCommand> = match self.editing_id {
+            Some(id) => Box::new(UpsertTag::update(id, self.project_id, name, color)),
+            None => Box::new(UpsertTag::create(self.project_id, name, color)),
+        };
+
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+
+        let task = self
+            .app_state
+            .update(cx, |app, cx| app.execute_command(command, cx));
+        let view = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = task.await;
+                let _ = cx.update(|window, cx| match outcome {
+                    Ok(effect) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.reset_form(window, cx);
+                        });
+                        if let Some(msg) = effect.toast {
+                            window.push_notification(Notification::success(msg), cx);
+                        }
+                    }
+                    Err(err) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.error = Some(err.to_string());
+                            cx.notify();
+                        });
+                    }
+                });
+            })
+            .detach();
+    }
+
+    fn delete_tag(&mut self, tag_id: TagId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+
+        let command = Box::new(DeleteTag::new(tag_id));
+        let task = self
+            .app_state
+            .update(cx, |app, cx| app.execute_command(command, cx));
+        let view = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = task.await;
+                let _ = cx.update(|window, cx| match outcome {
+                    Ok(effect) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            if this.editing_id == Some(tag_id) {
+                                this.reset_form(window, cx);
+                            } else {
+                                cx.notify();
+                            }
+                        });
+                        if let Some(msg) = effect.toast {
+                            window.push_notification(Notification::success(msg), cx);
+                        }
+                    }
+                    Err(err) => {
+                        let _ = view.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.error = Some(err.to_string());
+                            cx.notify();
+                        });
+                    }
+                });
+            })
+            .detach();
+    }
+}
+
+impl Render for TagsManagerModalView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snap_opt = self.store.read(cx).snapshot().cloned();
+        let tags: Vec<_> = snap_opt
+            .as_ref()
+            .filter(|s| s.project.id == self.project_id)
+            .map(|s| s.tags.clone())
+            .unwrap_or_default();
+
+        let name_ok = validate_tag_name(&self.name_input.read(cx).value()).is_ok();
+        let can_submit = !self.busy && name_ok;
+        let is_editing = self.editing_id.is_some();
+
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "Tags here are strictly scoped to {} ({}) and never leak into other Projects.",
+                        self.project_name, self.key_prefix
+                    )),
+            )
+            .when_some(render_error_banner(self.error.clone(), cx), |this, banner| {
+                this.child(banner)
+            })
+            .child(if tags.is_empty() {
+                div()
+                    .px_3()
+                    .py_4()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No tags in this project yet. Add one below.")
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .id("tag-list-viewport")
+                    .test_support()
+                    .w_full()
+                    .max_h(px(210.))
+                    .overflow_hidden()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div().flex_1().overflow_hidden().child(
+                            v_flex()
+                                .size_full()
+                                .gap_1p5()
+                                .p_2()
+                                .overflow_y_scrollbar()
+                                .id("tag-list-scroll")
+                                .children(tags.into_iter().enumerate().map(|(ix, tag)| {
+                                    let tid = tag.id;
+                                    let is_being_edited = self.editing_id == Some(tid);
+                                    let usage_count = snap_opt.as_ref().map_or(0, |s| {
+                                        s.item_tags
+                                            .values()
+                                            .filter(|ids| ids.contains(&tid))
+                                            .count()
+                                    });
+
+                                    h_flex()
+                                        .id(("tag-row", ix))
+                                        .test_support()
+                                        .flex_shrink_0()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(cx.theme().radius * 0.75)
+                                        .bg(if is_being_edited {
+                                            cx.theme().accent
+                                        } else {
+                                            cx.theme().muted.opacity(0.35)
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(domain_tag_chip(&tag, cx))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(format!("{usage_count} item(s)")),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .child(
+                                                    Button::new(("tag-row-edit", ix))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("Edit")
+                                                        .disabled(self.busy)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.start_editing(tid, window, cx);
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new(("tag-row-delete", ix))
+                                                        .outline()
+                                                        .xsmall()
+                                                        .label("Delete")
+                                                        .disabled(self.busy)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.delete_tag(tid, window, cx);
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                })),
+                        ),
+                    )
+                    .into_any_element()
+            })
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2p5()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted.opacity(0.35))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .child(if is_editing { "Edit Tag" } else { "New Tag" }),
+                            )
+                            .when(is_editing, |this| {
+                                this.child(
+                                    Button::new("tag-modal-cancel-edit")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Cancel Edit")
+                                        .disabled(self.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.reset_form(window, cx);
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().font_medium().child("Tag Name"))
+                            .child(
+                                Input::new(&self.name_input)
+                                    .id("tag-modal-name")
+                                    .small()
+                                    .disabled(self.busy),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_xs().font_medium().child("Color"))
+                                    .child(
+                                        h_flex().gap_1p5().children(
+                                            PROJECT_COLOR_PRESETS.iter().enumerate().map(
+                                                |(ix, (hex, label))| {
+                                                    let is_selected = self
+                                                        .selected_color
+                                                        .eq_ignore_ascii_case(hex);
+                                                    let swatch =
+                                                        parse_hex_or(hex, cx.theme().primary);
+                                                    let hex_owned = (*hex).to_string();
+
+                                                    div()
+                                                        .id(("tag-color-swatch", ix))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .size(px(22.))
+                                                        .rounded(px(999.))
+                                                        .cursor_pointer()
+                                                        .border_2()
+                                                        .border_color(if is_selected {
+                                                            cx.theme().foreground
+                                                        } else {
+                                                            cx.theme().transparent
+                                                        })
+                                                        .tooltip(move |window, cx| {
+                                                            Tooltip::new(*label).build(window, cx)
+                                                        })
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            if !this.busy {
+                                                                this.selected_color =
+                                                                    hex_owned.clone();
+                                                                cx.notify();
+                                                            }
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .size(px(14.))
+                                                                .rounded(px(999.))
+                                                                .bg(swatch),
+                                                        )
+                                                },
+                                            ),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                Button::new("tag-modal-submit")
+                                    .primary()
+                                    .small()
+                                    .label(if is_editing { "Save Tag" } else { "Add Tag" })
+                                    .disabled(!can_submit)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                DialogFooter::new().pt_1().child(
+                    Button::new("tag-modal-close")
+                        .outline()
+                        .small()
+                        .label("Done")
+                        .disabled(self.busy)
+                        .on_click(|_, window, cx| {
+                            window.close_dialog(cx);
+                        }),
+                ),
+            )
+    }
+}
+
+pub fn open_assignees_manager_modal(
+    app_state: Entity<AppState>,
+    store: Entity<ProjectStore>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+
+    let view = cx.new(|cx| AssigneesManagerModalView::new(app_state, store, window, cx));
+    let initial_focus = Cell::new(true);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        if initial_focus.replace(false) {
+            let input = view.read(cx).name_input.clone();
+            input.update(cx, |inp, cx| inp.focus(window, cx));
+        }
+        let view = view.clone();
+        dialog
+            .width(px(560.))
+            .title("Global Assignees")
+            .content(move |content, _, _| content.child(view.clone()))
+    });
+}
+
+pub fn open_tags_manager_modal(
+    app_state: Entity<AppState>,
+    store: Entity<ProjectStore>,
+    project_id: ProjectId,
+    project_name: String,
+    key_prefix: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+
+    let title = format!("Project Tags · {key_prefix}");
+    let view = cx.new(|cx| {
+        TagsManagerModalView::new(
+            app_state,
+            store,
+            project_id,
+            project_name,
+            key_prefix,
+            window,
+            cx,
+        )
+    });
+    let initial_focus = Cell::new(true);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        if initial_focus.replace(false) {
+            let input = view.read(cx).name_input.clone();
+            input.update(cx, |inp, cx| inp.focus(window, cx));
+        }
+        let view = view.clone();
+        dialog
+            .width(px(480.))
+            .title(title.clone())
             .content(move |content, _, _| content.child(view.clone()))
     });
 }

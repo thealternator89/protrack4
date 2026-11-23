@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AppContext as _, Bounds, Entity, TestAppContext, WindowBounds, WindowOptions, base::Root, px,
-    size,
+    AppContext as _, Bounds, Entity, ScrollDelta, TestAppContext, WindowBounds, WindowOptions,
+    base::Root, point, px, size,
 };
 use protrack4::commands::{
     CreateFeature, CreateProject, ReparentFeature, ReorderSiblingFeatures, UpdateItemFields,
@@ -646,6 +646,7 @@ async fn phase3_project_feature_crud_and_inspector_persistence(cx: &mut TestAppC
                     description: None,
                     status: Some(ItemStatus::InProgress),
                     priority: Some(Priority::Urgent),
+                    assignee_id: None,
                 }),
                 cx,
             )
@@ -1077,6 +1078,697 @@ async fn phase4_work_items_multi_feature_and_unallocated_triage(cx: &mut TestApp
     .unwrap();
 
     app_state2.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}
+
+#[gpui_kit::test]
+async fn phase5_global_assignees_and_project_scoped_tags(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase5.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config.clone(), window, cx)),
+        )
+        .expect("open Phase 5 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Create Project A (ALP) and Project B (BET), plus items in each
+    let proj_a_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Alpha",
+                    "ALP",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let wi_a_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(protrack4::commands::CreateWorkItem::new(
+                    proj_a_id,
+                    "Wire OAuth callback",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                    vec![],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let proj_b_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Beta",
+                    "BET",
+                    "",
+                    "#10B981",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let wi_b_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(protrack4::commands::CreateWorkItem::new(
+                    proj_b_id,
+                    "Mobile push notification",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                    vec![],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    // Switch back to Project A
+    app_state
+        .update(cx, |app, cx| app.switch_project(proj_a_id, cx))
+        .await
+        .unwrap();
+    wait_until(cx, "Project A active", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.project.id == proj_a_id && s.item(wi_a_id).is_some())
+    })
+    .await;
+
+    // 2. Open Global Assignees Manager via Sidebar and create 2 Assignees (MB, AI)
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("sidebar-assignees", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert!(window.try_find("assignee-modal-name").is_some());
+
+        window.click("assignee-modal-name", cx);
+        window.input("Mark Benson", cx);
+    })
+    .unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("assignee-modal-handle").value(), Some("MB"));
+        window.click("assignee-modal-submit", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "first assignee created", |cx| {
+        store.read(cx).assignees().len() == 1
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("assignee-modal-name", cx);
+        window.input("Claude Agent", cx);
+    })
+    .unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("assignee-modal-handle", cx);
+        window.press("secondary-a", cx);
+        window.input("AI", cx);
+    })
+    .unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("assignee-modal-submit", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "second assignee created", |cx| {
+        store.read(cx).assignees().len() == 2
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("assignee-modal-close", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+
+    // 3. Open Project Tags Manager via Sidebar and create 3 Tags in Project A (bug, core, ui)
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("sidebar-tags", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert!(window.try_find("tag-modal-name").is_some());
+    })
+    .unwrap();
+
+    for (expected_count, tag_name) in [(1usize, "bug"), (2usize, "core"), (3usize, "ui")] {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("tag-modal-name", cx);
+            window.input(tag_name, cx);
+        })
+        .unwrap();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("tag-modal-submit", cx);
+        })
+        .unwrap();
+
+        wait_until(cx, "project tag created", |cx| {
+            store
+                .read(cx)
+                .snapshot()
+                .is_some_and(|s| s.tags.len() == expected_count)
+        })
+        .await;
+    }
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("tag-modal-close", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+
+    let (mb_id, ai_id) = cx.update(|cx| {
+        let assignees = store.read(cx).assignees();
+        let mb = assignees.iter().find(|a| a.handle == "MB").unwrap().id;
+        let ai = assignees.iter().find(|a| a.handle == "AI").unwrap().id;
+        (mb, ai)
+    });
+
+    // 4. Select wi_a_id, assign MB, and attach/detach tags via Inspector popover & chip [x]
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpdateItemFields {
+                    item_id: wi_a_id,
+                    title: None,
+                    description: None,
+                    status: None,
+                    priority: None,
+                    assignee_id: Some(Some(mb_id)),
+                }),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    wait_until(cx, "wi_a assigned to MB", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.item(wi_a_id).and_then(|i| i.assignee_id) == Some(mb_id))
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(wi_a_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("inspector-add-tag-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("inspector-tag-search").is_some());
+
+        // Tags are sorted alphabetically: 0="bug", 1="core", 2="ui"
+        window.click(("inspector-tag-option", 0usize), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "first tag attached via Inspector popover", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.tags_for_item(wi_a_id).len() == 1)
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("inspector-tag-option", 2usize), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "second tag attached via Inspector popover", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.tags_for_item(wi_a_id).len() == 2)
+    })
+    .await;
+
+    // Close popover, remove first tag chip via [x], and render Outline/Table/Unallocated views
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window.click(("inspector-remove-tag", 0usize), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "tag removed via Inspector chip [x]", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            let names: Vec<_> = s.tags_for_item(wi_a_id).into_iter().map(|t| t.name.as_str()).collect();
+            names == vec!["ui"]
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        for tab in [
+            CenterViewTab::Outline,
+            CenterViewTab::Table,
+            CenterViewTab::Unallocated,
+        ] {
+            store.update(cx, |s, cx| {
+                s.set_active_tab(tab);
+                cx.notify();
+            });
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+
+    // 5. Archive Mark Benson -> preserved on wi_a_id, excluded from selectable_assignees(None)
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("sidebar-assignees", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // Sorted alphabetically: 0="Claude Agent", 1="Mark Benson"
+        window.click(("assignee-row-archive", 1usize), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Mark Benson archived", |cx| {
+        store
+            .read(cx)
+            .assignees()
+            .iter()
+            .any(|a| a.id == mb_id && a.is_archived())
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("assignee-modal-close", cx);
+        window.render_frame(cx);
+
+        let snap = store.read(cx).snapshot().unwrap();
+        assert_eq!(snap.item(wi_a_id).unwrap().assignee_id, Some(mb_id));
+        assert_eq!(
+            snap.selectable_assignees(None)
+                .into_iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>(),
+            vec![ai_id]
+        );
+        assert_eq!(
+            snap.selectable_assignees(Some(mb_id))
+                .into_iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>(),
+            vec![ai_id, mb_id]
+        );
+    })
+    .unwrap();
+
+    // 6. Switch to Project B -> global Assignees persist, Project A Tags are strictly isolated
+    app_state
+        .update(cx, |app, cx| app.switch_project(proj_b_id, cx))
+        .await
+        .unwrap();
+    wait_until(cx, "Project B active", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.project.id == proj_b_id)
+    })
+    .await;
+
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpdateItemFields {
+                    item_id: wi_b_id,
+                    title: None,
+                    description: None,
+                    status: None,
+                    priority: None,
+                    assignee_id: Some(Some(ai_id)),
+                }),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    wait_until(cx, "wi_b assigned to AI in Project B", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.item(wi_b_id).and_then(|i| i.assignee_id) == Some(ai_id))
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let snap_b = store.read(cx).snapshot().unwrap();
+        assert_eq!(snap_b.assignees.len(), 2);
+        assert!(snap_b.tags.is_empty());
+        assert_eq!(snap_b.item(wi_b_id).unwrap().assignee_id, Some(ai_id));
+    })
+    .unwrap();
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+
+    // 7. Reopen workspace and confirm persistence of Assignees & Tags
+    let (handle2, shell2) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("reopen Phase 5 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let app_state2 = shell2.read_with(cx, |view, _| view.app_state().clone());
+    let store2 = shell2.read_with(cx, |view, _| view.store().clone());
+    wait_for_workspace_idle(cx, &app_state2).await;
+
+    app_state2
+        .update(cx, |app, cx| app.switch_project(proj_a_id, cx))
+        .await
+        .unwrap();
+    wait_until(cx, "Project A reloaded", |cx| {
+        store2
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.project.id == proj_a_id)
+    })
+    .await;
+
+    cx.update_window(handle2.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let snap = store2.read(cx).snapshot().unwrap();
+        assert_eq!(snap.assignees.len(), 2);
+        assert_eq!(snap.tags.len(), 3);
+        assert_eq!(snap.item(wi_a_id).unwrap().assignee_id, Some(mb_id));
+        assert_eq!(
+            snap.tags_for_item(wi_a_id)
+                .into_iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ui"]
+        );
+    })
+    .unwrap();
+
+    app_state2.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}
+
+#[gpui_kit::test]
+async fn phase5_manager_lists_scroll_when_exceeding_max_height(cx: &mut TestAppContext) {
+    use protrack4::commands::{UpsertAssignee, UpsertTag};
+
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase5_scroll.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 5 scroll WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    let project_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Scroll Suite",
+                    "SCR",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    for i in 1..=8 {
+        app_state
+            .update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(UpsertAssignee::create(
+                        format!("Member {i:02}"),
+                        format!("M{i}"),
+                        "#64748B",
+                        Some("Engineer".to_string()),
+                        "Team member notes",
+                    )),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        app_state
+            .update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(UpsertTag::create(
+                        project_id,
+                        format!("tag-{i:02}"),
+                        "#8B5CF6",
+                    )),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    wait_until(cx, "8 assignees and 8 tags loaded", |cx| {
+        let st = store.read(cx);
+        st.assignees().len() == 8 && st.snapshot().is_some_and(|s| s.tags.len() == 8)
+    })
+    .await;
+
+    // 1. Verify Assignees Manager list clamps to max_h(210) and scrolls to reveal row 7
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("sidebar-assignees", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+
+        let viewport = window.find("assignee-list-viewport").bounds();
+        assert!(
+            viewport.size.height <= px(210.5),
+            "assignee list viewport should clamp to 210px, got {:?}",
+            viewport.size.height
+        );
+
+        let last_row_before = window.find(("assignee-row", 7usize)).bounds();
+        assert!(
+            last_row_before.bottom() > viewport.bottom(),
+            "8th assignee row should start below clamped viewport"
+        );
+
+        window.scroll(
+            "assignee-list-viewport",
+            ScrollDelta::Pixels(point(px(0.), px(-280.))),
+            cx,
+        );
+        window.render_frame(cx);
+
+        let last_row_after = window.find(("assignee-row", 7usize)).bounds();
+        assert!(
+            last_row_after.origin.y < last_row_before.origin.y,
+            "scrolling assignee list must move rows upward (before={:?}, after={:?})",
+            last_row_before.origin.y,
+            last_row_after.origin.y
+        );
+        assert!(
+            last_row_after.bottom() <= viewport.bottom() + px(1.),
+            "8th assignee row should scroll cleanly into viewport (row={:?}, viewport={:?})",
+            last_row_after,
+            viewport
+        );
+
+        window.click("assignee-modal-close", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+
+    // 2. Verify Project Tags Manager list also clamps to max_h(210) and scrolls to reveal row 7
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("sidebar-tags", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+
+        let viewport = window.find("tag-list-viewport").bounds();
+        assert!(
+            viewport.size.height <= px(210.5),
+            "tag list viewport should clamp to 210px, got {:?}",
+            viewport.size.height
+        );
+
+        let last_row_before = window.find(("tag-row", 7usize)).bounds();
+        assert!(
+            last_row_before.bottom() > viewport.bottom(),
+            "8th tag row should start below clamped viewport"
+        );
+
+        window.scroll(
+            "tag-list-viewport",
+            ScrollDelta::Pixels(point(px(0.), px(-280.))),
+            cx,
+        );
+        window.render_frame(cx);
+
+        let last_row_after = window.find(("tag-row", 7usize)).bounds();
+        assert!(
+            last_row_after.origin.y < last_row_before.origin.y,
+            "scrolling tag list must move rows upward (before={:?}, after={:?})",
+            last_row_before.origin.y,
+            last_row_after.origin.y
+        );
+        assert!(
+            last_row_after.bottom() <= viewport.bottom() + px(1.),
+            "8th tag row should scroll cleanly into viewport (row={:?}, viewport={:?})",
+            last_row_after,
+            viewport
+        );
+
+        window.click("tag-modal-close", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+
+    app_state.update(cx, |app, cx| {
         app.close_workspace_sync(cx).unwrap();
     });
     assert!(!wal_path_for(&db_path).exists());

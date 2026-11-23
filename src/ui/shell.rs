@@ -941,6 +941,7 @@ impl WorkspaceShell {
                         let item_id = item.id;
                         let is_selected = selected_item_id == Some(item_id);
                         let assignee = item.assignee_id.and_then(|aid| snapshot.assignee(aid));
+                        let item_tags = snapshot.tags_for_item(item.id);
                         let context_label = match item.kind {
                             ItemKind::Feature => {
                                 let path = snapshot.feature_path(item.id);
@@ -1008,15 +1009,31 @@ impl WorkspaceShell {
                             )
                             .child(div().w(px(88.)).child(kind_badge(item.kind, cx)))
                             .child(
-                                div()
+                                h_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(item.title.clone()),
+                                    .gap_1p5()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child(item.title.clone()),
+                                    )
+                                    .when(!item_tags.is_empty(), |this| {
+                                        this.child(
+                                            h_flex().gap_1().flex_shrink_0().children(
+                                                item_tags
+                                                    .into_iter()
+                                                    .map(|tag| domain_tag_chip(tag, cx)),
+                                            ),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()

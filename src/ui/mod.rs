@@ -118,8 +118,26 @@ pub fn kind_badge(kind: ItemKind, cx: &App) -> impl IntoElement {
 
 pub fn assignee_pill(assignee: &Assignee, show_full_name: bool, cx: &App) -> impl IntoElement {
     let base_color = parse_hex_or(&assignee.color, cx.theme().primary);
-    let bg = base_color.opacity(if cx.theme().is_dark() { 0.22 } else { 0.14 });
-    let border = base_color.opacity(if cx.theme().is_dark() { 0.42 } else { 0.28 });
+    let archived = assignee.is_archived();
+    let fg_color = if archived {
+        base_color.opacity(0.65)
+    } else {
+        base_color
+    };
+    let bg = base_color.opacity(if archived {
+        0.09
+    } else if cx.theme().is_dark() {
+        0.22
+    } else {
+        0.14
+    });
+    let border = base_color.opacity(if archived {
+        0.22
+    } else if cx.theme().is_dark() {
+        0.42
+    } else {
+        0.28
+    });
 
     let mut row = div()
         .flex()
@@ -139,7 +157,7 @@ pub fn assignee_pill(assignee: &Assignee, show_full_name: bool, cx: &App) -> imp
                 .border_color(border)
                 .text_size(px(10.))
                 .font_semibold()
-                .text_color(base_color)
+                .text_color(fg_color)
                 .child(assignee.handle.clone()),
         );
 
@@ -147,7 +165,11 @@ pub fn assignee_pill(assignee: &Assignee, show_full_name: bool, cx: &App) -> imp
         row = row.child(
             div()
                 .text_xs()
-                .text_color(cx.theme().foreground)
+                .text_color(if archived {
+                    cx.theme().muted_foreground
+                } else {
+                    cx.theme().foreground
+                })
                 .child(assignee.name.clone()),
         );
         if let Some(role) = &assignee.role {
@@ -156,6 +178,14 @@ pub fn assignee_pill(assignee: &Assignee, show_full_name: bool, cx: &App) -> imp
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("· {role}")),
+            );
+        }
+        if archived {
+            row = row.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("(Archived)"),
             );
         }
     }

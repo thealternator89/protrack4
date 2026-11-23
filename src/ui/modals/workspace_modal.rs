@@ -323,22 +323,29 @@ pub fn open_workspace_modal(app_state: Entity<AppState>, window: &mut Window, cx
                         .into_any_element()
                 } else {
                     v_flex()
-                        .id("workspace-modal-recents-scroll")
                         .w_full()
                         .max_h(px(220.))
-                        .gap_1()
-                        .overflow_y_scrollbar()
-                        .children(recents.into_iter().enumerate().map(|(ix, entry)| {
-                            let exists = entry.path.exists();
-                            let is_active = active_path.as_ref().is_some_and(|p| p == &entry.path);
-                            let open_path = entry.path.clone();
-                            let remove_path = entry.path.clone();
-                            let display_path = entry.path.display().to_string();
-                            let can_open = exists && !busy;
+                        .overflow_hidden()
+                        .child(
+                            div().flex_1().overflow_hidden().child(
+                                v_flex()
+                                    .size_full()
+                                    .gap_1()
+                                    .overflow_y_scrollbar()
+                                    .id("workspace-modal-recents-scroll")
+                                    .children(recents.into_iter().enumerate().map(|(ix, entry)| {
+                                        let exists = entry.path.exists();
+                                        let is_active =
+                                            active_path.as_ref().is_some_and(|p| p == &entry.path);
+                                        let open_path = entry.path.clone();
+                                        let remove_path = entry.path.clone();
+                                        let display_path = entry.path.display().to_string();
+                                        let can_open = exists && !busy;
 
-                            h_flex()
-                                .id(("workspace-recent-row", ix))
-                                .w_full()
+                                        h_flex()
+                                            .id(("workspace-recent-row", ix))
+                                            .flex_shrink_0()
+                                            .w_full()
                                 .px_2p5()
                                 .py_2()
                                 .gap_2()
@@ -444,7 +451,9 @@ pub fn open_workspace_modal(app_state: Entity<AppState>, window: &mut Window, cx
                                             }),
                                     )
                                 })
-                        }))
+                        })),
+                        ),
+                        )
                         .into_any_element()
                 };
 

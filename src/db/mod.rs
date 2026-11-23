@@ -1,7 +1,9 @@
 pub mod actor;
+pub mod assignee_repo;
 pub mod item_repo;
 pub mod migrations;
 pub mod project_repo;
+pub mod tag_repo;
 
 use std::collections::HashMap;
 
@@ -10,11 +12,12 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::domain::{
-    Assignee, AssigneeId, DomainError, FeatureWorkItem, ItemId, ProjectId, ProjectSnapshot, Tag,
-    TagId, WorkspaceMeta, WorkspaceOverview,
+    DomainError, FeatureWorkItem, ItemId, ProjectId, ProjectSnapshot, TagId, WorkspaceMeta,
+    WorkspaceOverview,
 };
 
 pub use actor::{DbRequest, DbService, DomainEventReceiver};
+pub use assignee_repo::list_assignees;
 pub use migrations::{
     APP_MAX_SCHEMA_VERSION, checkpoint_and_switch_to_delete_mode, inspect_and_migrate,
     seed_sample_project,
@@ -104,38 +107,6 @@ pub fn load_workspace_meta(conn: &Connection) -> Result<WorkspaceMeta, DomainErr
     })
 }
 
-pub fn list_assignees(conn: &Connection) -> Result<Vec<Assignee>, DomainError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, handle, color, role, notes, archived_at, created_at, updated_at
-             FROM assignees
-             ORDER BY archived_at IS NOT NULL ASC, name COLLATE NOCASE ASC;",
-        )
-        .map_err(map_sqlite_err)?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let archived_opt: Option<String> = row.get(6)?;
-            let archived_at = archived_opt
-                .map(|raw| parse_ts_col(6, raw))
-                .transpose()?;
-            Ok(Assignee {
-                id: AssigneeId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
-                name: row.get(1)?,
-                handle: row.get(2)?,
-                color: row.get(3)?,
-                role: row.get(4)?,
-                notes: row.get(5)?,
-                archived_at,
-                created_at: parse_ts_col(7, row.get(7)?)?,
-                updated_at: parse_ts_col(8, row.get(8)?)?,
-            })
-        })
-        .map_err(map_sqlite_err)?;
-
-    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
-}
-
 pub fn load_project_snapshot(
     conn: &Connection,
     project_id: ProjectId,
@@ -149,29 +120,7 @@ pub fn load_project_snapshot(
 
     let project_id_sql = uuid_to_sql(project_id.0);
     let assignees = list_assignees(conn)?;
-
-    let tags = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, project_id, name, color, created_at
-                 FROM tags
-                 WHERE project_id = ?1
-                 ORDER BY name COLLATE NOCASE ASC;",
-            )
-            .map_err(map_sqlite_err)?;
-        let rows = stmt
-            .query_map(params![&project_id_sql], |row| {
-                Ok(Tag {
-                    id: TagId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
-                    project_id: ProjectId::from_uuid(parse_uuid_col(1, row.get(1)?)?),
-                    name: row.get(2)?,
-                    color: row.get(3)?,
-                    created_at: parse_ts_col(4, row.get(4)?)?,
-                })
-            })
-            .map_err(map_sqlite_err)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
-    };
+    let tags = tag_repo::list_tags_for_project(conn, project_id)?;
 
     let items = {
         let mut stmt = conn
@@ -1244,6 +1193,531 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn global_assignees_crud_unique_handle_archive_and_cross_project_selection() {
+        use crate::db::assignee_repo::{
+            UpsertAssigneeInput, get_assignee, list_active_assignees, list_assignees,
+            set_assignee_archived, upsert_assignee,
+        };
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, UpdateItemFieldsInput, create_feature,
+            create_work_item, get_item, update_item_fields,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::domain::{ItemStatus, Priority, ProjectStatus};
+        use rusqlite::TransactionBehavior;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "AssigneeTest").unwrap();
+
+        let (proj_a, proj_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let a = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Alpha".to_string(),
+                    key_prefix: "ALP".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let b = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Beta".to_string(),
+                    key_prefix: "BET".to_string(),
+                    description: String::new(),
+                    color: "#10B981".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (a, b)
+        };
+
+        // Validation checks
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                upsert_assignee(
+                    &tx,
+                    UpsertAssigneeInput {
+                        id: None,
+                        name: "   ".to_string(),
+                        handle: "MB".to_string(),
+                        color: "#64748B".to_string(),
+                        role: None,
+                        notes: String::new(),
+                    },
+                )
+                .is_err()
+            );
+            assert!(
+                upsert_assignee(
+                    &tx,
+                    UpsertAssigneeInput {
+                        id: None,
+                        name: "Mark".to_string(),
+                        handle: "TOO_LONG_12".to_string(),
+                        color: "#64748B".to_string(),
+                        role: None,
+                        notes: String::new(),
+                    },
+                )
+                .is_err()
+            );
+            assert!(
+                upsert_assignee(
+                    &tx,
+                    UpsertAssigneeInput {
+                        id: None,
+                        name: "Mark".to_string(),
+                        handle: "MB".to_string(),
+                        color: "blue".to_string(),
+                        role: None,
+                        notes: String::new(),
+                    },
+                )
+                .is_err()
+            );
+        }
+
+        // Create two assignees
+        let (mb, ai) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let (mb, created_mb) = upsert_assignee(
+                &tx,
+                UpsertAssigneeInput {
+                    id: None,
+                    name: "  Mark Benson ".to_string(),
+                    handle: " MB ".to_string(),
+                    color: "#6366f1".to_string(),
+                    role: Some("  Founder ".to_string()),
+                    notes: "Core".to_string(),
+                },
+            )
+            .unwrap();
+            assert!(created_mb);
+            assert_eq!(mb.name, "Mark Benson");
+            assert_eq!(mb.handle, "MB");
+            assert_eq!(mb.color, "#6366F1");
+            assert_eq!(mb.role.as_deref(), Some("Founder"));
+
+            let (ai, created_ai) = upsert_assignee(
+                &tx,
+                UpsertAssigneeInput {
+                    id: None,
+                    name: "Claude Agent".to_string(),
+                    handle: "AI".to_string(),
+                    color: "#10B981".to_string(),
+                    role: Some("   ".to_string()),
+                    notes: String::new(),
+                },
+            )
+            .unwrap();
+            assert!(created_ai);
+            assert_eq!(ai.role, None);
+            tx.commit().unwrap();
+            (mb, ai)
+        };
+
+        // Case-insensitive unique handle rejected on create, allowed on self-update
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                upsert_assignee(
+                    &tx,
+                    UpsertAssigneeInput {
+                        id: None,
+                        name: "Duplicate".to_string(),
+                        handle: "mb".to_string(),
+                        color: "#64748B".to_string(),
+                        role: None,
+                        notes: String::new(),
+                    },
+                )
+                .is_err()
+            );
+
+            let (updated_mb, created) = upsert_assignee(
+                &tx,
+                UpsertAssigneeInput {
+                    id: Some(mb.id),
+                    name: "Mark Benson".to_string(),
+                    handle: "mb".to_string(),
+                    color: "#6366F1".to_string(),
+                    role: Some("Lead".to_string()),
+                    notes: "Updated".to_string(),
+                },
+            )
+            .unwrap();
+            assert!(!created);
+            assert_eq!(updated_mb.handle, "mb");
+            tx.commit().unwrap();
+        }
+
+        // INV-14: Global assignees are immediately selectable and assignable in both Project A and Project B
+        let (fa, wb, wa_unassigned) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let fa = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: proj_a.id,
+                    parent_feature_id: None,
+                    title: "Alpha Core".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                },
+            )
+            .unwrap();
+            let wa_unassigned = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: proj_a.id,
+                    title: "New Task".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: Vec::new(),
+                },
+            )
+            .unwrap();
+            let wb = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: proj_b.id,
+                    title: "Beta Task".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                    feature_ids: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            update_item_fields(
+                &tx,
+                UpdateItemFieldsInput {
+                    item_id: fa.id,
+                    assignee_id: Some(Some(mb.id)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            update_item_fields(
+                &tx,
+                UpdateItemFieldsInput {
+                    item_id: wb.id,
+                    assignee_id: Some(Some(mb.id)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (fa, wb, wa_unassigned)
+        };
+
+        let snap_a = load_project_snapshot(&conn, proj_a.id).unwrap();
+        let snap_b = load_project_snapshot(&conn, proj_b.id).unwrap();
+        assert_eq!(snap_a.assignees.len(), 2);
+        assert_eq!(snap_b.assignees.len(), 2);
+        assert_eq!(snap_a.item(fa.id).unwrap().assignee_id, Some(mb.id));
+        assert_eq!(snap_b.item(wb.id).unwrap().assignee_id, Some(mb.id));
+
+        // Archive Mark Benson -> preserved on existing items, hidden from active pickers & new assignments
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let archived = set_assignee_archived(&tx, mb.id, true).unwrap();
+            assert!(archived.is_archived());
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(list_assignees(&conn).unwrap().len(), 2);
+        let active = list_active_assignees(&conn).unwrap();
+        assert_eq!(active.iter().map(|a| a.id).collect::<Vec<_>>(), vec![ai.id]);
+
+        let snap_a_arch = load_project_snapshot(&conn, proj_a.id).unwrap();
+        assert_eq!(get_item(&conn, fa.id).unwrap().assignee_id, Some(mb.id));
+        assert_eq!(
+            snap_a_arch
+                .selectable_assignees(None)
+                .into_iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>(),
+            vec![ai.id]
+        );
+        assert_eq!(
+            snap_a_arch
+                .selectable_assignees(Some(mb.id))
+                .into_iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>(),
+            vec![ai.id, mb.id]
+        );
+
+        // Assigning archived assignee to a new item is rejected
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                update_item_fields(
+                    &tx,
+                    UpdateItemFieldsInput {
+                        item_id: wa_unassigned.id,
+                        assignee_id: Some(Some(mb.id)),
+                        ..Default::default()
+                    },
+                )
+                .is_err()
+            );
+        }
+
+        // Unarchive restores availability
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let restored = set_assignee_archived(&tx, mb.id, false).unwrap();
+            assert!(!restored.is_archived());
+            tx.commit().unwrap();
+        }
+        assert!(!get_assignee(&conn, mb.id).unwrap().is_archived());
+        assert_eq!(list_active_assignees(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn project_scoped_tags_crud_isolation_and_composite_fk() {
+        use crate::db::item_repo::{CreateWorkItemInput, create_work_item};
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::db::tag_repo::{
+            UpsertTagInput, delete_tag, list_tag_ids_for_item, list_tags_for_project,
+            set_item_tags, upsert_tag,
+        };
+        use crate::domain::{ItemStatus, Priority, ProjectStatus};
+        use rusqlite::TransactionBehavior;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "TagTest").unwrap();
+
+        let (proj_a, proj_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let a = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Alpha".to_string(),
+                    key_prefix: "ALP".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let b = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Beta".to_string(),
+                    key_prefix: "BET".to_string(),
+                    description: String::new(),
+                    color: "#10B981".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (a, b)
+        };
+
+        let (wi_a, wi_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let wa = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: proj_a.id,
+                    title: "Alpha item".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                    feature_ids: Vec::new(),
+                },
+            )
+            .unwrap();
+            let wb = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: proj_b.id,
+                    title: "Beta item".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                    feature_ids: Vec::new(),
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (wa, wb)
+        };
+
+        // Create tags in Project A and Project B (same name allowed across distinct projects)
+        let (tag_a_bug, tag_a_ui, tag_b_bug) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let (ab, created1) = upsert_tag(
+                &tx,
+                UpsertTagInput {
+                    id: None,
+                    project_id: proj_a.id,
+                    name: "  bug ".to_string(),
+                    color: "#ef4444".to_string(),
+                },
+            )
+            .unwrap();
+            assert!(created1);
+            assert_eq!(ab.name, "bug");
+            assert_eq!(ab.color, "#EF4444");
+
+            let (au, _) = upsert_tag(
+                &tx,
+                UpsertTagInput {
+                    id: None,
+                    project_id: proj_a.id,
+                    name: "ui".to_string(),
+                    color: "#0EA5E9".to_string(),
+                },
+            )
+            .unwrap();
+
+            // Case-insensitive duplicate within Project A rejected
+            assert!(
+                upsert_tag(
+                    &tx,
+                    UpsertTagInput {
+                        id: None,
+                        project_id: proj_a.id,
+                        name: "BUG".to_string(),
+                        color: "#EF4444".to_string(),
+                    },
+                )
+                .is_err()
+            );
+
+            // Same name in Project B succeeds (INV-15)
+            let (bb, _) = upsert_tag(
+                &tx,
+                UpsertTagInput {
+                    id: None,
+                    project_id: proj_b.id,
+                    name: "bug".to_string(),
+                    color: "#F59E0B".to_string(),
+                },
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+            (ab, au, bb)
+        };
+
+        assert_eq!(list_tags_for_project(&conn, proj_a.id).unwrap().len(), 2);
+        assert_eq!(list_tags_for_project(&conn, proj_b.id).unwrap().len(), 1);
+        assert!(
+            load_project_snapshot(&conn, proj_b.id)
+                .unwrap()
+                .tags
+                .iter()
+                .all(|t| t.project_id == proj_b.id)
+        );
+
+        // Attach Project A tags to Project A item
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            set_item_tags(&tx, wi_a.id, &[tag_a_ui.id, tag_a_bug.id]).unwrap();
+            tx.commit().unwrap();
+        }
+        let snap_a = load_project_snapshot(&conn, proj_a.id).unwrap();
+        assert_eq!(
+            snap_a
+                .tags_for_item(wi_a.id)
+                .into_iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bug", "ui"]
+        );
+
+        // Cross-project tag attachment rejected by repo AND by SQLite composite FK (INV-01, INV-15)
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                set_item_tags(&tx, wi_b.id, &[tag_a_bug.id]).unwrap_err(),
+                DomainError::CrossProjectReference
+            );
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO item_tags (project_id, item_id, tag_id, created_at)
+                 VALUES (?1, ?2, ?3, '2026-11-23T12:00:00Z');",
+                params![
+                    uuid_to_sql(proj_b.id.0),
+                    uuid_to_sql(wi_b.id.0),
+                    uuid_to_sql(tag_a_bug.id.0),
+                ],
+            )
+            .is_err(),
+            "SQLite composite FK must reject attaching Project A's tag to Project B's item"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO item_tags (project_id, item_id, tag_id, created_at)
+                 VALUES (?1, ?2, ?3, '2026-11-23T12:00:00Z');",
+                params![
+                    uuid_to_sql(proj_a.id.0),
+                    uuid_to_sql(wi_b.id.0),
+                    uuid_to_sql(tag_a_bug.id.0),
+                ],
+            )
+            .is_err(),
+            "SQLite composite FK must reject mismatched item project_id"
+        );
+
+        // Deleting a tag cascades item_tags without affecting other tags
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            delete_tag(&tx, tag_a_bug.id).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            list_tag_ids_for_item(&conn, wi_a.id).unwrap(),
+            vec![tag_a_ui.id]
+        );
+        assert_eq!(list_tags_for_project(&conn, proj_b.id).unwrap(), vec![tag_b_bug]);
     }
 }
 

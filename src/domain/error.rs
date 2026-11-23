@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::domain::{ItemId, ProjectId};
+use crate::domain::{AssigneeId, ItemId, ProjectId, TagId};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -12,6 +12,12 @@ pub enum DomainError {
 
     #[error("item not found: {0}")]
     ItemNotFound(ItemId),
+
+    #[error("assignee not found: {0}")]
+    AssigneeNotFound(AssigneeId),
+
+    #[error("tag not found: {0}")]
+    TagNotFound(TagId),
 
     #[error("feature nesting depth exceeds maximum of {max_depth}")]
     MaxFeatureDepthExceeded { max_depth: usize },

@@ -275,6 +275,12 @@ pub struct Assignee {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Assignee {
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tag {
     pub id: TagId,
@@ -349,18 +355,39 @@ impl ProjectSnapshot {
         self.assignees.iter().find(|assignee| assignee.id == id)
     }
 
+    pub fn active_assignees(&self) -> Vec<&Assignee> {
+        self.assignees
+            .iter()
+            .filter(|assignee| !assignee.is_archived())
+            .collect()
+    }
+
+    pub fn selectable_assignees(&self, current_assignee_id: Option<AssigneeId>) -> Vec<&Assignee> {
+        self.assignees
+            .iter()
+            .filter(|assignee| !assignee.is_archived() || Some(assignee.id) == current_assignee_id)
+            .collect()
+    }
+
     pub fn tags_for_item(&self, id: ItemId) -> Vec<&Tag> {
         let Some(tag_ids) = self.item_tags.get(&id) else {
             return Vec::new();
         };
-        tag_ids
+        let mut tags: Vec<&Tag> = tag_ids
             .iter()
             .filter_map(|tag_id| {
                 self.tags
                     .iter()
                     .find(|tag| tag.id == *tag_id && tag.project_id == self.project.id)
             })
-            .collect()
+            .collect();
+        tags.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        tags
     }
 
     pub fn active_items(&self) -> Vec<&Item> {

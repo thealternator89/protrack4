@@ -13,7 +13,10 @@ use gpui_kit::{
 
 use crate::domain::{MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px};
 use crate::state::{AppState, CenterViewTab, ProjectStore};
-use crate::ui::modals::{open_create_feature_modal, open_project_settings_modal};
+use crate::ui::modals::{
+    open_assignees_manager_modal, open_create_feature_modal, open_project_settings_modal,
+    open_tags_manager_modal,
+};
 use crate::ui::{
     build_project_switcher_menu, parse_hex_or, progress_pill, status_color, status_icon,
 };
@@ -34,7 +37,11 @@ pub fn render_sidebar(
     let selected_item_id = state.selected_item_id();
     let unallocated_count = snapshot.map_or(0, |s| s.unallocated_work_items().len());
     let trash_count = snapshot.map_or(0, |s| s.trash_count);
-    let assignee_count = state.assignees().len();
+    let assignee_count = state
+        .assignees()
+        .iter()
+        .filter(|a| !a.is_archived())
+        .count();
     let tag_count = snapshot.map_or(0, |s| s.tags.len());
     let tree_rows = snapshot
         .map(|s| s.visible_feature_tree_rows(state.expanded_features()))
@@ -572,8 +579,24 @@ pub fn render_sidebar(
                         .ghost()
                         .xsmall()
                         .w_full()
-                        .disabled(true)
-                        .tooltip("Global Assignees Manager — Available in Phase 5")
+                        .disabled(!has_workspace)
+                        .tooltip(if has_workspace {
+                            "Manage global workspace Assignees"
+                        } else {
+                            "Open or create a workspace first"
+                        })
+                        .on_click({
+                            let app_state = app_state.clone();
+                            let store = store.clone();
+                            move |_, window, cx| {
+                                open_assignees_manager_modal(
+                                    app_state.clone(),
+                                    store.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
                         .child(
                             h_flex()
                                 .flex_1()
@@ -599,8 +622,30 @@ pub fn render_sidebar(
                         .ghost()
                         .xsmall()
                         .w_full()
-                        .disabled(true)
-                        .tooltip("Project Tags Manager — Available in Phase 5")
+                        .disabled(active_project.is_none())
+                        .tooltip(if active_project.is_some() {
+                            "Manage Tags for the active Project"
+                        } else {
+                            "Select or create a Project first"
+                        })
+                        .on_click({
+                            let app_state = app_state.clone();
+                            let store = store.clone();
+                            let active_project = active_project.clone();
+                            move |_, window, cx| {
+                                if let Some(proj) = active_project.clone() {
+                                    open_tags_manager_modal(
+                                        app_state.clone(),
+                                        store.clone(),
+                                        proj.id,
+                                        proj.name,
+                                        proj.key_prefix,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }
+                        })
                         .child(
                             h_flex()
                                 .flex_1()

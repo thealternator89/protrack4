@@ -22,17 +22,17 @@ use gpui_kit::{
 
 use crate::commands::{
     AttachWorkItemToFeature, DetachWorkItemFromFeature, ReparentFeature, ReorderSiblingFeatures,
-    SetWorkItemFeatures, UndoableCommand, UpdateItemFields,
+    SetItemTags, SetWorkItemFeatures, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
-    Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId, ProjectSnapshot,
-    clamped_depth_badge, visual_indent_px,
+    Assignee, AssigneeId, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority,
+    ProjectId, ProjectSnapshot, TagId, clamped_depth_badge, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
-use crate::ui::modals::open_create_feature_modal;
+use crate::ui::modals::{open_create_feature_modal, open_tags_manager_modal};
 use crate::ui::{
     PrioritySelectOption, StatusSelectOption, all_priority_options, all_status_options,
-    assignee_pill, domain_tag_chip, kind_badge,
+    assignee_pill, kind_badge, parse_hex_or,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,43 @@ impl SelectItem for ParentFeatureOption {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssigneeSelectOption {
+    id: Option<AssigneeId>,
+    assignee: Option<Assignee>,
+    search_text: SharedString,
+    display_label: SharedString,
+}
+
+impl SelectItem for AssigneeSelectOption {
+    type Value = Option<AssigneeId>;
+
+    fn title(&self) -> SharedString {
+        self.display_label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.search_text
+            .to_lowercase()
+            .contains(&query.to_lowercase())
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        match &self.assignee {
+            Some(a) => assignee_pill(a, true, cx).into_any_element(),
+            None => div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Unassigned")
+                .into_any_element(),
+        }
+    }
+}
+
 pub struct InspectorView {
     app_state: Entity<AppState>,
     store: Entity<ProjectStore>,
@@ -108,15 +145,20 @@ pub struct InspectorView {
     loaded_description: String,
     loaded_status: ItemStatus,
     loaded_priority: Priority,
+    loaded_assignee_id: Option<AssigneeId>,
     loaded_parent_id: Option<ItemId>,
     parent_options_sig: Vec<(ItemId, String, String, Option<ItemId>)>,
+    assignee_options_sig: Vec<(AssigneeId, String, String, String, Option<String>, bool)>,
     title_input: Entity<InputState>,
     description_input: Entity<TextareaState>,
     status_select: Entity<SelectState<Vec<StatusSelectOption>>>,
     priority_select: Entity<SelectState<Vec<PrioritySelectOption>>>,
+    assignee_select: Entity<SelectState<SearchableVec<AssigneeSelectOption>>>,
     parent_select: Entity<SelectState<SearchableVec<ParentFeatureOption>>>,
     attach_popover_open: bool,
     attach_search_input: Entity<InputState>,
+    tag_popover_open: bool,
+    tag_search_input: Entity<InputState>,
     description_mode: DescriptionMode,
     preview_revision: u64,
     dirty_title: bool,
@@ -151,6 +193,16 @@ impl InspectorView {
         let priority_select =
             cx.new(|cx| SelectState::new(priority_options, Some(IndexPath::new(0)), window, cx));
 
+        let assignee_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(vec![unassigned_assignee_option()]),
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+
         let parent_select = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(vec![root_parent_option()]),
@@ -162,10 +214,21 @@ impl InspectorView {
         });
         let attach_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter Features…"));
+        let tag_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter project tags…"));
 
         let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
         let attach_search_sub = cx.subscribe_in(
             &attach_search_input,
+            window,
+            |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
+        let tag_search_sub = cx.subscribe_in(
+            &tag_search_input,
             window,
             |_, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -262,6 +325,7 @@ impl InspectorView {
                             description: None,
                             status: Some(*new_status),
                             priority: None,
+                            assignee_id: None,
                         }),
                         None,
                         cx,
@@ -292,10 +356,70 @@ impl InspectorView {
                             description: None,
                             status: None,
                             priority: Some(*new_priority),
+                            assignee_id: None,
                         }),
                         None,
                         cx,
                     );
+                }
+            },
+        );
+
+        let assignee_sub = cx.subscribe_in(
+            &assignee_select,
+            window,
+            |this, _, event: &SelectEvent<SearchableVec<AssigneeSelectOption>>, window, cx| {
+                if this.syncing {
+                    return;
+                }
+                if let SelectEvent::Confirm(Some(new_assignee)) = event {
+                    let Some(item_id) = this.loaded_item_id else {
+                        return;
+                    };
+                    if *new_assignee == this.loaded_assignee_id {
+                        return;
+                    }
+                    let previous = this.loaded_assignee_id;
+                    this.loaded_assignee_id = *new_assignee;
+                    let assignee_select = this.assignee_select.clone();
+                    let command = Box::new(UpdateItemFields {
+                        item_id,
+                        title: None,
+                        description: None,
+                        status: None,
+                        priority: None,
+                        assignee_id: Some(*new_assignee),
+                    });
+                    this.saving = true;
+                    cx.notify();
+
+                    let task = this
+                        .app_state
+                        .update(cx, |app, cx| app.execute_command(command, cx));
+                    let view = cx.entity().downgrade();
+                    window
+                        .spawn(cx, async move |cx| {
+                            let res = task.await;
+                            let _ = view.update(cx, |this, cx| {
+                                this.saving = false;
+                                if res.is_err() {
+                                    this.loaded_assignee_id = previous;
+                                }
+                                cx.notify();
+                            });
+                            if let Err(err) = res {
+                                let _ = cx.update(|window, cx| {
+                                    assignee_select.update(cx, |sel, cx| {
+                                        sel.set_selected_value(&previous, window, cx);
+                                    });
+                                    window.push_notification(
+                                        Notification::error(err.to_string()),
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .detach();
                 }
             },
         );
@@ -362,15 +486,20 @@ impl InspectorView {
             loaded_description: String::new(),
             loaded_status: ItemStatus::Todo,
             loaded_priority: Priority::None,
+            loaded_assignee_id: None,
             loaded_parent_id: None,
             parent_options_sig: Vec::new(),
+            assignee_options_sig: Vec::new(),
             title_input,
             description_input,
             status_select,
             priority_select,
+            assignee_select,
             parent_select,
             attach_popover_open: false,
             attach_search_input,
+            tag_popover_open: false,
+            tag_search_input,
             description_mode: DescriptionMode::Preview,
             preview_revision: 0,
             dirty_title: false,
@@ -382,10 +511,12 @@ impl InspectorView {
             _subscriptions: vec![
                 store_sub,
                 attach_search_sub,
+                tag_search_sub,
                 title_sub,
                 desc_sub,
                 status_sub,
                 priority_sub,
+                assignee_sub,
                 parent_sub,
             ],
         }
@@ -458,6 +589,7 @@ impl InspectorView {
             description: description.clone(),
             status: None,
             priority: None,
+            assignee_id: None,
         });
         if self
             .app_state
@@ -540,6 +672,7 @@ impl InspectorView {
                 description,
                 status: None,
                 priority: None,
+                assignee_id: None,
             }),
             Some((item_id, sent_title, sent_desc)),
             cx,
@@ -585,6 +718,7 @@ impl InspectorView {
             description,
             status: None,
             priority: None,
+            assignee_id: None,
         });
         let task = self
             .app_state
@@ -652,8 +786,11 @@ impl InspectorView {
             }
 
             self.attach_popover_open = false;
+            self.tag_popover_open = false;
             self.syncing = true;
             self.attach_search_input
+                .update(cx, |inp, cx| inp.set_value("", window, cx));
+            self.tag_search_input
                 .update(cx, |inp, cx| inp.set_value("", window, cx));
             if let (Some(snapshot), Some(item)) = (&snapshot_opt, current_item) {
                 self.loaded_item_id = Some(item.id);
@@ -662,6 +799,7 @@ impl InspectorView {
                 self.loaded_description = item.description.clone();
                 self.loaded_status = item.status;
                 self.loaded_priority = item.priority;
+                self.loaded_assignee_id = item.assignee_id;
                 self.loaded_parent_id = item.parent_feature_id;
                 self.dirty_title = false;
                 self.dirty_description = false;
@@ -680,6 +818,7 @@ impl InspectorView {
                 self.priority_select.update(cx, |sel, cx| {
                     sel.set_selected_value(&item.priority, window, cx);
                 });
+                self.rebuild_assignee_options(snapshot, &item, window, cx);
 
                 if item.kind == ItemKind::Feature {
                     self.rebuild_parent_options(snapshot, &item, window, cx);
@@ -691,8 +830,10 @@ impl InspectorView {
                 self.loaded_project_id = None;
                 self.loaded_title.clear();
                 self.loaded_description.clear();
+                self.loaded_assignee_id = None;
                 self.loaded_parent_id = None;
                 self.parent_options_sig.clear();
+                self.assignee_options_sig.clear();
                 self.dirty_title = false;
                 self.dirty_description = false;
                 self.title_error = None;
@@ -721,6 +862,14 @@ impl InspectorView {
             self.priority_select.update(cx, |sel, cx| {
                 sel.set_selected_value(&item.priority, window, cx)
             });
+        }
+
+        let new_assignee_sig = assignee_options_signature(&snapshot, item.assignee_id);
+        if new_assignee_sig != self.assignee_options_sig
+            || item.assignee_id != self.loaded_assignee_id
+        {
+            self.loaded_assignee_id = item.assignee_id;
+            self.rebuild_assignee_options(&snapshot, &item, window, cx);
         }
 
         if item.kind == ItemKind::Feature {
@@ -775,6 +924,22 @@ impl InspectorView {
         });
     }
 
+    fn rebuild_assignee_options(
+        &mut self,
+        snapshot: &ProjectSnapshot,
+        item: &Item,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.assignee_options_sig = assignee_options_signature(snapshot, item.assignee_id);
+        let options = build_assignee_options(snapshot, item.assignee_id);
+        let selected_assignee = item.assignee_id;
+        self.assignee_select.update(cx, |sel, cx| {
+            sel.set_items(SearchableVec::new(options), window, cx);
+            sel.set_selected_value(&selected_assignee, window, cx);
+        });
+    }
+
     fn dispatch_feature_membership_command(
         &mut self,
         command: Box<dyn UndoableCommand>,
@@ -809,6 +974,58 @@ impl InspectorView {
             })
             .detach();
     }
+}
+
+fn unassigned_assignee_option() -> AssigneeSelectOption {
+    AssigneeSelectOption {
+        id: None,
+        assignee: None,
+        search_text: "Unassigned".into(),
+        display_label: "Unassigned".into(),
+    }
+}
+
+fn assignee_options_signature(
+    snapshot: &ProjectSnapshot,
+    current_assignee_id: Option<AssigneeId>,
+) -> Vec<(AssigneeId, String, String, String, Option<String>, bool)> {
+    snapshot
+        .selectable_assignees(current_assignee_id)
+        .into_iter()
+        .map(|a| {
+            (
+                a.id,
+                a.name.clone(),
+                a.handle.clone(),
+                a.color.clone(),
+                a.role.clone(),
+                a.is_archived(),
+            )
+        })
+        .collect()
+}
+
+fn build_assignee_options(
+    snapshot: &ProjectSnapshot,
+    current_assignee_id: Option<AssigneeId>,
+) -> Vec<AssigneeSelectOption> {
+    let mut options = vec![unassigned_assignee_option()];
+    for a in snapshot.selectable_assignees(current_assignee_id) {
+        let search = format!(
+            "{} {} {}",
+            a.handle,
+            a.name,
+            a.role.as_deref().unwrap_or("")
+        );
+        let display = format!("{} · {}", a.handle, a.name);
+        options.push(AssigneeSelectOption {
+            id: Some(a.id),
+            assignee: Some(a.clone()),
+            search_text: search.into(),
+            display_label: display.into(),
+        });
+    }
+    options
 }
 
 fn root_parent_option() -> ParentFeatureOption {
@@ -919,7 +1136,11 @@ impl Render for InspectorView {
                 .into_any_element(),
                 (Some(snapshot), Some(item)) => {
                     let tags = snapshot.tags_for_item(item.id);
-                    let assignee = item.assignee_id.and_then(|aid| snapshot.assignee(aid));
+                    let current_tag_ids: Vec<TagId> = tags.iter().map(|t| t.id).collect();
+                    let item_id = item.id;
+                    let project_id = snapshot.project.id;
+                    let project_name = snapshot.project.name.clone();
+                    let key_prefix = snapshot.project.key_prefix.clone();
                     let convert_label = match item.kind {
                         ItemKind::Feature => "Convert to Work Item",
                         ItemKind::WorkItem => "Convert to Feature",
@@ -1478,13 +1699,22 @@ impl Render for InspectorView {
                                                                 .into_any_element()
                                                         } else {
                                                             v_flex()
+                                                                .w_full()
                                                                 .max_h(px(220.))
-                                                                .gap_0p5()
-                                                                .overflow_y_scrollbar()
-                                                                .id("inspector-attach-scroll")
-                                                                .children(
-                                                                    features.into_iter().map(
-                                                                        |(feat, depth)| {
+                                                                .overflow_hidden()
+                                                                .child(
+                                                                    div()
+                                                                        .flex_1()
+                                                                        .overflow_hidden()
+                                                                        .child(
+                                                                            v_flex()
+                                                                                .size_full()
+                                                                                .gap_0p5()
+                                                                                .overflow_y_scrollbar()
+                                                                                .id("inspector-attach-scroll")
+                                                                                .children(
+                                                                                    features.into_iter().map(
+                                                                                        |(feat, depth)| {
                                                                             let fid = feat.id;
                                                                             let is_attached =
                                                                                 live_attached
@@ -1511,6 +1741,7 @@ impl Render for InspectorView {
                                                                                 feat.item_number
                                                                                     as usize,
                                                                             ))
+                                                                            .flex_shrink_0()
                                                                             .w_full()
                                                                             .pl(px(8.0 + indent))
                                                                             .pr_2()
@@ -1603,6 +1834,8 @@ impl Render for InspectorView {
                                                                             )
                                                                         },
                                                                     ),
+                                                                ),
+                                                                ),
                                                                 )
                                                                 .into_any_element()
                                                         })
@@ -1768,16 +2001,25 @@ impl Render for InspectorView {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child("Assignee"),
                                         )
-                                        .child(match assignee {
-                                            Some(a) => assignee_pill(a, true, cx).into_any_element(),
-                                            None => div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("Unassigned (Phase 5)")
-                                                .into_any_element(),
-                                        }),
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Select::new(&self.assignee_select)
+                                                    .small()
+                                                    .search_placeholder("Filter assignees…"),
+                                            ),
+                                        ),
                                 )
-                                .child(
+                                .child({
+                                    let tag_search_focus =
+                                        self.tag_search_input.read(cx).focus_handle(cx);
+                                    let inspector_entity = cx.entity();
+                                    let inspector_for_change = inspector_entity.clone();
+                                    let inspector_for_content = inspector_entity.clone();
+                                    let app_for_empty = self.app_state.clone();
+                                    let store_for_empty = self.store.clone();
+                                    let empty_proj_name = project_name.clone();
+                                    let empty_prefix = key_prefix.clone();
+
                                     h_flex()
                                         .gap_2()
                                         .items_start()
@@ -1789,24 +2031,346 @@ impl Render for InspectorView {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child("Tags"),
                                         )
-                                        .child(if tags.is_empty() {
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("No tags (Phase 5)")
-                                                .into_any_element()
-                                        } else {
+                                        .child(
                                             h_flex()
                                                 .flex_1()
+                                                .min_w_0()
                                                 .gap_1p5()
                                                 .flex_wrap()
-                                                .children(
-                                                    tags.into_iter()
-                                                        .map(|tag| domain_tag_chip(tag, cx)),
-                                                )
-                                                .into_any_element()
-                                        }),
-                                ),
+                                                .items_center()
+                                                .children(tags.into_iter().enumerate().map(
+                                                    |(ix, tag)| {
+                                                        let tid = tag.id;
+                                                        let t_color = parse_hex_or(
+                                                            &tag.color,
+                                                            cx.theme().primary,
+                                                        );
+                                                        let t_bg = t_color.opacity(
+                                                            if cx.theme().is_dark() {
+                                                                0.2
+                                                            } else {
+                                                                0.11
+                                                            },
+                                                        );
+                                                        let t_border = t_color.opacity(
+                                                            if cx.theme().is_dark() {
+                                                                0.38
+                                                            } else {
+                                                                0.25
+                                                            },
+                                                        );
+                                                        let next_ids: Vec<TagId> = current_tag_ids
+                                                            .iter()
+                                                            .copied()
+                                                            .filter(|id| *id != tid)
+                                                            .collect();
+                                                        let inspector_remove =
+                                                            inspector_entity.clone();
+
+                                                        h_flex()
+                                                            .pl_2()
+                                                            .pr_1()
+                                                            .py_0p5()
+                                                            .gap_1()
+                                                            .items_center()
+                                                            .rounded(px(999.))
+                                                            .bg(t_bg)
+                                                            .border_1()
+                                                            .border_color(t_border)
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.))
+                                                                    .font_medium()
+                                                                    .text_color(t_color)
+                                                                    .child(tag.name.clone()),
+                                                            )
+                                                            .child(
+                                                                Button::new((
+                                                                    "inspector-remove-tag",
+                                                                    ix,
+                                                                ))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .compact()
+                                                                .icon(IconName::Close)
+                                                                .tooltip("Remove tag")
+                                                                .on_click(move |_, window, cx| {
+                                                                    let ids = next_ids.clone();
+                                                                    inspector_remove.update(
+                                                                        cx,
+                                                                        |this, cx| {
+                                                                            this.dispatch_feature_membership_command(
+                                                                                Box::new(SetItemTags::new(
+                                                                                    item_id,
+                                                                                    ids,
+                                                                                )),
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                            )
+                                                    },
+                                                ))
+                                                .child(
+                                                    Popover::new("inspector-tags-popover")
+                                                        .anchor(Anchor::TopLeft)
+                                                        .open(self.tag_popover_open)
+                                                        .track_focus(&tag_search_focus)
+                                                        .on_open_change(move |is_open, window, cx| {
+                                                            inspector_for_change.update(
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.tag_popover_open =
+                                                                        *is_open;
+                                                                    if *is_open {
+                                                                        this.tag_search_input
+                                                                            .update(cx, |inp, cx| {
+                                                                                inp.set_value(
+                                                                                    "", window, cx,
+                                                                                );
+                                                                                inp.focus(
+                                                                                    window, cx,
+                                                                                );
+                                                                            });
+                                                                    }
+                                                                    cx.notify();
+                                                                },
+                                                            );
+                                                        })
+                                                        .trigger(
+                                                            Button::new("inspector-add-tag-btn")
+                                                                .outline()
+                                                                .xsmall()
+                                                                .icon(IconName::Plus)
+                                                                .label("Tag"),
+                                                        )
+                                                        .content(move |_, _, cx| {
+                                                            let view_ref =
+                                                                inspector_for_content.read(cx);
+                                                            let search_input =
+                                                                view_ref.tag_search_input.clone();
+                                                            let query_raw =
+                                                                search_input.read(cx).value();
+                                                            let query =
+                                                                query_raw.trim().to_lowercase();
+                                                            let snap_opt = view_ref
+                                                                .store
+                                                                .read(cx)
+                                                                .snapshot()
+                                                                .cloned();
+                                                            let live_tag_ids: Vec<TagId> = snap_opt
+                                                                .as_ref()
+                                                                .map(|s| {
+                                                                    s.tags_for_item(item_id)
+                                                                        .into_iter()
+                                                                        .map(|t| t.id)
+                                                                        .collect()
+                                                                })
+                                                                .unwrap_or_default();
+                                                            let live_set: HashSet<TagId> =
+                                                                live_tag_ids
+                                                                    .iter()
+                                                                    .copied()
+                                                                    .collect();
+                                                            let all_project_tags: Vec<_> = snap_opt
+                                                                .as_ref()
+                                                                .map(|s| s.tags.clone())
+                                                                .unwrap_or_default();
+                                                            let filtered_tags: Vec<_> =
+                                                                all_project_tags
+                                                                    .iter()
+                                                                    .filter(|t| {
+                                                                        query.is_empty()
+                                                                            || t.name
+                                                                                .to_lowercase()
+                                                                                .contains(&query)
+                                                                    })
+                                                                    .cloned()
+                                                                    .collect();
+
+                                                            let app_manage = app_for_empty.clone();
+                                                            let store_manage =
+                                                                store_for_empty.clone();
+                                                            let pname_manage =
+                                                                empty_proj_name.clone();
+                                                            let prefix_manage =
+                                                                empty_prefix.clone();
+                                                            let inspector_manage =
+                                                                inspector_for_content.clone();
+                                                            let popover_manage = cx.entity();
+
+                                                            v_flex()
+                                                                .w(px(260.))
+                                                                .gap_2()
+                                                                .child(
+                                                                    h_flex()
+                                                                        .items_center()
+                                                                        .justify_between()
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .font_semibold()
+                                                                                .child("Project Tags"),
+                                                                        )
+                                                                        .child(
+                                                                            Button::new("inspector-manage-tags-btn")
+                                                                                .ghost()
+                                                                                .xsmall()
+                                                                                .label("Manage…")
+                                                                                .on_click(move |_, window, cx| {
+                                                                                    inspector_manage.update(cx, |this, cx| {
+                                                                                        this.tag_popover_open = false;
+                                                                                        cx.notify();
+                                                                                    });
+                                                                                    popover_manage.update(cx, |st, cx| {
+                                                                                        st.dismiss(window, cx);
+                                                                                    });
+                                                                                    open_tags_manager_modal(
+                                                                                        app_manage.clone(),
+                                                                                        store_manage.clone(),
+                                                                                        project_id,
+                                                                                        pname_manage.clone(),
+                                                                                        prefix_manage.clone(),
+                                                                                        window,
+                                                                                        cx,
+                                                                                    );
+                                                                                }),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    Input::new(&search_input)
+                                                                        .id("inspector-tag-search")
+                                                                        .small()
+                                                                        .cleanable(true),
+                                                                )
+                                                                .child(if filtered_tags.is_empty() {
+                                                                    div()
+                                                                        .px_2()
+                                                                        .py_3()
+                                                                        .text_xs()
+                                                                        .text_color(
+                                                                            cx.theme()
+                                                                                .muted_foreground,
+                                                                        )
+                                                                        .child(if all_project_tags.is_empty() {
+                                                                            "No tags in this project yet. Click Manage… to create one."
+                                                                        } else {
+                                                                            "No matching tags."
+                                                                        })
+                                                                        .into_any_element()
+                                                                } else {
+                                                                    v_flex()
+                                                                        .w_full()
+                                                                        .max_h(px(200.))
+                                                                        .overflow_hidden()
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_1()
+                                                                                .overflow_hidden()
+                                                                                .child(
+                                                                                    v_flex()
+                                                                                        .size_full()
+                                                                                        .gap_0p5()
+                                                                                        .overflow_y_scrollbar()
+                                                                                        .id("inspector-tag-scroll")
+                                                                                        .children(
+                                                                                            filtered_tags
+                                                                                                .into_iter()
+                                                                                                .enumerate()
+                                                                                                .map(|(ix, tag)| {
+                                                                                                    let tid = tag.id;
+                                                                                                    let checked = live_set.contains(&tid);
+                                                                                                    let dot_color = parse_hex_or(
+                                                                                                        &tag.color,
+                                                                                                        cx.theme().primary,
+                                                                                                    );
+                                                                                                    let mut next_ids = live_tag_ids.clone();
+                                                                                                    if checked {
+                                                                                                        next_ids.retain(|id| *id != tid);
+                                                                                                    } else {
+                                                                                                        next_ids.push(tid);
+                                                                                                    }
+                                                                                                    let inspector_toggle = inspector_for_content.clone();
+
+                                                                                                    ListItem::new(("inspector-tag-option", ix))
+                                                                                                        .flex_shrink_0()
+                                                                                                        .w_full()
+                                                                                        .px_2()
+                                                                                        .py_1p5()
+                                                                                        .rounded(cx.theme().radius * 0.75)
+                                                                                        .selected(checked)
+                                                                                        .on_click(move |_, window, cx| {
+                                                                                            let ids = next_ids.clone();
+                                                                                            inspector_toggle.update(cx, |this, cx| {
+                                                                                                this.dispatch_feature_membership_command(
+                                                                                                    Box::new(SetItemTags::new(item_id, ids)),
+                                                                                                    window,
+                                                                                                    cx,
+                                                                                                );
+                                                                                            });
+                                                                                        })
+                                                                                        .child(
+                                                                                            h_flex()
+                                                                                                .w_full()
+                                                                                                .gap_2()
+                                                                                                .items_center()
+                                                                                                .child(
+                                                                                                    div()
+                                                                                                        .flex()
+                                                                                                        .items_center()
+                                                                                                        .justify_center()
+                                                                                                        .size(px(14.))
+                                                                                                        .flex_shrink_0()
+                                                                                                        .rounded(px(3.))
+                                                                                                        .border_1()
+                                                                                                        .border_color(if checked {
+                                                                                                            cx.theme().primary
+                                                                                                        } else {
+                                                                                                            cx.theme().border
+                                                                                                        })
+                                                                                                        .bg(if checked {
+                                                                                                            cx.theme().primary
+                                                                                                        } else {
+                                                                                                            cx.theme().background
+                                                                                                        })
+                                                                                                        .when(checked, |this| {
+                                                                                                            this.child(
+                                                                                                                Icon::new(IconName::Check)
+                                                                                                                    .xsmall()
+                                                                                                                    .text_color(cx.theme().primary_foreground),
+                                                                                                            )
+                                                                                                        }),
+                                                                                                )
+                                                                                                .child(
+                                                                                                    div()
+                                                                                                        .size(px(8.))
+                                                                                                        .flex_shrink_0()
+                                                                                                        .rounded(px(999.))
+                                                                                                        .bg(dot_color),
+                                                                                                )
+                                                                                                .child(
+                                                                                                    div()
+                                                                                                        .flex_1()
+                                                                                                        .min_w_0()
+                                                                                                        .overflow_hidden()
+                                                                                                        .whitespace_nowrap()
+                                                                                                        .text_ellipsis()
+                                                                                                        .text_xs()
+                                                                                                        .child(tag.name),
+                                                                                                ),
+                                                                                        )
+                                                                                }),
+                                                                        ),
+                                                                        ),
+                                                                        )
+                                                                        .into_any_element()
+                                                                })
+                                                        }),
+                                                ),
+                                        )
+                                }),
                         )
                         // Hierarchy or Attached Features
                         .child(relation_section)

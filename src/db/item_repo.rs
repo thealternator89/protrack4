@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
+use crate::db::assignee_repo;
 use crate::db::project_repo::{allocate_next_item_key, get_project};
 use crate::db::{
     map_sqlite_err, parse_domain_col, parse_ts_col, parse_uuid_col, ts_to_sql, uuid_to_sql,
@@ -55,6 +56,7 @@ pub struct UpdateItemFieldsInput {
     pub description: Option<String>,
     pub status: Option<ItemStatus>,
     pub priority: Option<Priority>,
+    pub assignee_id: Option<Option<AssigneeId>>,
 }
 
 pub fn validate_item_title(title: &str) -> Result<String, DomainError> {
@@ -482,6 +484,20 @@ pub fn update_item_fields(
     let description = input.description.unwrap_or_else(|| existing.description.clone());
     let status = input.status.unwrap_or(existing.status);
     let priority = input.priority.unwrap_or(existing.priority);
+    let assignee_id = match input.assignee_id {
+        Some(Some(aid)) => {
+            let assignee = assignee_repo::get_assignee(tx, aid)?;
+            if existing.assignee_id != Some(aid) && assignee.is_archived() {
+                return Err(DomainError::Validation(format!(
+                    "Assignee '{}' is archived and cannot be assigned to new items",
+                    assignee.name
+                )));
+            }
+            Some(aid)
+        }
+        Some(None) => None,
+        None => existing.assignee_id,
+    };
 
     let now = Utc::now();
     let now_sql = ts_to_sql(now);
@@ -492,13 +508,15 @@ pub fn update_item_fields(
              description = ?2,
              status = ?3,
              priority = ?4,
-             updated_at = ?5
-         WHERE id = ?6;",
+             assignee_id = ?5,
+             updated_at = ?6
+         WHERE id = ?7;",
         params![
             &title,
             &description,
             status.as_str(),
             priority.as_str(),
+            assignee_id.map(|id| uuid_to_sql(id.0)),
             &now_sql,
             uuid_to_sql(existing.id.0),
         ],
@@ -510,6 +528,7 @@ pub fn update_item_fields(
         description,
         status,
         priority,
+        assignee_id,
         updated_at: now,
         ..existing
     })

@@ -59,7 +59,7 @@ pub fn validate_hex_color(color: &str) -> Result<String, DomainError> {
     let bytes = trimmed.as_bytes();
     if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(|b| b.is_ascii_hexdigit()) {
         return Err(DomainError::Validation(format!(
-            "Project color '{trimmed}' must be a 6-digit hex color like #6366F1"
+            "Color '{trimmed}' must be a 6-digit hex color like #6366F1"
         )));
     }
     Ok(format!("#{}", trimmed[1..].to_ascii_uppercase()))
