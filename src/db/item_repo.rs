@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
@@ -7,8 +9,8 @@ use crate::db::{
 };
 use crate::domain::fractional_index;
 use crate::domain::{
-    AssigneeId, DomainError, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority,
-    ProjectId,
+    AssigneeId, DomainError, FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus,
+    MAX_FEATURE_DEPTH, Priority, ProjectId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,16 @@ pub struct CreateFeatureInput {
     pub description: String,
     pub status: ItemStatus,
     pub priority: Priority,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateWorkItemInput {
+    pub project_id: ProjectId,
+    pub title: String,
+    pub description: String,
+    pub status: ItemStatus,
+    pub priority: Priority,
+    pub feature_ids: Vec<ItemId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -711,4 +723,540 @@ pub fn reorder_sibling_features(
         updated_at: now,
         ..feature
     })
+}
+
+fn dedupe_preserve_order(ids: &[ItemId]) -> Vec<ItemId> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+fn validate_active_feature_in_project(
+    conn: &Connection,
+    project_id: ProjectId,
+    feature_id: ItemId,
+) -> Result<Item, DomainError> {
+    let feat = get_item(conn, feature_id)?;
+    if feat.project_id != project_id {
+        return Err(DomainError::CrossProjectReference);
+    }
+    if !feat.is_active() {
+        return Err(DomainError::Validation(
+            "Cannot attach a Work Item to a trashed Feature".to_string(),
+        ));
+    }
+    if feat.kind != ItemKind::Feature {
+        return Err(DomainError::Validation(
+            "Work Items can only be attached to Features".to_string(),
+        ));
+    }
+    Ok(feat)
+}
+
+fn validate_active_work_item(conn: &Connection, work_item_id: ItemId) -> Result<Item, DomainError> {
+    let item = get_item(conn, work_item_id)?;
+    if !item.is_active() {
+        return Err(DomainError::Validation(
+            "Cannot modify Feature attachments of a trashed Work Item".to_string(),
+        ));
+    }
+    if item.kind != ItemKind::WorkItem {
+        return Err(DomainError::Validation(
+            "Only Work Items can be attached to Features".to_string(),
+        ));
+    }
+    Ok(item)
+}
+
+fn append_work_item_sort_order(
+    tx: &Transaction<'_>,
+    project_id: ProjectId,
+    now_sql: &str,
+) -> Result<String, DomainError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, sort_order
+             FROM items
+             WHERE project_id = ?1
+               AND kind = 'work_item'
+               AND deleted_at IS NULL
+             ORDER BY sort_order ASC, item_number ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(project_id.0)], |row| {
+            let id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+            let sort_order: String = row.get(1)?;
+            Ok((id, sort_order))
+        })
+        .map_err(map_sqlite_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_err)?;
+    drop(stmt);
+
+    let Some((_, last_key)) = rows.last() else {
+        return Ok(fractional_index::first());
+    };
+
+    match fractional_index::after(last_key) {
+        Ok(next) if !fractional_index::needs_rebalance(&next) => Ok(next),
+        _ => {
+            let keys = fractional_index::rebalance_keys(rows.len() + 1);
+            for ((id, _), key) in rows.iter().zip(keys.iter()) {
+                tx.execute(
+                    "UPDATE items SET sort_order = ?1, updated_at = ?2 WHERE id = ?3;",
+                    params![key, now_sql, uuid_to_sql(id.0)],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            Ok(keys.last().cloned().unwrap_or_else(fractional_index::first))
+        }
+    }
+}
+
+fn append_fwi_sort_order(
+    tx: &Transaction<'_>,
+    project_id: ProjectId,
+    feature_id: ItemId,
+) -> Result<String, DomainError> {
+    let project_sql = uuid_to_sql(project_id.0);
+    let feature_sql = uuid_to_sql(feature_id.0);
+
+    let mut stmt = tx
+        .prepare(
+            "SELECT work_item_id, sort_order
+             FROM feature_work_items
+             WHERE project_id = ?1
+               AND feature_id = ?2
+             ORDER BY sort_order ASC, work_item_id ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![&project_sql, &feature_sql], |row| {
+            let id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+            let sort_order: String = row.get(1)?;
+            Ok((id, sort_order))
+        })
+        .map_err(map_sqlite_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_err)?;
+    drop(stmt);
+
+    let Some((_, last_key)) = rows.last() else {
+        return Ok(fractional_index::first());
+    };
+
+    match fractional_index::after(last_key) {
+        Ok(next) if !fractional_index::needs_rebalance(&next) => Ok(next),
+        _ => {
+            let keys = fractional_index::rebalance_keys(rows.len() + 1);
+            for ((wi_id, _), key) in rows.iter().zip(keys.iter()) {
+                tx.execute(
+                    "UPDATE feature_work_items
+                     SET sort_order = ?1
+                     WHERE feature_id = ?2 AND work_item_id = ?3;",
+                    params![key, &feature_sql, uuid_to_sql(wi_id.0)],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            Ok(keys.last().cloned().unwrap_or_else(fractional_index::first))
+        }
+    }
+}
+
+pub fn create_work_item(
+    tx: &Transaction<'_>,
+    input: CreateWorkItemInput,
+) -> Result<Item, DomainError> {
+    let title = validate_item_title(&input.title)?;
+    let _project = get_project(tx, input.project_id)?;
+
+    let feature_ids = dedupe_preserve_order(&input.feature_ids);
+    for &fid in &feature_ids {
+        validate_active_feature_in_project(tx, input.project_id, fid)?;
+    }
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+    let sort_order = append_work_item_sort_order(tx, input.project_id, &now_sql)?;
+    let (item_number, item_key) = allocate_next_item_key(tx, input.project_id)?;
+
+    let item = Item {
+        id: ItemId::new(),
+        project_id: input.project_id,
+        item_number,
+        item_key,
+        kind: ItemKind::WorkItem,
+        parent_feature_id: None,
+        title,
+        description: input.description,
+        status: input.status,
+        priority: input.priority,
+        assignee_id: None,
+        sort_order,
+        deleted_at: None,
+        trash_root_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let project_sql = uuid_to_sql(item.project_id.0);
+    let item_sql = uuid_to_sql(item.id.0);
+
+    tx.execute(
+        "INSERT INTO items (
+            id, project_id, item_number, item_key, kind, parent_feature_id,
+            title, description, status, priority, assignee_id, sort_order,
+            deleted_at, trash_root_id, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 'work_item', NULL, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11, ?12);",
+        params![
+            &item_sql,
+            &project_sql,
+            item.item_number,
+            &item.item_key,
+            &item.title,
+            &item.description,
+            item.status.as_str(),
+            item.priority.as_str(),
+            item.assignee_id.map(|id| uuid_to_sql(id.0)),
+            &item.sort_order,
+            &now_sql,
+            &now_sql,
+        ],
+    )
+    .map_err(map_sqlite_err)?;
+
+    for fid in feature_ids {
+        let fwi_sort_order = append_fwi_sort_order(tx, item.project_id, fid)?;
+        tx.execute(
+            "INSERT INTO feature_work_items (project_id, feature_id, work_item_id, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5);",
+            params![
+                &project_sql,
+                uuid_to_sql(fid.0),
+                &item_sql,
+                &fwi_sort_order,
+                &now_sql,
+            ],
+        )
+        .map_err(map_sqlite_err)?;
+    }
+
+    Ok(item)
+}
+
+/// Executes the Unallocated Bucket query (`DATA_MODEL.md` §4.2 / `INV-03`).
+pub fn query_unallocated_work_items(
+    conn: &Connection,
+    project_id: ProjectId,
+) -> Result<Vec<Item>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.id, i.project_id, i.item_number, i.item_key, i.kind, i.parent_feature_id,
+                    i.title, i.description, i.status, i.priority, i.assignee_id, i.sort_order,
+                    i.deleted_at, i.trash_root_id, i.created_at, i.updated_at
+             FROM items i
+             WHERE i.project_id = ?1
+               AND i.kind = 'work_item'
+               AND i.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM feature_work_items fwi
+                   JOIN items f ON f.id = fwi.feature_id
+                   WHERE fwi.work_item_id = i.id
+                     AND f.deleted_at IS NULL
+               )
+             ORDER BY i.sort_order ASC, i.item_number ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(project_id.0)], row_to_item)
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+/// Returns all active Features currently attached to `work_item_id`.
+pub fn query_features_for_work_item(
+    conn: &Connection,
+    work_item_id: ItemId,
+) -> Result<Vec<Item>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.id, f.project_id, f.item_number, f.item_key, f.kind, f.parent_feature_id,
+                    f.title, f.description, f.status, f.priority, f.assignee_id, f.sort_order,
+                    f.deleted_at, f.trash_root_id, f.created_at, f.updated_at
+             FROM feature_work_items fwi
+             JOIN items f ON f.id = fwi.feature_id
+             WHERE fwi.work_item_id = ?1
+               AND f.deleted_at IS NULL
+               AND f.kind = 'feature'
+             ORDER BY f.item_number ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(work_item_id.0)], row_to_item)
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+/// Returns active `feature_work_items` links for `work_item_id`.
+pub fn query_feature_attachments_for_work_item(
+    conn: &Connection,
+    work_item_id: ItemId,
+) -> Result<Vec<FeatureWorkItem>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT fwi.project_id, fwi.feature_id, fwi.work_item_id, fwi.sort_order, fwi.created_at
+             FROM feature_work_items fwi
+             JOIN items f ON f.id = fwi.feature_id
+             WHERE fwi.work_item_id = ?1
+               AND f.deleted_at IS NULL
+             ORDER BY fwi.feature_id ASC, fwi.sort_order ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(work_item_id.0)], |row| {
+            Ok(FeatureWorkItem {
+                project_id: ProjectId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
+                feature_id: ItemId::from_uuid(parse_uuid_col(1, row.get(1)?)?),
+                work_item_id: ItemId::from_uuid(parse_uuid_col(2, row.get(2)?)?),
+                sort_order: row.get(3)?,
+                created_at: parse_ts_col(4, row.get(4)?)?,
+            })
+        })
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+/// Returns active Work Items attached to `feature_id` ordered by per-Feature `sort_order`.
+pub fn query_work_items_for_feature(
+    conn: &Connection,
+    feature_id: ItemId,
+) -> Result<Vec<Item>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT wi.id, wi.project_id, wi.item_number, wi.item_key, wi.kind, wi.parent_feature_id,
+                    wi.title, wi.description, wi.status, wi.priority, wi.assignee_id, wi.sort_order,
+                    wi.deleted_at, wi.trash_root_id, wi.created_at, wi.updated_at
+             FROM feature_work_items fwi
+             JOIN items wi ON wi.id = fwi.work_item_id
+             WHERE fwi.feature_id = ?1
+               AND wi.deleted_at IS NULL
+               AND wi.kind = 'work_item'
+             ORDER BY fwi.sort_order ASC, wi.item_number ASC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(feature_id.0)], row_to_item)
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+/// Replaces the set of active Features attached to `work_item_id`, preserving `sort_order`
+/// on retained links and leaving any inert links to trashed Features untouched.
+pub fn set_work_item_features(
+    tx: &Transaction<'_>,
+    work_item_id: ItemId,
+    feature_ids: &[ItemId],
+) -> Result<Item, DomainError> {
+    let work_item = validate_active_work_item(tx, work_item_id)?;
+    let desired_order = dedupe_preserve_order(feature_ids);
+    for &fid in &desired_order {
+        validate_active_feature_in_project(tx, work_item.project_id, fid)?;
+    }
+
+    let wi_sql = uuid_to_sql(work_item_id.0);
+    let project_sql = uuid_to_sql(work_item.project_id.0);
+
+    let current_active: Vec<ItemId> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT fwi.feature_id
+                 FROM feature_work_items fwi
+                 JOIN items f ON f.id = fwi.feature_id
+                 WHERE fwi.work_item_id = ?1
+                   AND f.deleted_at IS NULL;",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![&wi_sql], |row| {
+                Ok(ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?))
+            })
+            .map_err(map_sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+    };
+
+    let current_set: HashSet<ItemId> = current_active.iter().copied().collect();
+    let desired_set: HashSet<ItemId> = desired_order.iter().copied().collect();
+
+    let mut mutated = false;
+    for existing_fid in &current_active {
+        if !desired_set.contains(existing_fid) {
+            let deleted = tx
+                .execute(
+                    "DELETE FROM feature_work_items
+                     WHERE feature_id = ?1 AND work_item_id = ?2;",
+                    params![uuid_to_sql(existing_fid.0), &wi_sql],
+                )
+                .map_err(map_sqlite_err)?;
+            if deleted > 0 {
+                mutated = true;
+            }
+        }
+    }
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+
+    for desired_fid in desired_order {
+        if !current_set.contains(&desired_fid) {
+            let fwi_sort_order = append_fwi_sort_order(tx, work_item.project_id, desired_fid)?;
+            tx.execute(
+                "INSERT INTO feature_work_items (project_id, feature_id, work_item_id, sort_order, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![
+                    &project_sql,
+                    uuid_to_sql(desired_fid.0),
+                    &wi_sql,
+                    &fwi_sort_order,
+                    &now_sql,
+                ],
+            )
+            .map_err(map_sqlite_err)?;
+            mutated = true;
+        }
+    }
+
+    if !mutated {
+        return Ok(work_item);
+    }
+
+    tx.execute(
+        "UPDATE items SET updated_at = ?1 WHERE id = ?2;",
+        params![&now_sql, &wi_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    Ok(Item {
+        updated_at: now,
+        ..work_item
+    })
+}
+
+pub fn attach_work_item_to_feature(
+    tx: &Transaction<'_>,
+    work_item_id: ItemId,
+    feature_id: ItemId,
+) -> Result<FeatureWorkItem, DomainError> {
+    let work_item = validate_active_work_item(tx, work_item_id)?;
+    let _feature = validate_active_feature_in_project(tx, work_item.project_id, feature_id)?;
+
+    let wi_sql = uuid_to_sql(work_item_id.0);
+    let feat_sql = uuid_to_sql(feature_id.0);
+    let project_sql = uuid_to_sql(work_item.project_id.0);
+
+    if let Some(existing) = tx
+        .query_row(
+            "SELECT project_id, feature_id, work_item_id, sort_order, created_at
+             FROM feature_work_items
+             WHERE feature_id = ?1 AND work_item_id = ?2;",
+            params![&feat_sql, &wi_sql],
+            |row| {
+                Ok(FeatureWorkItem {
+                    project_id: ProjectId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
+                    feature_id: ItemId::from_uuid(parse_uuid_col(1, row.get(1)?)?),
+                    work_item_id: ItemId::from_uuid(parse_uuid_col(2, row.get(2)?)?),
+                    sort_order: row.get(3)?,
+                    created_at: parse_ts_col(4, row.get(4)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_err)?
+    {
+        return Ok(existing);
+    }
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+    let sort_order = append_fwi_sort_order(tx, work_item.project_id, feature_id)?;
+
+    tx.execute(
+        "INSERT INTO feature_work_items (project_id, feature_id, work_item_id, sort_order, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5);",
+        params![&project_sql, &feat_sql, &wi_sql, &sort_order, &now_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    tx.execute(
+        "UPDATE items SET updated_at = ?1 WHERE id = ?2;",
+        params![&now_sql, &wi_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    Ok(FeatureWorkItem {
+        project_id: work_item.project_id,
+        feature_id,
+        work_item_id,
+        sort_order,
+        created_at: now,
+    })
+}
+
+pub fn detach_work_item_from_feature(
+    tx: &Transaction<'_>,
+    work_item_id: ItemId,
+    feature_id: ItemId,
+) -> Result<bool, DomainError> {
+    let work_item = validate_active_work_item(tx, work_item_id)?;
+    let feat_project: Option<String> = tx
+        .query_row(
+            "SELECT project_id FROM items WHERE id = ?1;",
+            params![uuid_to_sql(feature_id.0)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_err)?;
+
+    if let Some(pid_raw) = feat_project {
+        let pid = ProjectId::from_uuid(parse_uuid_col(0, pid_raw).map_err(map_sqlite_err)?);
+        if pid != work_item.project_id {
+            return Err(DomainError::CrossProjectReference);
+        }
+    }
+
+    let wi_sql = uuid_to_sql(work_item_id.0);
+    let deleted = tx
+        .execute(
+            "DELETE FROM feature_work_items WHERE feature_id = ?1 AND work_item_id = ?2;",
+            params![uuid_to_sql(feature_id.0), &wi_sql],
+        )
+        .map_err(map_sqlite_err)?;
+
+    if deleted > 0 {
+        let now_sql = ts_to_sql(Utc::now());
+        tx.execute(
+            "UPDATE items SET updated_at = ?1 WHERE id = ?2;",
+            params![&now_sql, &wi_sql],
+        )
+        .map_err(map_sqlite_err)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }

@@ -2,6 +2,7 @@ pub mod inspector;
 pub mod modals;
 pub mod shell;
 pub mod sidebar;
+pub mod unallocated_view;
 
 pub use shell::WorkspaceShell;
 

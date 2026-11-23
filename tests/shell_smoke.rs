@@ -794,3 +794,292 @@ async fn phase3_project_feature_crud_and_inspector_persistence(cx: &mut TestAppC
     assert!(!shm_path_for(&db_path).exists());
     assert!(!lock_path_for(&db_path).exists());
 }
+
+#[gpui_kit::test]
+async fn phase4_work_items_multi_feature_and_unallocated_triage(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase4.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config.clone(), window, cx)),
+        )
+        .expect("open Phase 4 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Create Project and two Features (Auth, Billing)
+    let project_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Triage Suite",
+                    "TRI",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let f1_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    project_id,
+                    None,
+                    "Auth",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f2_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    project_id,
+                    None,
+                    "Billing",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    wait_until(cx, "2 features loaded", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.active_items().len() == 2)
+    })
+    .await;
+
+    let (f1_num, f2_num) = cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        (
+            s.item(f1_id).unwrap().item_number as usize,
+            s.item(f2_id).unwrap().item_number as usize,
+        )
+    });
+
+    // 2. Navigate to Unallocated via Sidebar row and capture 3 Work Items via Enter
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("sidebar-unallocated-row", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).active_tab(), CenterViewTab::Unallocated);
+        window.click("unallocated-quick-capture", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("unallocated-quick-capture").focused(), Some(true));
+    })
+    .unwrap();
+
+    for (expected_count, title) in [
+        (1usize, "Add OAuth token refresh"),
+        (2usize, "Fix invoice PDF rounding"),
+        (3usize, "Audit session timeout"),
+    ] {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.input(title, cx);
+        })
+        .unwrap();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("enter", cx);
+        })
+        .unwrap();
+
+        wait_until(cx, "quick-captured work item created", |cx| {
+            store
+                .read(cx)
+                .snapshot()
+                .is_some_and(|s| s.unallocated_work_items().len() == expected_count)
+        })
+        .await;
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("unallocated-quick-capture").value(), Some(""));
+            assert_eq!(window.find("unallocated-quick-capture").focused(), Some(true));
+        })
+        .unwrap();
+    }
+
+    let (wi1_id, wi1_num) = cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        let wi1 = s
+            .unallocated_work_items()
+            .into_iter()
+            .find(|w| w.title == "Add OAuth token refresh")
+            .unwrap();
+        (wi1.id, wi1.item_number as usize)
+    });
+
+    // 3. Assign wi1 to 2 Features via [+ Assign Features] popover in Unallocated View
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("unallocated-assign-btn", wi1_num), cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("unallocated-feature-search").is_some());
+
+        window.click(("unallocated-picker-feature", f1_num), cx);
+        window.render_frame(cx);
+        window.click(("unallocated-picker-feature", f2_num), cx);
+        window.render_frame(cx);
+        window.click("unallocated-picker-apply", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "wi1 assigned to 2 Features and removed from Unallocated", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.features_for_work_item(wi1_id).len() == 2 && s.unallocated_work_items().len() == 2
+        })
+    })
+    .await;
+
+    // 4. Inspect wi1 in Inspector: verify 2 attached features, detach f1, re-attach f1 via popover, then click [Unallocate]
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(wi1_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find(("inspector-detach-feature", f1_num)).is_some());
+        assert!(window.try_find(("inspector-detach-feature", f2_num)).is_some());
+
+        window.click(("inspector-detach-feature", f1_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "wi1 detached from f1 in Inspector", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            let feats = s.features_for_work_item(wi1_id);
+            feats.len() == 1 && feats[0].id == f2_id
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("inspector-attach-feature-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("inspector-attach-feature-search").is_some());
+        window.click(("inspector-attach-option", f1_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "wi1 re-attached to f1 via Inspector popover", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.features_for_work_item(wi1_id).len() == 2)
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("inspector-unallocate-btn", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "wi1 unallocated via Inspector [Unallocate]", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.features_for_work_item(wi1_id).is_empty() && s.unallocated_work_items().len() == 3
+        })
+    })
+    .await;
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+
+    // 5. Reopen workspace and confirm persistence
+    let (handle2, shell2) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("reopen Phase 4 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let app_state2 = shell2.read_with(cx, |view, _| view.app_state().clone());
+    let store2 = shell2.read_with(cx, |view, _| view.store().clone());
+    wait_for_workspace_idle(cx, &app_state2).await;
+
+    cx.update_window(handle2.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let snap = store2.read(cx).snapshot().expect("reopened snapshot");
+        assert_eq!(snap.unallocated_work_items().len(), 3);
+        assert!(snap.item(wi1_id).is_some());
+    })
+    .unwrap();
+
+    app_state2.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}

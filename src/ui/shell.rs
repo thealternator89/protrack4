@@ -19,6 +19,7 @@ use crate::state::{AppState, CenterViewTab, LaunchConfig, ProjectStore, ThemePre
 use crate::ui::inspector::InspectorView;
 use crate::ui::modals::{open_new_project_modal, open_workspace_modal};
 use crate::ui::sidebar::render_sidebar;
+use crate::ui::unallocated_view::UnallocatedView;
 use crate::ui::{
     OpenWorkspace, ToggleInspector, ToggleSidebar, assignee_pill, build_project_switcher_menu,
     domain_tag_chip, kind_badge, parse_hex_or, priority_badge, progress_pill, status_badge,
@@ -29,6 +30,7 @@ pub struct WorkspaceShell {
     app_state: Entity<AppState>,
     store: Entity<ProjectStore>,
     inspector: Entity<InspectorView>,
+    unallocated_view: Entity<UnallocatedView>,
     focus_handle: FocusHandle,
     resizable_state: Entity<ResizableState>,
     sidebar_width: Pixels,
@@ -52,6 +54,8 @@ impl WorkspaceShell {
         let app_state = cx.new(|cx| AppState::new(config.clone(), cx));
         let store = app_state.read(cx).project_store().clone();
         let inspector = cx.new(|cx| InspectorView::new(app_state.clone(), store.clone(), window, cx));
+        let unallocated_view =
+            cx.new(|cx| UnallocatedView::new(app_state.clone(), store.clone(), window, cx));
         let prefs = app_state.read(cx).preferences().clone();
 
         prefs.theme.apply(Some(window), cx);
@@ -102,6 +106,7 @@ impl WorkspaceShell {
             app_state,
             store,
             inspector,
+            unallocated_view,
             focus_handle,
             resizable_state,
             sidebar_width,
@@ -123,6 +128,10 @@ impl WorkspaceShell {
 
     pub fn inspector(&self) -> &Entity<InspectorView> {
         &self.inspector
+    }
+
+    pub fn unallocated_view(&self) -> &Entity<UnallocatedView> {
+        &self.unallocated_view
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -645,9 +654,7 @@ impl WorkspaceShell {
             CenterViewTab::Table => self
                 .render_table_body(snapshot, selected_item_id, cx)
                 .into_any_element(),
-            CenterViewTab::Unallocated => self
-                .render_unallocated_body(snapshot, selected_item_id, cx)
-                .into_any_element(),
+            CenterViewTab::Unallocated => self.unallocated_view.clone().into_any_element(),
             CenterViewTab::Trash => self.render_trash_body(cx).into_any_element(),
         };
 
@@ -1036,155 +1043,6 @@ impl WorkspaceShell {
                                     .child("—")
                                     .into_any_element(),
                             }))
-                    })),
-            )
-    }
-
-    fn render_unallocated_body(
-        &self,
-        snapshot: &ProjectSnapshot,
-        selected_item_id: Option<ItemId>,
-        cx: &App,
-    ) -> impl IntoElement {
-        let unallocated = snapshot.unallocated_work_items();
-
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .p_4()
-            .gap_3()
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Things we need to do but I haven't figured out when yet"),
-                    )
-                    .child(Tag::warning().xsmall().outline().child(format!(
-                        "{} unallocated",
-                        unallocated.len()
-                    ))),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .items_center()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().muted.opacity(0.4))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .small()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Quick-capture unallocated Work Items — Available in Phase 4"),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_1p5()
-                    .overflow_y_scrollbar()
-                    .id("center-unallocated-scroll")
-                    .children(unallocated.into_iter().map(|wi| {
-                        let wi_id = wi.id;
-                        let is_selected = selected_item_id == Some(wi_id);
-                        let assignee = wi.assignee_id.and_then(|aid| snapshot.assignee(aid));
-                        let tags = snapshot.tags_for_item(wi_id);
-
-                        h_flex()
-                            .id(("unallocated-row", wi.item_number as usize))
-                            .w_full()
-                            .px_3()
-                            .py_2()
-                            .gap_2p5()
-                            .items_center()
-                            .rounded(cx.theme().radius)
-                            .border_1()
-                            .border_color(if is_selected {
-                                cx.theme().primary.opacity(0.45)
-                            } else {
-                                cx.theme().border
-                            })
-                            .bg(if is_selected {
-                                cx.theme().accent
-                            } else {
-                                cx.theme().popover
-                            })
-                            .cursor_pointer()
-                            .when(!is_selected, |this| {
-                                this.hover(|s| s.bg(cx.theme().list_hover))
-                            })
-                            .on_click({
-                                let store = self.store.clone();
-                                move |_, _, cx| {
-                                    store.update(cx, |s, cx| {
-                                        s.select_item(Some(wi_id));
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::new(status_icon(wi.status))
-                                    .small()
-                                    .text_color(status_color(wi.status, cx)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(wi.item_key.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(wi.title.clone()),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .children(tags.into_iter().map(|tag| domain_tag_chip(tag, cx))),
-                            )
-                            .child(priority_badge(wi.priority, cx))
-                            .when_some(assignee, |this, a| {
-                                this.child(assignee_pill(a, false, cx))
-                            })
-                            .child(
-                                Button::new(("unallocated-assign-stub", wi.item_number as usize))
-                                    .outline()
-                                    .xsmall()
-                                    .label("+ Assign Features")
-                                    .disabled(true)
-                                    .tooltip("Feature attachment popover — Available in Phase 4"),
-                            )
-                            .child(
-                                Button::new(("unallocated-convert-stub", wi.item_number as usize))
-                                    .ghost()
-                                    .xsmall()
-                                    .label("→ Feature")
-                                    .disabled(true)
-                                    .tooltip("Convert to Feature — Available in Phase 8"),
-                            )
                     })),
             )
     }

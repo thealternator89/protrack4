@@ -7,7 +7,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::domain::{MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px};
@@ -191,6 +192,7 @@ pub fn render_sidebar(
             div().px_2().pt_2().pb_1().child(
                 h_flex()
                     .id("sidebar-unallocated-row")
+                    .test_support()
                     .w_full()
                     .px_2()
                     .py_1p5()
@@ -226,6 +228,7 @@ pub fn render_sidebar(
                     .child(div().flex_1().text_xs().font_medium().child("Unallocated"))
                     .child(
                         div()
+                            .id("sidebar-unallocated-badge")
                             .px_1p5()
                             .py_0p5()
                             .rounded(px(999.))

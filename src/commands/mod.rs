@@ -6,7 +6,8 @@ use rusqlite::Transaction;
 use crate::domain::{DomainError, DomainEvent, ItemId, ProjectId};
 
 pub use item_commands::{
-    CreateFeature, ReparentFeature, ReorderSiblingFeatures, UpdateItemFields,
+    AttachWorkItemToFeature, CreateFeature, CreateWorkItem, DetachWorkItemFromFeature,
+    ReparentFeature, ReorderSiblingFeatures, SetWorkItemFeatures, UpdateItemFields,
 };
 pub use meta_commands::{CreateProject, UpdateProject};
 
@@ -188,5 +189,102 @@ mod tests {
             assert!(bad_update.execute(&tx).is_err());
         }
         assert_eq!(get_item(&conn, f3_id).unwrap().title, "Second Root");
+    }
+
+    #[test]
+    fn work_item_commands_create_attach_detach_and_set_features() {
+        use crate::db::load_project_snapshot;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "WiCmdTest").unwrap();
+
+        let mut create_proj = CreateProject::new(
+            "Triage",
+            "TRI",
+            "Triage project",
+            "#6366F1",
+            ProjectStatus::Active,
+        );
+        let pid = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let eff = create_proj.execute(&tx).unwrap();
+            tx.commit().unwrap();
+            eff.created_project_id.unwrap()
+        };
+
+        let mut cf1 = CreateFeature::new(pid, None, "Auth", "", ItemStatus::Todo, Priority::High);
+        let mut cf2 = CreateFeature::new(pid, None, "CLI", "", ItemStatus::Todo, Priority::Medium);
+        let (f1, f2) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let id1 = cf1.execute(&tx).unwrap().created_item_id.unwrap();
+            let id2 = cf2.execute(&tx).unwrap().created_item_id.unwrap();
+            tx.commit().unwrap();
+            (id1, id2)
+        };
+
+        let mut create_wi = CreateWorkItem::new(
+            pid,
+            "Brain dump task",
+            "",
+            ItemStatus::Todo,
+            Priority::None,
+            Vec::new(),
+        );
+        let wi_eff = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let eff = create_wi.execute(&tx).unwrap();
+            tx.commit().unwrap();
+            eff
+        };
+        let wi_id = wi_eff.created_item_id.unwrap();
+        assert_eq!(wi_eff.selected_item_id, Some(wi_id));
+        assert!(wi_eff.toast.as_deref().unwrap().contains("TRI-3"));
+
+        let snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap.unallocated_work_items().len(), 1);
+
+        let mut attach1 = AttachWorkItemToFeature::new(wi_id, f1);
+        let mut attach2 = AttachWorkItemToFeature::new(wi_id, f2);
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            attach1.execute(&tx).unwrap();
+            attach2.execute(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        let snap2 = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap2.features_for_work_item(wi_id).len(), 2);
+        assert!(snap2.unallocated_work_items().is_empty());
+
+        let mut detach1 = DetachWorkItemFromFeature::new(wi_id, f1);
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let eff = detach1.execute(&tx).unwrap();
+            tx.commit().unwrap();
+            assert!(eff.toast.as_deref().unwrap().contains("Detached"));
+        }
+        let snap3 = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap3.features_for_work_item(wi_id).len(), 1);
+
+        let mut unallocate = SetWorkItemFeatures::new(wi_id, Vec::new());
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let eff = unallocate.execute(&tx).unwrap();
+            tx.commit().unwrap();
+            assert_eq!(eff.toast.as_deref(), Some("Moved TRI-3 to Unallocated"));
+        }
+        let snap4 = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap4.unallocated_work_items().len(), 1);
     }
 }

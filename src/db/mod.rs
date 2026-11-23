@@ -967,5 +967,283 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn work_item_multi_feature_membership_unallocated_and_sort_order() {
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, attach_work_item_to_feature, create_feature,
+            create_work_item, detach_work_item_from_feature,
+            query_feature_attachments_for_work_item, query_features_for_work_item,
+            query_unallocated_work_items, query_work_items_for_feature, set_work_item_features,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::domain::{ItemStatus, Priority, ProjectStatus};
+        use rusqlite::TransactionBehavior;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "WiTest").unwrap();
+
+        let (proj_a, _proj_b, f1, f2, f3, fb) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let pa = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Alpha".to_string(),
+                    key_prefix: "ALP".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let pb = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Beta".to_string(),
+                    key_prefix: "BET".to_string(),
+                    description: String::new(),
+                    color: "#10B981".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let f1 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pa.id,
+                    parent_feature_id: None,
+                    title: "Auth".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                },
+            )
+            .unwrap();
+            let f2 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pa.id,
+                    parent_feature_id: None,
+                    title: "Sync".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                },
+            )
+            .unwrap();
+            let f3 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pa.id,
+                    parent_feature_id: Some(f1.id),
+                    title: "OAuth".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Low,
+                },
+            )
+            .unwrap();
+            let fb = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pb.id,
+                    parent_feature_id: None,
+                    title: "Beta Feature".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (pa, pb, f1, f2, f3, fb)
+        };
+
+        // Pre-populate f1 with w_other so w1 sits at position #2 in f1 and #1 in f2
+        let (w_other, w1) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let w_other = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: proj_a.id,
+                    title: "Existing f1 task".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![f1.id],
+                },
+            )
+            .unwrap();
+            let w1 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: proj_a.id,
+                    title: "Shared OAuth refresh".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (w_other, w1)
+        };
+
+        // Newly created unallocated Work Item appears in Unallocated query (INV-03)
+        let unalloc = query_unallocated_work_items(&conn, proj_a.id).unwrap();
+        assert_eq!(unalloc.iter().map(|i| i.id).collect::<Vec<_>>(), vec![w1.id]);
+        assert!(query_features_for_work_item(&conn, w1.id).unwrap().is_empty());
+
+        // Attach w1 to 2 Features (f1, f2) -> leaves Unallocated & preserves independent sort_order per Feature
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            set_work_item_features(&tx, w1.id, &[f1.id, f2.id]).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(query_unallocated_work_items(&conn, proj_a.id).unwrap().is_empty());
+        assert_eq!(
+            query_work_items_for_feature(&conn, f1.id)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>(),
+            vec![w_other.id, w1.id]
+        );
+        assert_eq!(
+            query_work_items_for_feature(&conn, f2.id)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>(),
+            vec![w1.id]
+        );
+
+        let initial_links = query_feature_attachments_for_work_item(&conn, w1.id).unwrap();
+        let f1_sort = initial_links
+            .iter()
+            .find(|l| l.feature_id == f1.id)
+            .unwrap()
+            .sort_order
+            .clone();
+        let f2_sort = initial_links
+            .iter()
+            .find(|l| l.feature_id == f2.id)
+            .unwrap()
+            .sort_order
+            .clone();
+        assert_ne!(f1_sort, f2_sort);
+
+        // Diffing via set_work_item_features preserves sort_order on retained links
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            set_work_item_features(&tx, w1.id, &[f1.id, f2.id, f3.id]).unwrap();
+            tx.commit().unwrap();
+        }
+        let updated_links = query_feature_attachments_for_work_item(&conn, w1.id).unwrap();
+        assert_eq!(updated_links.len(), 3);
+        assert_eq!(
+            updated_links
+                .iter()
+                .find(|l| l.feature_id == f1.id)
+                .unwrap()
+                .sort_order,
+            f1_sort
+        );
+        assert_eq!(
+            updated_links
+                .iter()
+                .find(|l| l.feature_id == f2.id)
+                .unwrap()
+                .sort_order,
+            f2_sort
+        );
+
+        // Detaching all Features returns w1 automatically to Unallocated
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(detach_work_item_from_feature(&tx, w1.id, f1.id).unwrap());
+            assert!(!detach_work_item_from_feature(&tx, w1.id, f1.id).unwrap());
+            set_work_item_features(&tx, w1.id, &[]).unwrap();
+            tx.commit().unwrap();
+        }
+        let unalloc_after = query_unallocated_work_items(&conn, proj_a.id).unwrap();
+        assert_eq!(
+            unalloc_after.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![w1.id]
+        );
+
+        // Cross-project & kind guards
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                attach_work_item_to_feature(&tx, w1.id, fb.id).unwrap_err(),
+                DomainError::CrossProjectReference
+            );
+            assert_eq!(
+                create_work_item(
+                    &tx,
+                    CreateWorkItemInput {
+                        project_id: proj_a.id,
+                        title: "Cross".to_string(),
+                        description: String::new(),
+                        status: ItemStatus::Todo,
+                        priority: Priority::None,
+                        feature_ids: vec![fb.id],
+                    },
+                )
+                .unwrap_err(),
+                DomainError::CrossProjectReference
+            );
+            assert!(attach_work_item_to_feature(&tx, w1.id, w_other.id).is_err());
+            assert!(attach_work_item_to_feature(&tx, f2.id, f1.id).is_err());
+        }
+
+        // Attach to f1, then mark f1 trashed -> both w_other and w1 now have 0 active attached features -> Unallocated (INV-03)
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            attach_work_item_to_feature(&tx, w1.id, f1.id).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(query_unallocated_work_items(&conn, proj_a.id).unwrap().is_empty());
+
+        conn.execute(
+            "UPDATE items SET deleted_at = '2026-11-23T12:00:00Z', trash_root_id = id WHERE id = ?1;",
+            [uuid_to_sql(f1.id.0)],
+        )
+        .unwrap();
+        let unalloc_trashed_parent = query_unallocated_work_items(&conn, proj_a.id).unwrap();
+        assert_eq!(
+            unalloc_trashed_parent
+                .iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>(),
+            vec![w_other.id, w1.id]
+        );
+        assert!(
+            attach_work_item_to_feature(
+                &conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap(),
+                w1.id,
+                f1.id,
+            )
+            .is_err()
+        );
+    }
 }
 

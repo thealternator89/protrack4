@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::list::ListItem;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -12,16 +15,18 @@ use gpui_kit::component::{
     WindowExt as _, h_flex, notification::Notification, v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    Anchor, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::commands::{
-    ReparentFeature, ReorderSiblingFeatures, UndoableCommand, UpdateItemFields,
+    AttachWorkItemToFeature, DetachWorkItemFromFeature, ReparentFeature, ReorderSiblingFeatures,
+    SetWorkItemFeatures, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
     Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId, ProjectSnapshot,
+    clamped_depth_badge, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::open_create_feature_modal;
@@ -110,6 +115,8 @@ pub struct InspectorView {
     status_select: Entity<SelectState<Vec<StatusSelectOption>>>,
     priority_select: Entity<SelectState<Vec<PrioritySelectOption>>>,
     parent_select: Entity<SelectState<SearchableVec<ParentFeatureOption>>>,
+    attach_popover_open: bool,
+    attach_search_input: Entity<InputState>,
     description_mode: DescriptionMode,
     preview_revision: u64,
     dirty_title: bool,
@@ -153,8 +160,19 @@ impl InspectorView {
             )
             .searchable(true)
         });
+        let attach_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter Features…"));
 
         let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
+        let attach_search_sub = cx.subscribe_in(
+            &attach_search_input,
+            window,
+            |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
 
         let title_sub = cx.subscribe_in(
             &title_input,
@@ -351,6 +369,8 @@ impl InspectorView {
             status_select,
             priority_select,
             parent_select,
+            attach_popover_open: false,
+            attach_search_input,
             description_mode: DescriptionMode::Preview,
             preview_revision: 0,
             dirty_title: false,
@@ -361,6 +381,7 @@ impl InspectorView {
             debounce_task: None,
             _subscriptions: vec![
                 store_sub,
+                attach_search_sub,
                 title_sub,
                 desc_sub,
                 status_sub,
@@ -630,7 +651,10 @@ impl InspectorView {
                 self.flush_dirty_for_previous_item(prev_id, cx);
             }
 
+            self.attach_popover_open = false;
             self.syncing = true;
+            self.attach_search_input
+                .update(cx, |inp, cx| inp.set_value("", window, cx));
             if let (Some(snapshot), Some(item)) = (&snapshot_opt, current_item) {
                 self.loaded_item_id = Some(item.id);
                 self.loaded_project_id = Some(item.project_id);
@@ -749,6 +773,41 @@ impl InspectorView {
             sel.set_items(SearchableVec::new(options), window, cx);
             sel.set_selected_value(&selected_parent, window, cx);
         });
+    }
+
+    fn dispatch_feature_membership_command(
+        &mut self,
+        command: Box<dyn UndoableCommand>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving = true;
+        cx.notify();
+
+        let task = self
+            .app_state
+            .update(cx, |app, cx| app.execute_command(command, cx));
+        let view = cx.entity().downgrade();
+
+        window
+            .spawn(cx, async move |cx| {
+                let res = task.await;
+                let _ = view.update(cx, |this, cx| {
+                    this.saving = false;
+                    cx.notify();
+                });
+                let _ = cx.update(|window, cx| match res {
+                    Ok(effect) => {
+                        if let Some(msg) = effect.toast {
+                            window.push_notification(Notification::success(msg), cx);
+                        }
+                    }
+                    Err(err) => {
+                        window.push_notification(Notification::error(err.to_string()), cx);
+                    }
+                });
+            })
+            .detach();
     }
 }
 
@@ -1175,8 +1234,17 @@ impl Render for InspectorView {
                                 )
                         }
                         ItemKind::WorkItem => {
-                            let attached = snapshot.features_for_work_item(item.id);
+                            let wi_id = item.id;
+                            let attached = snapshot.features_for_work_item(wi_id);
                             let attached_len = attached.len();
+                            let attached_ids: HashSet<ItemId> =
+                                attached.iter().map(|f| f.id).collect();
+                            let attach_search_focus =
+                                self.attach_search_input.read(cx).focus_handle(cx);
+                            let inspector_entity = cx.entity();
+                            let inspector_for_change = inspector_entity.clone();
+                            let inspector_for_content = inspector_entity.clone();
+                            let inspector_for_unallocate = inspector_entity.clone();
 
                             v_flex()
                                 .gap_2()
@@ -1214,11 +1282,21 @@ impl Render for InspectorView {
                                         .gap_1()
                                         .children(attached.into_iter().map(|feat| {
                                             let feat_id = feat.id;
+                                            let feat_num = feat.item_number as usize;
+                                            let path_titles: Vec<_> = snapshot
+                                                .feature_path(feat_id)
+                                                .into_iter()
+                                                .map(|f| f.title.clone())
+                                                .collect();
+                                            let display_label = if path_titles.len() > 1 {
+                                                path_titles.join(" › ")
+                                            } else {
+                                                feat.title.clone()
+                                            };
+                                            let inspector_for_detach = inspector_entity.clone();
+
                                             h_flex()
-                                                .id((
-                                                    "inspector-feature-link",
-                                                    feat.item_number as usize,
-                                                ))
+                                                .id(("inspector-feature-link", feat_num))
                                                 .px_2()
                                                 .py_1()
                                                 .gap_1p5()
@@ -1261,11 +1339,306 @@ impl Render for InspectorView {
                                                         .text_ellipsis()
                                                         .text_xs()
                                                         .font_medium()
-                                                        .child(feat.title.clone()),
+                                                        .child(display_label),
+                                                )
+                                                .child(
+                                                    Button::new((
+                                                        "inspector-detach-feature",
+                                                        feat_num,
+                                                    ))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .compact()
+                                                    .icon(IconName::Close)
+                                                    .tooltip("Remove from this Feature")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.stop_propagation();
+                                                        inspector_for_detach.update(
+                                                            cx,
+                                                            |this, cx| {
+                                                                this.dispatch_feature_membership_command(
+                                                                    Box::new(
+                                                                        DetachWorkItemFromFeature::new(
+                                                                            wi_id, feat_id,
+                                                                        ),
+                                                                    ),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        );
+                                                    }),
                                                 )
                                         }))
                                         .into_any_element()
                                 })
+                                .child(
+                                    h_flex()
+                                        .pt_1()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .flex_wrap()
+                                        .child(
+                                            Popover::new("inspector-attach-feature-popover")
+                                                .anchor(Anchor::TopLeft)
+                                                .open(self.attach_popover_open)
+                                                .track_focus(&attach_search_focus)
+                                                .on_open_change(move |is_open, window, cx| {
+                                                    inspector_for_change.update(cx, |this, cx| {
+                                                        this.attach_popover_open = *is_open;
+                                                        if *is_open {
+                                                            this.attach_search_input.update(
+                                                                cx,
+                                                                |inp, cx| {
+                                                                    inp.set_value("", window, cx);
+                                                                    inp.focus(window, cx);
+                                                                },
+                                                            );
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .trigger(
+                                                    Button::new("inspector-attach-feature-btn")
+                                                        .outline()
+                                                        .xsmall()
+                                                        .icon(IconName::Plus)
+                                                        .label("Attach to Feature…")
+                                                        .dropdown_caret(true),
+                                                )
+                                                .content(move |_, _, cx| {
+                                                    let view_ref = inspector_for_content.read(cx);
+                                                    let search_input =
+                                                        view_ref.attach_search_input.clone();
+                                                    let query_raw = search_input.read(cx).value();
+                                                    let query = query_raw.trim().to_lowercase();
+                                                    let snap_opt =
+                                                        view_ref.store.read(cx).snapshot().cloned();
+                                                    let live_attached: HashSet<ItemId> = snap_opt
+                                                        .as_ref()
+                                                        .map(|snap| {
+                                                            snap.features_for_work_item(wi_id)
+                                                                .into_iter()
+                                                                .map(|f| f.id)
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_else(|| attached_ids.clone());
+
+                                                    let features: Vec<_> = snap_opt
+                                                        .as_ref()
+                                                        .map(|snap| {
+                                                            snap.active_features_dfs()
+                                                                .into_iter()
+                                                                .filter(|(feat, _)| {
+                                                                    query.is_empty()
+                                                                        || feat
+                                                                            .item_key
+                                                                            .to_lowercase()
+                                                                            .contains(&query)
+                                                                        || feat
+                                                                            .title
+                                                                            .to_lowercase()
+                                                                            .contains(&query)
+                                                                })
+                                                                .map(|(feat, depth)| {
+                                                                    (feat.clone(), depth)
+                                                                })
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default();
+
+                                                    v_flex()
+                                                        .w(px(300.))
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .font_semibold()
+                                                                .child("Attach / Detach Features"),
+                                                        )
+                                                        .child(
+                                                            Input::new(&search_input)
+                                                                .id("inspector-attach-feature-search")
+                                                                .small()
+                                                                .cleanable(true),
+                                                        )
+                                                        .child(if features.is_empty() {
+                                                            div()
+                                                                .px_2()
+                                                                .py_3()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(if query.is_empty() {
+                                                                    "No Features in this Project."
+                                                                } else {
+                                                                    "No matching Features."
+                                                                })
+                                                                .into_any_element()
+                                                        } else {
+                                                            v_flex()
+                                                                .max_h(px(220.))
+                                                                .gap_0p5()
+                                                                .overflow_y_scrollbar()
+                                                                .id("inspector-attach-scroll")
+                                                                .children(
+                                                                    features.into_iter().map(
+                                                                        |(feat, depth)| {
+                                                                            let fid = feat.id;
+                                                                            let is_attached =
+                                                                                live_attached
+                                                                                    .contains(&fid);
+                                                                            let indent =
+                                                                                if query.is_empty() {
+                                                                                    visual_indent_px(
+                                                                                        depth,
+                                                                                    )
+                                                                                    .min(64.0)
+                                                                                } else {
+                                                                                    0.0
+                                                                                };
+                                                                            let depth_badge =
+                                                                                clamped_depth_badge(
+                                                                                    depth,
+                                                                                );
+                                                                            let inspector_toggle =
+                                                                                inspector_for_content
+                                                                                    .clone();
+
+                                                                            ListItem::new((
+                                                                                "inspector-attach-option",
+                                                                                feat.item_number
+                                                                                    as usize,
+                                                                            ))
+                                                                            .w_full()
+                                                                            .pl(px(8.0 + indent))
+                                                                            .pr_2()
+                                                                            .py_1p5()
+                                                                            .rounded(
+                                                                                cx.theme().radius
+                                                                                    * 0.75,
+                                                                            )
+                                                                            .selected(is_attached)
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    let cmd: Box<dyn UndoableCommand> =
+                                                                                        if is_attached {
+                                                                                            Box::new(DetachWorkItemFromFeature::new(wi_id, fid))
+                                                                                        } else {
+                                                                                            Box::new(AttachWorkItemToFeature::new(wi_id, fid))
+                                                                                        };
+                                                                                    inspector_toggle.update(cx, |this, cx| {
+                                                                                        this.dispatch_feature_membership_command(cmd, window, cx);
+                                                                                    });
+                                                                                },
+                                                                            )
+                                                                            .child(
+                                                                                h_flex()
+                                                                                    .w_full()
+                                                                                    .gap_2()
+                                                                                    .items_center()
+                                                                                    .child(
+                                                                                        div()
+                                                                                            .flex()
+                                                                                            .items_center()
+                                                                                            .justify_center()
+                                                                                            .size(px(14.))
+                                                                                            .flex_shrink_0()
+                                                                                            .rounded(px(3.))
+                                                                                            .border_1()
+                                                                                            .border_color(if is_attached {
+                                                                                                cx.theme().primary
+                                                                                            } else {
+                                                                                                cx.theme().border
+                                                                                            })
+                                                                                            .bg(if is_attached {
+                                                                                                cx.theme().primary
+                                                                                            } else {
+                                                                                                cx.theme().background
+                                                                                            })
+                                                                                            .when(is_attached, |this| {
+                                                                                                this.child(
+                                                                                                    Icon::new(IconName::Check)
+                                                                                                        .xsmall()
+                                                                                                        .text_color(cx.theme().primary_foreground),
+                                                                                                )
+                                                                                            }),
+                                                                                    )
+                                                                                    .child(
+                                                                                        div()
+                                                                                            .text_xs()
+                                                                                            .font_family(
+                                                                                                cx.theme()
+                                                                                                    .mono_font_family
+                                                                                                    .clone(),
+                                                                                            )
+                                                                                            .text_color(
+                                                                                                cx.theme()
+                                                                                                    .muted_foreground,
+                                                                                            )
+                                                                                            .child(feat.item_key),
+                                                                                    )
+                                                                                    .child(
+                                                                                        div()
+                                                                                            .flex_1()
+                                                                                            .min_w_0()
+                                                                                            .overflow_hidden()
+                                                                                            .whitespace_nowrap()
+                                                                                            .text_ellipsis()
+                                                                                            .text_xs()
+                                                                                            .child(feat.title),
+                                                                                    )
+                                                                                    .when_some(
+                                                                                        depth_badge,
+                                                                                        |this, badge| {
+                                                                                            this.child(
+                                                                                                div()
+                                                                                                    .text_size(px(10.))
+                                                                                                    .text_color(cx.theme().muted_foreground)
+                                                                                                    .child(badge),
+                                                                                            )
+                                                                                        },
+                                                                                    ),
+                                                                            )
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .into_any_element()
+                                                        })
+                                                }),
+                                        )
+                                        .when(attached_len >= 1, |this| {
+                                            this.child(
+                                                Button::new("inspector-unallocate-btn")
+                                                    .outline()
+                                                    .xsmall()
+                                                    .icon(IconName::Inbox)
+                                                    .label("Unallocate")
+                                                    .tooltip(
+                                                        "Detach from all Features and move to Unallocated",
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        inspector_for_unallocate.update(
+                                                            cx,
+                                                            |this, cx| {
+                                                                this.attach_popover_open = false;
+                                                                this.dispatch_feature_membership_command(
+                                                                    Box::new(
+                                                                        SetWorkItemFeatures::new(
+                                                                            wi_id,
+                                                                            Vec::new(),
+                                                                        ),
+                                                                    ),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        );
+                                                    }),
+                                            )
+                                        }),
+                                )
                         }
                     };
 
