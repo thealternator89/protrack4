@@ -175,6 +175,7 @@ pub fn render_sidebar(
                 .ghost()
                 .xsmall()
                 .compact()
+                .accessibility_label("Project Settings")
                 .icon(IconName::Settings)
                 .disabled(active_project.is_none())
                 .tooltip("Project Settings…")
@@ -338,6 +339,7 @@ pub fn render_sidebar(
                                 .ghost()
                                 .xsmall()
                                 .compact()
+                                .accessibility_label("New Root Feature")
                                 .disabled(active_project_id.is_none())
                                 .icon(IconName::Plus)
                                 .tooltip("New Root Feature")
@@ -361,6 +363,11 @@ pub fn render_sidebar(
                                 .ghost()
                                 .xsmall()
                                 .compact()
+                                .accessibility_label(if any_expanded {
+                                    "Collapse all Features"
+                                } else {
+                                    "Expand all Features"
+                                })
                                 .disabled(snapshot.is_none())
                                 .icon(IconName::ChevronsUpDown)
                                 .tooltip(if any_expanded {
@@ -661,6 +668,7 @@ pub fn render_sidebar(
                                     .ghost()
                                     .xsmall()
                                     .compact()
+                                    .accessibility_label("New Sub-Feature")
                                     .disabled(at_max_depth)
                                     .icon(IconName::Plus)
                                     .tooltip(if at_max_depth {

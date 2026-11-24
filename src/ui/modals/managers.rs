@@ -315,14 +315,14 @@ impl ProjectModalView {
             ProjectModalMode::Create => {
                 Box::new(CreateProject::new(name, key_prefix, description, color, status))
             }
-            ProjectModalMode::Edit { original, .. } => Box::new(UpdateProject {
-                project_id: original.id,
+            ProjectModalMode::Edit { original, .. } => Box::new(UpdateProject::new(
+                original.id,
                 name,
                 key_prefix,
                 description,
                 color,
                 status,
-            }),
+            )),
         };
 
         self.busy = true;

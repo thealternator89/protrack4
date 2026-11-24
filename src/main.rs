@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use gpui_kit::component::TitleBar;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 use protrack4::state::LaunchConfig;
 use protrack4::ui::WorkspaceShell;
-use protrack4::workspace::parse_cli_db_arg;
+use protrack4::workspace::{install_signal_handlers, parse_cli_db_arg, take_shutdown_signal};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -17,7 +19,8 @@ fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("protrack4=info,warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    tracing::info!(db_override = ?db_override, "Starting ProTrack (Phase 3)");
+    tracing::info!(db_override = ?db_override, "Starting ProTrack");
+    install_signal_handlers();
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -42,10 +45,39 @@ fn main() {
             })
             .expect("failed to open ProTrack main window");
 
-            let app_state = shell.read(cx).app_state().clone();
+            let app_state_quit = shell.read(cx).app_state().clone();
+            let inspector_quit = shell.read(cx).inspector().clone();
             cx.on_app_quit(move |cx| {
-                let _ = app_state.update(cx, |app, cx| app.close_workspace_sync(cx));
+                inspector_quit.update(cx, |view, cx| view.flush_pending_edits_for_shutdown(cx));
+                let _ = app_state_quit.update(cx, |app, cx| app.close_workspace_sync(cx));
                 async {}
+            })
+            .detach();
+
+            let app_state_sig = shell.read(cx).app_state().clone();
+            let inspector_sig = shell.read(cx).inspector().clone();
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    if take_shutdown_signal() {
+                        cx.update(|cx| {
+                            inspector_sig
+                                .update(cx, |view, cx| view.flush_pending_edits_for_shutdown(cx));
+                            if let Err(err) =
+                                app_state_sig.update(cx, |app, cx| app.close_workspace_sync(cx))
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    "Failed to flush workspace cleanly on shutdown signal"
+                                );
+                            }
+                            cx.quit();
+                        });
+                        break;
+                    }
+                }
             })
             .detach();
 

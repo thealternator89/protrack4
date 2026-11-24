@@ -642,14 +642,11 @@ async fn phase3_project_feature_crud_and_inspector_persistence(cx: &mut TestAppC
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: f3_id,
-                    title: None,
-                    description: None,
-                    status: Some(ItemStatus::InProgress),
-                    priority: Some(Priority::Urgent),
-                    assignee_id: None,
-                }),
+                Box::new(
+                    UpdateItemFields::new(f3_id)
+                        .with_status(ItemStatus::InProgress)
+                        .with_priority(Priority::Urgent),
+                ),
                 cx,
             )
         })
@@ -707,14 +704,14 @@ async fn phase3_project_feature_crud_and_inspector_persistence(cx: &mut TestAppC
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateProject {
+                Box::new(UpdateProject::new(
                     project_id,
-                    name: "Alpha Platform v2".to_string(),
-                    key_prefix: "PRO".to_string(),
-                    description: "Renamed project".to_string(),
-                    color: "#8B5CF6".to_string(),
-                    status: ProjectStatus::Paused,
-                }),
+                    "Alpha Platform v2",
+                    "PRO",
+                    "Renamed project",
+                    "#8B5CF6",
+                    ProjectStatus::Paused,
+                )),
                 cx,
             )
         })
@@ -1329,14 +1326,7 @@ async fn phase5_global_assignees_and_project_scoped_tags(cx: &mut TestAppContext
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: wi_a_id,
-                    title: None,
-                    description: None,
-                    status: None,
-                    priority: None,
-                    assignee_id: Some(Some(mb_id)),
-                }),
+                Box::new(UpdateItemFields::new(wi_a_id).with_assignee_id(Some(mb_id))),
                 cx,
             )
         })
@@ -1479,14 +1469,7 @@ async fn phase5_global_assignees_and_project_scoped_tags(cx: &mut TestAppContext
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: wi_b_id,
-                    title: None,
-                    description: None,
-                    status: None,
-                    priority: None,
-                    assignee_id: Some(Some(ai_id)),
-                }),
+                Box::new(UpdateItemFields::new(wi_b_id).with_assignee_id(Some(ai_id))),
                 cx,
             )
         })
@@ -2272,14 +2255,7 @@ async fn phase7_features_only_blocking_engine_and_transitive_propagation(cx: &mu
     let start_eff = app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: wi_excl_id,
-                    title: None,
-                    description: None,
-                    status: Some(ItemStatus::InProgress),
-                    priority: None,
-                    assignee_id: None,
-                }),
+                Box::new(UpdateItemFields::new(wi_excl_id).with_status(ItemStatus::InProgress)),
                 cx,
             )
         })
@@ -2303,14 +2279,7 @@ async fn phase7_features_only_blocking_engine_and_transitive_propagation(cx: &mu
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: fb_id,
-                    title: None,
-                    description: None,
-                    status: Some(ItemStatus::Cancelled),
-                    priority: None,
-                    assignee_id: None,
-                }),
+                Box::new(UpdateItemFields::new(fb_id).with_status(ItemStatus::Cancelled)),
                 cx,
             )
         })
@@ -2338,14 +2307,7 @@ async fn phase7_features_only_blocking_engine_and_transitive_propagation(cx: &mu
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: fb_id,
-                    title: None,
-                    description: None,
-                    status: Some(ItemStatus::Done),
-                    priority: None,
-                    assignee_id: None,
-                }),
+                Box::new(UpdateItemFields::new(fb_id).with_status(ItemStatus::Done)),
                 cx,
             )
         })
@@ -2903,14 +2865,7 @@ async fn phase9_filtered_virtualized_table_view(cx: &mut TestAppContext) {
     app_state
         .update(cx, |app, cx| {
             app.execute_command(
-                Box::new(UpdateItemFields {
-                    item_id: shared_wi_id,
-                    title: None,
-                    description: None,
-                    status: None,
-                    priority: None,
-                    assignee_id: Some(Some(mb_id)),
-                }),
+                Box::new(UpdateItemFields::new(shared_wi_id).with_assignee_id(Some(mb_id))),
                 cx,
             )
         })
@@ -4138,4 +4093,282 @@ async fn phase11_dnd_quick_search_and_quick_add(cx: &mut TestAppContext) {
     assert!(!wal_path_for(&db_path).exists());
     assert!(!shm_path_for(&db_path).exists());
     assert!(!lock_path_for(&db_path).exists());
+}
+
+#[gpui_kit::test]
+async fn phase12_undo_redo_shortcuts_input_isolation_locked_modal_and_shutdown(
+    cx: &mut TestAppContext,
+) {
+    use protrack4::commands::{ConvertWorkItemToFeature, EmptyTrash, TrashItemSubtree};
+
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase12.protrack");
+    let locked_path = dir.path().join("locked_other.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    {
+        let mut manager = WorkspaceManager::new();
+        manager
+            .create_workspace(&db_path, Some("Phase 12"), true)
+            .unwrap();
+        manager.close_workspace().unwrap();
+    }
+    {
+        let mut manager = WorkspaceManager::new();
+        manager
+            .create_workspace(&locked_path, Some("Locked Other"), false)
+            .unwrap();
+        manager.close_workspace().unwrap();
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 12 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store, inspector, shell_focus) = shell.read_with(cx, |view, _| {
+        (
+            view.app_state().clone(),
+            view.store().clone(),
+            view.inspector().clone(),
+            view.focus_handle().clone(),
+        )
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Find unallocated PRO-8 and convert it to a Feature, then Undo & Redo via Cmd+Z / Cmd+Shift+Z
+    let pro_8_id = cx.update(|cx| {
+        let snap = store.read(cx).snapshot().unwrap();
+        snap.active_items()
+            .into_iter()
+            .find(|i| i.item_key == "PRO-8")
+            .unwrap()
+            .id
+    });
+
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(ConvertWorkItemToFeature::new(pro_8_id)), cx)
+        })
+        .await
+        .unwrap();
+
+    wait_until(cx, "PRO-8 converted to Feature and undo_status updated", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.item(pro_8_id))
+            .is_some_and(|i| i.kind == ItemKind::Feature)
+            && app_state.read(cx).undo_status().can_undo
+    })
+    .await;
+
+    // Dispatch Cmd+Z while shell has focus
+    cx.update_window(handle.into(), |_, window, cx| {
+        shell_focus.focus(window, cx);
+        window.render_frame(cx);
+        window.press("secondary-z", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Cmd+Z undid ConvertWorkItemToFeature", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.item(pro_8_id))
+            .is_some_and(|i| i.kind == ItemKind::WorkItem)
+            && !app_state.read(cx).undo_status().can_undo
+            && app_state.read(cx).undo_status().can_redo
+    })
+    .await;
+
+    // Dispatch Cmd+Shift+Z to Redo
+    cx.update_window(handle.into(), |_, window, cx| {
+        shell_focus.focus(window, cx);
+        window.render_frame(cx);
+        window.press("secondary-shift-z", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Cmd+Shift+Z redid ConvertWorkItemToFeature", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.item(pro_8_id))
+            .is_some_and(|i| i.kind == ItemKind::Feature)
+            && app_state.read(cx).undo_status().can_undo
+            && !app_state.read(cx).undo_status().can_redo
+    })
+    .await;
+
+    // 2. Focus Inspector title input, type text, press Cmd+Z -> MUST NOT undo DB command!
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(pro_8_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+
+        let title_input = inspector.read(cx).title_input().clone();
+        title_input.update(cx, |inp, cx| inp.focus(window, cx));
+        window.render_frame(cx);
+        window.input(" (draft)", cx);
+        window.render_frame(cx);
+        window.press("secondary-z", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        assert_eq!(
+            store.read(cx).snapshot().unwrap().item(pro_8_id).unwrap().kind,
+            ItemKind::Feature,
+            "Cmd+Z inside text input must NOT undo DB command!"
+        );
+        assert!(app_state.read(cx).undo_status().can_undo);
+    });
+
+    // Clear dirty draft before continuing
+    cx.update_window(handle.into(), |_, window, cx| {
+        shell_focus.focus(window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 3. Verify Cmd+1 / Cmd+2 / Cmd+3 view switching & Escape clears selection outside inputs/modals
+    cx.update_window(handle.into(), |_, window, cx| {
+        shell_focus.focus(window, cx);
+        window.render_frame(cx);
+
+        window.press("secondary-2", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).active_tab(), CenterViewTab::Table);
+
+        window.press("secondary-3", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).active_tab(), CenterViewTab::Unallocated);
+
+        window.press("secondary-1", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).active_tab(), CenterViewTab::Outline);
+
+        assert!(store.read(cx).selected_item_id().is_some());
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).selected_item_id(), None);
+    })
+    .unwrap();
+
+    // 4. Verify EmptyTrash clears Undo/Redo history cleanly
+    let project_id = cx.update(|cx| store.read(cx).snapshot().unwrap().project.id);
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(TrashItemSubtree::new(pro_8_id)), cx)
+        })
+        .await
+        .unwrap();
+    wait_until(cx, "pro_8 trashed", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| s.trash_count == 1)
+    })
+    .await;
+
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(EmptyTrash::new(project_id)), cx)
+        })
+        .await
+        .unwrap();
+    wait_until(cx, "trash emptied and undo stack cleared", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| s.trash_count == 0)
+            && !app_state.read(cx).undo_status().can_undo
+            && !app_state.read(cx).undo_status().can_redo
+    })
+    .await;
+
+    // 5. Light & Dark Theme visual render pass across Outline/Table/Unallocated/Trash
+    cx.update_window(handle.into(), |_, window, cx| {
+        for pref in [ThemePreference::Light, ThemePreference::Dark] {
+            app_state.update(cx, |app, cx| app.set_theme_preference(pref, cx));
+            for tab in [
+                CenterViewTab::Outline,
+                CenterViewTab::Table,
+                CenterViewTab::Unallocated,
+                CenterViewTab::Trash,
+            ] {
+                store.update(cx, |s, cx| {
+                    s.set_active_tab(tab);
+                    cx.notify();
+                });
+                window.render_frame(cx);
+            }
+        }
+    })
+    .unwrap();
+
+    // 6. Dedicated Advisory Lock Error Modal when opening an externally locked .protrack file
+    let mut external_holder = WorkspaceManager::new();
+    external_holder.open_workspace(&locked_path).unwrap();
+
+    let open_res = app_state
+        .update(cx, |app, cx| app.open_workspace(locked_path.clone(), false, cx))
+        .await;
+    assert!(open_res.is_err());
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.has_active_dialog(cx),
+            "Locked workspace modal should open automatically"
+        );
+        assert!(window.try_find("workspace-locked-modal-body").is_some());
+        window.click("workspace-locked-close", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
+
+    external_holder.close_workspace().unwrap();
+
+    // 7. Clean shutdown leaves zero -wal/-shm/.lock files and SQLite header in DELETE mode
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+    let bytes = fs::read(&db_path).unwrap();
+    assert_eq!(bytes[18], 1);
+    assert_eq!(bytes[19], 1);
 }

@@ -6,11 +6,11 @@ use std::task::{Poll, Waker};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 
-use crate::commands::{CommandEffect, UndoableCommand};
+use crate::commands::{CommandEffect, UndoManager, UndoRedoStatus, UndoableCommand};
 use crate::db::migrations::{checkpoint_and_switch_to_delete_mode, seed_sample_project};
-use crate::db::{SearchResultItem, load_project_snapshot, load_workspace_overview, map_sqlite_err};
+use crate::db::{SearchResultItem, load_project_snapshot, load_workspace_overview};
 use crate::domain::{
     DomainError, DomainEvent, ProjectId, ProjectSnapshot, WorkspaceOverview,
 };
@@ -36,6 +36,19 @@ pub enum DbRequest {
     ExecuteCommand {
         command: Box<dyn UndoableCommand>,
         reply: oneshot::Sender<Result<CommandEffect, DomainError>>,
+    },
+    ExecuteCommandWithStatus {
+        command: Box<dyn UndoableCommand>,
+        reply: oneshot::Sender<Result<(CommandEffect, UndoRedoStatus), DomainError>>,
+    },
+    Undo {
+        reply: oneshot::Sender<Result<Option<(CommandEffect, UndoRedoStatus)>, DomainError>>,
+    },
+    Redo {
+        reply: oneshot::Sender<Result<Option<(CommandEffect, UndoRedoStatus)>, DomainError>>,
+    },
+    UndoRedoStatus {
+        reply: oneshot::Sender<Result<UndoRedoStatus, DomainError>>,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), DomainError>>,
@@ -284,6 +297,60 @@ impl DbService {
             .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
     }
 
+    pub async fn execute_command_with_status(
+        &self,
+        command: Box<dyn UndoableCommand>,
+    ) -> Result<(CommandEffect, UndoRedoStatus), DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::ExecuteCommandWithStatus {
+            command,
+            reply: reply_tx,
+        })?;
+        await_oneshot(reply_rx).await
+    }
+
+    pub async fn undo(&self) -> Result<Option<(CommandEffect, UndoRedoStatus)>, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::Undo { reply: reply_tx })?;
+        await_oneshot(reply_rx).await
+    }
+
+    pub fn undo_blocking(&self) -> Result<Option<(CommandEffect, UndoRedoStatus)>, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::Undo { reply: reply_tx })?;
+        reply_rx
+            .recv()
+            .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
+    }
+
+    pub async fn redo(&self) -> Result<Option<(CommandEffect, UndoRedoStatus)>, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::Redo { reply: reply_tx })?;
+        await_oneshot(reply_rx).await
+    }
+
+    pub fn redo_blocking(&self) -> Result<Option<(CommandEffect, UndoRedoStatus)>, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::Redo { reply: reply_tx })?;
+        reply_rx
+            .recv()
+            .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
+    }
+
+    pub async fn undo_redo_status(&self) -> Result<UndoRedoStatus, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::UndoRedoStatus { reply: reply_tx })?;
+        await_oneshot(reply_rx).await
+    }
+
+    pub fn undo_redo_status_blocking(&self) -> Result<UndoRedoStatus, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::UndoRedoStatus { reply: reply_tx })?;
+        reply_rx
+            .recv()
+            .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
+    }
+
     pub fn shutdown(&self) -> Result<(), DomainError> {
         let result = if !self.inner.shutdown_started.swap(true, Ordering::SeqCst) {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -320,6 +387,7 @@ async fn await_oneshot<T>(rx: oneshot::Receiver<Result<T, DomainError>>) -> Resu
 
 fn run_actor_loop(conn: Connection, rx: Receiver<DbRequest>, bus: Arc<DomainEventBus>) {
     let mut conn_opt = Some(conn);
+    let mut undo_manager = UndoManager::new();
 
     while let Ok(req) = rx.recv() {
         let Some(conn) = conn_opt.as_mut() else {
@@ -350,26 +418,54 @@ fn run_actor_loop(conn: Connection, rx: Receiver<DbRequest>, bus: Arc<DomainEven
             DbRequest::SeedSampleProject { reply } => {
                 let res = seed_sample_project(conn);
                 if let Ok(project_id) = res {
+                    undo_manager.clear();
                     bus.emit(DomainEvent::ProjectsChanged);
                     bus.emit(DomainEvent::ItemsChanged { project_id });
                 }
                 let _ = reply.send(res);
             }
-            DbRequest::ExecuteCommand { mut command, reply } => {
-                let res = (|| -> Result<CommandEffect, DomainError> {
-                    let tx = conn
-                        .transaction_with_behavior(TransactionBehavior::Immediate)
-                        .map_err(map_sqlite_err)?;
-                    let effect = command.execute(&tx)?;
-                    tx.commit().map_err(map_sqlite_err)?;
-                    Ok(effect)
-                })();
+            DbRequest::ExecuteCommand { command, reply } => {
+                let res = undo_manager.execute(conn, command);
                 if let Ok(effect) = &res {
                     for event in &effect.events {
                         bus.emit(event.clone());
                     }
                 }
                 let _ = reply.send(res);
+            }
+            DbRequest::ExecuteCommandWithStatus { command, reply } => {
+                let res = undo_manager.execute(conn, command).map(|effect| {
+                    for event in &effect.events {
+                        bus.emit(event.clone());
+                    }
+                    (effect, undo_manager.status())
+                });
+                let _ = reply.send(res);
+            }
+            DbRequest::Undo { reply } => {
+                let res = undo_manager.undo(conn).map(|opt| {
+                    opt.map(|effect| {
+                        for event in &effect.events {
+                            bus.emit(event.clone());
+                        }
+                        (effect, undo_manager.status())
+                    })
+                });
+                let _ = reply.send(res);
+            }
+            DbRequest::Redo { reply } => {
+                let res = undo_manager.redo(conn).map(|opt| {
+                    opt.map(|effect| {
+                        for event in &effect.events {
+                            bus.emit(event.clone());
+                        }
+                        (effect, undo_manager.status())
+                    })
+                });
+                let _ = reply.send(res);
+            }
+            DbRequest::UndoRedoStatus { reply } => {
+                let _ = reply.send(Ok(undo_manager.status()));
             }
             DbRequest::Shutdown { reply } => {
                 let res = if let Some(c) = conn_opt.take() {

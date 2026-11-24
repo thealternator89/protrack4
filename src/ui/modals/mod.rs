@@ -9,4 +9,6 @@ pub use managers::{
 };
 pub use quick_add::{QuickAddDefaults, compute_quick_add_defaults, open_quick_add_modal};
 pub use quick_search::open_quick_search_modal;
-pub use workspace_modal::{WorkspaceModalState, open_workspace_modal};
+pub use workspace_modal::{
+    WorkspaceModalState, open_workspace_locked_modal, open_workspace_modal,
+};

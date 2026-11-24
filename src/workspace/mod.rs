@@ -4,7 +4,10 @@ pub mod preferences;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use manager::{WorkspaceHandle, WorkspaceManager, lock_path_for, shm_path_for, wal_path_for};
+pub use manager::{
+    WorkspaceHandle, WorkspaceManager, install_signal_handlers, lock_path_for, shm_path_for,
+    take_shutdown_signal, wal_path_for,
+};
 pub use preferences::{
     AppPreferences, RecentWorkspace, default_preferences_path, default_workspaces_dir,
 };

@@ -1,14 +1,43 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::db::{
-    DbService, inspect_and_migrate, load_workspace_meta, map_sqlite_err, seed_sample_project,
+    DbService, checkpoint_and_switch_to_delete_mode, inspect_and_migrate, load_workspace_meta,
+    map_sqlite_err, seed_sample_project,
 };
 use crate::domain::{DomainError, WorkspaceMeta};
+
+static SHUTDOWN_SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(_sig: i32) {
+    SHUTDOWN_SIGNAL_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+/// Installs async-signal-safe `SIGINT` and `SIGTERM` handlers that flag the main loop to flush
+/// SQLite WAL (`PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;`) and exit cleanly.
+pub fn install_signal_handlers() {
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        signal(SIGINT, handle_shutdown_signal);
+        signal(SIGTERM, handle_shutdown_signal);
+    }
+}
+
+/// Returns `true` once if a shutdown signal (`SIGINT` / `SIGTERM`) was received.
+pub fn take_shutdown_signal() -> bool {
+    SHUTDOWN_SIGNAL_RECEIVED.swap(false, Ordering::SeqCst)
+}
 
 pub fn lock_path_for(path: &Path) -> PathBuf {
     let mut os = OsString::from(path.as_os_str());
@@ -177,6 +206,7 @@ impl WorkspaceManager {
 
         let meta = if create_if_missing && seed_sample {
             if let Err(err) = seed_sample_project(&mut conn) {
+                let _ = checkpoint_and_switch_to_delete_mode(&conn);
                 drop(conn);
                 release_lock_without_opening(lock_file, &lock_path);
                 return Err(err);

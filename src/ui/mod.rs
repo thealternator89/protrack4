@@ -36,6 +36,12 @@ gpui_kit::actions!(
         OpenWorkspace,
         OpenQuickSearch,
         OpenQuickAdd,
+        Undo,
+        Redo,
+        SwitchToOutline,
+        SwitchToTable,
+        SwitchToUnallocated,
+        ClearSelection,
         Quit
     ]
 );
@@ -47,6 +53,36 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("secondary-o", OpenWorkspace, None),
         KeyBinding::new("secondary-k", OpenQuickSearch, None),
         KeyBinding::new("secondary-n", OpenQuickAdd, None),
+        KeyBinding::new(
+            "secondary-z",
+            Undo,
+            Some("WorkspaceShell && !Input && !Dialog"),
+        ),
+        KeyBinding::new(
+            "secondary-shift-z",
+            Redo,
+            Some("WorkspaceShell && !Input && !Dialog"),
+        ),
+        KeyBinding::new(
+            "secondary-1",
+            SwitchToOutline,
+            Some("WorkspaceShell && !Dialog"),
+        ),
+        KeyBinding::new(
+            "secondary-2",
+            SwitchToTable,
+            Some("WorkspaceShell && !Dialog"),
+        ),
+        KeyBinding::new(
+            "secondary-3",
+            SwitchToUnallocated,
+            Some("WorkspaceShell && !Dialog"),
+        ),
+        KeyBinding::new(
+            "escape",
+            ClearSelection,
+            Some("WorkspaceShell && !Input && !Dialog"),
+        ),
         KeyBinding::new("secondary-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());

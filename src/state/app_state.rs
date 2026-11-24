@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{AppContext as _, Context, Entity, Task};
 
-use crate::commands::{CommandEffect, UndoableCommand};
+use crate::commands::{CommandEffect, UndoRedoStatus, UndoableCommand};
 use crate::db::{DbService, DomainEventReceiver, SearchResultItem};
 use crate::domain::{DomainError, DomainEvent, ItemId, ItemKind, ProjectId};
 use crate::state::{CenterViewTab, ProjectStore, ThemePreference};
@@ -26,7 +26,9 @@ pub struct AppState {
     is_loading: bool,
     needs_welcome_modal: bool,
     last_error: Option<String>,
+    pending_locked_workspace_path: Option<PathBuf>,
     desired_project_id: Option<ProjectId>,
+    undo_status: UndoRedoStatus,
     project_store: Entity<ProjectStore>,
     event_listener_task: Option<Task<()>>,
     pending_workspace_task: Option<Task<()>>,
@@ -56,7 +58,9 @@ impl AppState {
             is_loading: false,
             needs_welcome_modal: false,
             last_error: None,
+            pending_locked_workspace_path: None,
             desired_project_id: None,
+            undo_status: UndoRedoStatus::default(),
             project_store,
             event_listener_task: None,
             pending_workspace_task: None,
@@ -86,6 +90,14 @@ impl AppState {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    pub fn undo_status(&self) -> &UndoRedoStatus {
+        &self.undo_status
+    }
+
+    pub fn take_pending_locked_workspace(&mut self) -> Option<PathBuf> {
+        self.pending_locked_workspace_path.take()
     }
 
     pub fn clear_error(&mut self, cx: &mut Context<Self>) {
@@ -171,6 +183,7 @@ impl AppState {
             let project_id = db.seed_sample_project().await?;
             let overview = db.load_workspace_overview(Some(project_id)).await?;
             this.update(cx, |app, cx| {
+                app.undo_status = UndoRedoStatus::default();
                 app.desired_project_id = Some(project_id);
                 app.preferences
                     .set_active_project_for(&active_path, project_id);
@@ -306,9 +319,12 @@ impl AppState {
         let active_path = handle.path.clone();
 
         cx.spawn(async move |this, cx| {
-            let effect = db.execute_command(command).await?;
+            let (effect, undo_status) = db.execute_command_with_status(command).await?;
             let target_project_id = this
                 .update(cx, |app, cx| {
+                    if app.active_workspace_path() == Some(active_path.as_path()) {
+                        app.undo_status = undo_status;
+                    }
                     if let Some(created_pid) = effect.created_project_id
                         && app.active_workspace_path() == Some(active_path.as_path())
                     {
@@ -368,6 +384,99 @@ impl AppState {
             .map_err(|_| DomainError::Storage("AppState dropped before UI refresh".into()))?;
 
             Ok(effect)
+        })
+    }
+
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> Task<Result<Option<CommandEffect>, DomainError>> {
+        self.apply_undo_or_redo(true, cx)
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) -> Task<Result<Option<CommandEffect>, DomainError>> {
+        self.apply_undo_or_redo(false, cx)
+    }
+
+    fn apply_undo_or_redo(
+        &mut self,
+        is_undo: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<CommandEffect>, DomainError>> {
+        let Some(handle) = self.workspace_manager.active() else {
+            return Task::ready(Err(DomainError::Validation(
+                "No workspace is currently open".to_string(),
+            )));
+        };
+        let db = handle.db.clone();
+        let active_path = handle.path.clone();
+
+        cx.spawn(async move |this, cx| {
+            let outcome = if is_undo {
+                db.undo().await?
+            } else {
+                db.redo().await?
+            };
+            let Some((effect, status)) = outcome else {
+                let fresh_status = db.undo_redo_status().await.unwrap_or_default();
+                let _ = this.update(cx, |app, cx| {
+                    if app.active_workspace_path() == Some(active_path.as_path()) {
+                        app.undo_status = fresh_status;
+                        cx.notify();
+                    }
+                });
+                return Ok(None);
+            };
+
+            let target_project_id = this
+                .update(cx, |app, cx| {
+                    if app.active_workspace_path() == Some(active_path.as_path()) {
+                        app.undo_status = status;
+                        if let Some(pid) = effect.created_project_id {
+                            app.desired_project_id = Some(pid);
+                            app.preferences.set_active_project_for(&active_path, pid);
+                            app.persist_preferences_if_allowed();
+                        }
+                    }
+
+                    effect
+                        .created_project_id
+                        .or(app.desired_project_id)
+                        .or_else(|| app.project_store.read(cx).snapshot().map(|s| s.project.id))
+                })
+                .map_err(|_| {
+                    DomainError::Storage("AppState dropped before undo/redo refresh".into())
+                })?;
+
+            let overview = db.load_workspace_overview(target_project_id).await?;
+            this.update(cx, |app, cx| {
+                if app.active_workspace_path() != Some(active_path.as_path()) {
+                    return;
+                }
+                if let Some(snap) = &overview.active_snapshot {
+                    app.desired_project_id = Some(snap.project.id);
+                    app.preferences
+                        .set_active_project_for(&active_path, snap.project.id);
+                } else {
+                    app.desired_project_id = None;
+                }
+
+                app.project_store.update(cx, |store, cx| {
+                    store.apply_workspace_overview(active_path, overview);
+                    if let Some(item_id) = effect.selected_item_id {
+                        let is_active = store
+                            .snapshot()
+                            .and_then(|s| s.item(item_id))
+                            .is_some_and(crate::domain::Item::is_active);
+                        if is_active {
+                            store.expand_ancestors_of(item_id);
+                            store.select_item(Some(item_id));
+                        }
+                    }
+                    cx.notify();
+                });
+                cx.notify();
+            })
+            .map_err(|_| DomainError::Storage("AppState dropped before UI refresh".into()))?;
+
+            Ok(Some(effect))
         })
     }
 
@@ -461,7 +570,12 @@ impl AppState {
                         if app.request_generation == req_gen {
                             app.is_loading = false;
                             app.last_error = Some(err.to_string());
-                            app.needs_welcome_modal = !app.has_open_workspace();
+                            if let DomainError::WorkspaceLocked { path: locked_path } = &err {
+                                app.pending_locked_workspace_path = Some(PathBuf::from(locked_path));
+                                app.needs_welcome_modal = false;
+                            } else {
+                                app.needs_welcome_modal = !app.has_open_workspace();
+                            }
                             cx.notify();
                         }
                     });
@@ -535,6 +649,8 @@ impl AppState {
                     });
 
                     app.spawn_event_listener(db_service, events_rx, cx);
+                    app.undo_status = UndoRedoStatus::default();
+                    app.pending_locked_workspace_path = None;
                     app.is_loading = false;
                     app.needs_welcome_modal = false;
                     app.last_error = None;
@@ -682,6 +798,8 @@ impl AppState {
     pub fn close_workspace_sync(&mut self, cx: &mut Context<Self>) -> Result<(), DomainError> {
         self.persist_preferences_if_allowed();
         self.desired_project_id = None;
+        self.undo_status = UndoRedoStatus::default();
+        self.pending_locked_workspace_path = None;
         self.event_listener_task.take();
         self.pending_workspace_task.take();
         let res = self.workspace_manager.close_workspace();

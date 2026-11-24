@@ -603,6 +603,7 @@ impl Render for QuickAddModalView {
                                             .ghost()
                                             .xsmall()
                                             .compact()
+                                            .accessibility_label("Remove feature attachment")
                                             .icon(IconName::Close)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.selected_feature_ids.remove(&fid);

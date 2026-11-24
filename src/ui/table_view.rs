@@ -616,14 +616,7 @@ impl TableDelegate for ItemTableDelegate {
                         .on_click(move |_, window, cx| {
                             Self::dispatch_command(
                                 app_click.clone(),
-                                Box::new(UpdateItemFields {
-                                    item_id,
-                                    title: None,
-                                    description: None,
-                                    status: Some(status),
-                                    priority: None,
-                                    assignee_id: None,
-                                }),
+                                Box::new(UpdateItemFields::new(item_id).with_status(status)),
                                 window,
                                 cx,
                             );
@@ -659,14 +652,7 @@ impl TableDelegate for ItemTableDelegate {
                     .on_click(move |_, window, cx| {
                         Self::dispatch_command(
                             app_click.clone(),
-                            Box::new(UpdateItemFields {
-                                item_id,
-                                title: None,
-                                description: None,
-                                status: None,
-                                priority: Some(priority),
-                                assignee_id: None,
-                            }),
+                            Box::new(UpdateItemFields::new(item_id).with_priority(priority)),
                             window,
                             cx,
                         );
@@ -693,14 +679,7 @@ impl TableDelegate for ItemTableDelegate {
                     .on_click(move |_, window, cx| {
                         Self::dispatch_command(
                             app_unassign.clone(),
-                            Box::new(UpdateItemFields {
-                                item_id,
-                                title: None,
-                                description: None,
-                                status: None,
-                                priority: None,
-                                assignee_id: Some(None),
-                            }),
+                            Box::new(UpdateItemFields::new(item_id).with_assignee_id(None)),
                             window,
                             cx,
                         );
@@ -747,14 +726,7 @@ impl TableDelegate for ItemTableDelegate {
                     .on_click(move |_, window, cx| {
                         Self::dispatch_command(
                             app_pick.clone(),
-                            Box::new(UpdateItemFields {
-                                item_id,
-                                title: None,
-                                description: None,
-                                status: None,
-                                priority: None,
-                                assignee_id: Some(Some(aid)),
-                            }),
+                            Box::new(UpdateItemFields::new(item_id).with_assignee_id(Some(aid))),
                             window,
                             cx,
                         );

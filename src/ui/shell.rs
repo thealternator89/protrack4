@@ -5,7 +5,7 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, Theme, TitleBar, WindowExt as _, h_flex, v_flex,
+    StyledExt as _, Theme, TitleBar, WindowExt as _, h_flex, notification::Notification, v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
@@ -16,7 +16,8 @@ use gpui_kit::{
 use crate::state::{AppState, CenterViewTab, LaunchConfig, ProjectStore, ThemePreference};
 use crate::ui::inspector::InspectorView;
 use crate::ui::modals::{
-    open_new_project_modal, open_quick_add_modal, open_quick_search_modal, open_workspace_modal,
+    open_new_project_modal, open_quick_add_modal, open_quick_search_modal,
+    open_workspace_locked_modal, open_workspace_modal,
 };
 use crate::ui::outline_view::OutlineView;
 use crate::ui::sidebar::render_sidebar;
@@ -24,7 +25,8 @@ use crate::ui::table_view::TableView;
 use crate::ui::trash_view::TrashView;
 use crate::ui::unallocated_view::UnallocatedView;
 use crate::ui::{
-    OpenQuickAdd, OpenQuickSearch, OpenWorkspace, ToggleInspector, ToggleSidebar,
+    ClearSelection, OpenQuickAdd, OpenQuickSearch, OpenWorkspace, Redo, SwitchToOutline,
+    SwitchToTable, SwitchToUnallocated, ToggleInspector, ToggleSidebar, Undo,
     build_project_switcher_menu, parse_hex_or,
 };
 
@@ -217,6 +219,109 @@ impl WorkspaceShell {
         open_quick_add_modal(self.app_state.clone(), self.store.clone(), window, cx);
     }
 
+    fn undo_action(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) || !self.app_state.read(cx).has_open_workspace() {
+            return;
+        }
+        self.trigger_undo_or_redo(true, window, cx);
+    }
+
+    fn redo_action(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) || !self.app_state.read(cx).has_open_workspace() {
+            return;
+        }
+        self.trigger_undo_or_redo(false, window, cx);
+    }
+
+    fn switch_to_outline_action(
+        &mut self,
+        _: &SwitchToOutline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Outline);
+            cx.notify();
+        });
+    }
+
+    fn switch_to_table_action(
+        &mut self,
+        _: &SwitchToTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Table);
+            cx.notify();
+        });
+    }
+
+    fn switch_to_unallocated_action(
+        &mut self,
+        _: &SwitchToUnallocated,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Unallocated);
+            cx.notify();
+        });
+    }
+
+    fn clear_selection_action(
+        &mut self,
+        _: &ClearSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.store.update(cx, |s, cx| {
+            s.select_item(None);
+            cx.notify();
+        });
+    }
+
+    fn trigger_undo_or_redo(&mut self, is_undo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self.app_state.update(cx, |app, cx| {
+            if is_undo {
+                app.undo(cx)
+            } else {
+                app.redo(cx)
+            }
+        });
+        window
+            .spawn(cx, async move |cx| {
+                let res = task.await;
+                let _ = cx.update(|window, cx| match res {
+                    Ok(Some(effect)) => {
+                        if let Some(warn) = effect.warning_toast {
+                            window.push_notification(Notification::warning(warn), cx);
+                        }
+                        if let Some(msg) = effect.toast {
+                            window.push_notification(Notification::info(msg), cx);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        window.push_notification(Notification::error(err.to_string()), cx);
+                    }
+                });
+            })
+            .detach();
+    }
+
     fn toggle_sidebar_inner(&mut self, cx: &mut Context<Self>) {
         let next = !self.store.read(cx).sidebar_open();
         self.app_state.update(cx, |app, cx| {
@@ -249,6 +354,8 @@ impl WorkspaceShell {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.store.read(cx);
+        let app = self.app_state.read(cx);
+        let undo_status = app.undo_status().clone();
         let snapshot = state.snapshot();
         let has_workspace = state.has_workspace();
         let active_tab = state.active_tab();
@@ -256,6 +363,15 @@ impl WorkspaceShell {
         let inspector_open = state.inspector_open();
         let theme_pref = state.theme_preference();
         let unallocated_count = snapshot.map_or(0, |s| s.unallocated_work_items().len());
+
+        let undo_tooltip = match &undo_status.undo_label {
+            Some(label) => format!("Undo: {label}"),
+            None => "Nothing to undo".to_string(),
+        };
+        let redo_tooltip = match &undo_status.redo_label {
+            Some(label) => format!("Redo: {label}"),
+            None => "Nothing to redo".to_string(),
+        };
 
         let amber = cx.theme().warning;
         let amber_bg = amber.opacity(if cx.theme().is_dark() { 0.22 } else { 0.14 });
@@ -360,6 +476,7 @@ impl WorkspaceShell {
                             .ghost()
                             .small()
                             .selected(sidebar_open)
+                            .accessibility_label("Toggle Left Sidebar")
                             .icon(if sidebar_open {
                                 IconName::PanelLeftClose
                             } else {
@@ -374,6 +491,7 @@ impl WorkspaceShell {
                         Button::new("toolbar-workspace-switcher")
                             .ghost()
                             .small()
+                            .accessibility_label("Switch or create workspace")
                             .icon(IconName::HardDrive)
                             .label(state.workspace_name())
                             .dropdown_caret(true)
@@ -394,6 +512,7 @@ impl WorkspaceShell {
                         Button::new("toolbar-project-switcher")
                             .outline()
                             .small()
+                            .accessibility_label("Switch active project")
                             .dropdown_caret(true)
                             .disabled(!has_workspace)
                             .tooltip(if has_workspace {
@@ -416,15 +535,42 @@ impl WorkspaceShell {
             )
             // Center group: View tabs
             .child(tab_bar)
-            // Right group: Search (Cmd+K), Quick Add (Cmd+N), Theme toggle, Inspector toggle
+            // Right group: Undo, Redo, Search (Cmd+K), Quick Add (Cmd+N), Theme toggle, Inspector toggle
             .child(
                 h_flex()
                     .gap_1p5()
                     .items_center()
                     .child(
+                        Button::new("toolbar-undo-btn")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(IconName::Undo2)
+                            .accessibility_label(undo_tooltip.clone())
+                            .disabled(!has_workspace || !undo_status.can_undo)
+                            .tooltip_with_action(undo_tooltip, &Undo, None)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.trigger_undo_or_redo(true, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("toolbar-redo-btn")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(IconName::Redo2)
+                            .accessibility_label(redo_tooltip.clone())
+                            .disabled(!has_workspace || !undo_status.can_redo)
+                            .tooltip_with_action(redo_tooltip, &Redo, None)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.trigger_undo_or_redo(false, window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("toolbar-search-btn")
                             .outline()
                             .small()
+                            .accessibility_label("Quick Search and Commands")
                             .icon(IconName::Search)
                             .label("Search ⌘K")
                             .disabled(!has_workspace)
@@ -442,6 +588,7 @@ impl WorkspaceShell {
                         Button::new("toolbar-new-btn")
                             .primary()
                             .small()
+                            .accessibility_label("Quick Add Work Item or Feature")
                             .icon(IconName::Plus)
                             .label("New")
                             .disabled(snapshot.is_none())
@@ -459,6 +606,7 @@ impl WorkspaceShell {
                         Button::new("toolbar-theme-toggle")
                             .ghost()
                             .small()
+                            .accessibility_label("Cycle appearance theme")
                             .icon(theme_icon)
                             .label(theme_pref.label())
                             .tooltip("Cycle theme: System / Light / Dark")
@@ -471,6 +619,7 @@ impl WorkspaceShell {
                             .ghost()
                             .small()
                             .selected(inspector_open)
+                            .accessibility_label("Toggle Right Inspector")
                             .icon(if inspector_open {
                                 IconName::PanelRightClose
                             } else {
@@ -694,10 +843,25 @@ impl Render for WorkspaceShell {
             theme_pref.apply(Some(window), cx);
         }
 
-        let (needs_modal, is_loading) = {
+        let (needs_modal, is_loading, pending_locked) = {
             let app = self.app_state.read(cx);
-            (app.needs_welcome_modal(), app.is_loading())
+            (
+                app.needs_welcome_modal(),
+                app.is_loading(),
+                app.last_error().is_some(),
+            )
         };
+        if pending_locked && !is_loading && !window.has_active_dialog(cx) {
+            let locked_opt = self
+                .app_state
+                .update(cx, |app, _| app.take_pending_locked_workspace());
+            if let Some(locked_path) = locked_opt {
+                let app_state = self.app_state.clone();
+                window.defer(cx, move |window, cx| {
+                    open_workspace_locked_modal(app_state, locked_path, window, cx);
+                });
+            }
+        }
         if needs_modal && !is_loading && !window.has_active_dialog(cx) {
             self.app_state.update(cx, |app, _| app.clear_welcome_flag());
             let app_state = self.app_state.clone();
@@ -770,6 +934,7 @@ impl Render for WorkspaceShell {
 
         v_flex()
             .id("workspace-shell")
+            .key_context("WorkspaceShell")
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -779,6 +944,12 @@ impl Render for WorkspaceShell {
             .on_action(cx.listener(Self::open_workspace_action))
             .on_action(cx.listener(Self::open_quick_search_action))
             .on_action(cx.listener(Self::open_quick_add_action))
+            .on_action(cx.listener(Self::undo_action))
+            .on_action(cx.listener(Self::redo_action))
+            .on_action(cx.listener(Self::switch_to_outline_action))
+            .on_action(cx.listener(Self::switch_to_table_action))
+            .on_action(cx.listener(Self::switch_to_unallocated_action))
+            .on_action(cx.listener(Self::clear_selection_action))
             .child(
                 TitleBar::new().child(
                     h_flex()

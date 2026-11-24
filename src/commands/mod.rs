@@ -2,7 +2,9 @@ pub mod blocker_commands;
 pub mod conversion_commands;
 pub mod item_commands;
 pub mod meta_commands;
+pub(crate) mod snapshot_helpers;
 pub mod trash_commands;
+pub mod undo_manager;
 
 use rusqlite::Transaction;
 
@@ -20,6 +22,7 @@ pub use meta_commands::{
     ArchiveAssignee, CreateProject, DeleteTag, UpdateProject, UpsertAssignee, UpsertTag,
 };
 pub use trash_commands::{EmptyTrash, PurgeTrashGroup, RestoreTrashGroup, TrashItemSubtree};
+pub use undo_manager::{MAX_UNDO_DEPTH, UndoManager, UndoRedoStatus};
 
 /// Result emitted by executing or undoing a command inside a SQLite transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -42,8 +45,14 @@ pub trait UndoableCommand: Send + Sync {
     /// Apply the forward mutation inside an active SQLite transaction.
     fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError>;
 
-    /// Revert the mutation inside an active SQLite transaction (enabled in Phase 12).
+    /// Revert the mutation inside an active SQLite transaction.
     fn undo(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError>;
+
+    /// Returns `true` for destructive commands (`PurgeTrashGroup`, `EmptyTrash`)
+    /// that permanently delete rows and must reset the session Undo/Redo stacks.
+    fn clears_undo_history(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -131,14 +140,11 @@ mod tests {
         };
 
         // Update fields on f2
-        let mut update_fields = UpdateItemFields {
-            item_id: f2_id,
-            title: Some("Child Feature Updated".to_string()),
-            description: Some("## Details".to_string()),
-            status: Some(ItemStatus::InProgress),
-            priority: Some(Priority::Urgent),
-            assignee_id: None,
-        };
+        let mut update_fields = UpdateItemFields::new(f2_id)
+            .with_title("Child Feature Updated")
+            .with_description("## Details")
+            .with_status(ItemStatus::InProgress)
+            .with_priority(Priority::Urgent);
         {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -168,14 +174,14 @@ mod tests {
         assert_eq!(keys, vec!["CORE-2", "CORE-1", "CORE-3"]);
 
         // Rename key prefix via UpdateProject
-        let mut update_proj = UpdateProject {
-            project_id: pid,
-            name: "Core App v2".to_string(),
-            key_prefix: "APP".to_string(),
-            description: "Renamed".to_string(),
-            color: "#10B981".to_string(),
-            status: ProjectStatus::Active,
-        };
+        let mut update_proj = UpdateProject::new(
+            pid,
+            "Core App v2",
+            "APP",
+            "Renamed",
+            "#10B981",
+            ProjectStatus::Active,
+        );
         {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -189,14 +195,7 @@ mod tests {
         assert_eq!(keys_after, vec!["APP-2", "APP-1", "APP-3"]);
 
         // Invalid command fails and leaves DB untouched on drop/rollback
-        let mut bad_update = UpdateItemFields {
-            item_id: f3_id,
-            title: Some("   ".to_string()),
-            description: None,
-            status: None,
-            priority: None,
-            assignee_id: None,
-        };
+        let mut bad_update = UpdateItemFields::new(f3_id).with_title("   ");
         {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -360,22 +359,8 @@ mod tests {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
-            let mut ua = UpdateItemFields {
-                item_id: wi_a,
-                title: None,
-                description: None,
-                status: None,
-                priority: None,
-                assignee_id: Some(Some(mb_id)),
-            };
-            let mut ub = UpdateItemFields {
-                item_id: wi_b,
-                title: None,
-                description: None,
-                status: None,
-                priority: None,
-                assignee_id: Some(Some(mb_id)),
-            };
+            let mut ua = UpdateItemFields::new(wi_a).with_assignee_id(Some(mb_id));
+            let mut ub = UpdateItemFields::new(wi_b).with_assignee_id(Some(mb_id));
             ua.execute(&tx).unwrap();
             ub.execute(&tx).unwrap();
             tx.commit().unwrap();
@@ -510,14 +495,7 @@ mod tests {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
-            let mut start_wi = UpdateItemFields {
-                item_id: wi_a,
-                title: None,
-                description: None,
-                status: Some(ItemStatus::InProgress),
-                priority: None,
-                assignee_id: None,
-            };
+            let mut start_wi = UpdateItemFields::new(wi_a).with_status(ItemStatus::InProgress);
             let eff = start_wi.execute(&tx).unwrap();
             assert_eq!(
                 eff.warning_toast.as_deref(),
@@ -532,14 +510,7 @@ mod tests {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
-            let mut start_b = UpdateItemFields {
-                item_id: f_b,
-                title: None,
-                description: None,
-                status: Some(ItemStatus::InProgress),
-                priority: None,
-                assignee_id: None,
-            };
+            let mut start_b = UpdateItemFields::new(f_b).with_status(ItemStatus::InProgress);
             let eff = start_b.execute(&tx).unwrap();
             assert_eq!(eff.warning_toast, None);
             tx.commit().unwrap();

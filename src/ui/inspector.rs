@@ -339,14 +339,7 @@ impl InspectorView {
                     let previous_status = this.loaded_status;
                     this.loaded_status = *new_status;
                     let status_select = this.status_select.clone();
-                    let command = Box::new(UpdateItemFields {
-                        item_id,
-                        title: None,
-                        description: None,
-                        status: Some(*new_status),
-                        priority: None,
-                        assignee_id: None,
-                    });
+                    let command = Box::new(UpdateItemFields::new(item_id).with_status(*new_status));
                     this.saving = true;
                     cx.notify();
 
@@ -405,14 +398,7 @@ impl InspectorView {
                     }
                     this.loaded_priority = *new_priority;
                     this.dispatch_item_command(
-                        Box::new(UpdateItemFields {
-                            item_id,
-                            title: None,
-                            description: None,
-                            status: None,
-                            priority: Some(*new_priority),
-                            assignee_id: None,
-                        }),
+                        Box::new(UpdateItemFields::new(item_id).with_priority(*new_priority)),
                         None,
                         cx,
                     );
@@ -437,14 +423,8 @@ impl InspectorView {
                     let previous = this.loaded_assignee_id;
                     this.loaded_assignee_id = *new_assignee;
                     let assignee_select = this.assignee_select.clone();
-                    let command = Box::new(UpdateItemFields {
-                        item_id,
-                        title: None,
-                        description: None,
-                        status: None,
-                        priority: None,
-                        assignee_id: Some(*new_assignee),
-                    });
+                    let command =
+                        Box::new(UpdateItemFields::new(item_id).with_assignee_id(*new_assignee));
                     this.saving = true;
                     cx.notify();
 
@@ -643,14 +623,10 @@ impl InspectorView {
             return;
         }
 
-        let command = Box::new(UpdateItemFields {
-            item_id,
-            title: title.clone(),
-            description: description.clone(),
-            status: None,
-            priority: None,
-            assignee_id: None,
-        });
+        let mut cmd = UpdateItemFields::new(item_id);
+        cmd.title = title.clone();
+        cmd.description = description.clone();
+        let command = Box::new(cmd);
         if self
             .app_state
             .read(cx)
@@ -725,15 +701,11 @@ impl InspectorView {
             self.dirty_description = false;
         }
 
+        let mut cmd = UpdateItemFields::new(item_id);
+        cmd.title = title;
+        cmd.description = description;
         self.dispatch_item_command(
-            Box::new(UpdateItemFields {
-                item_id,
-                title,
-                description,
-                status: None,
-                priority: None,
-                assignee_id: None,
-            }),
+            Box::new(cmd),
             Some((item_id, sent_title, sent_desc)),
             cx,
         );
@@ -772,14 +744,10 @@ impl InspectorView {
             return;
         }
 
-        let command = Box::new(UpdateItemFields {
-            item_id: prev_id,
-            title,
-            description,
-            status: None,
-            priority: None,
-            assignee_id: None,
-        });
+        let mut cmd = UpdateItemFields::new(prev_id);
+        cmd.title = title;
+        cmd.description = description;
+        let command = Box::new(cmd);
         let task = self
             .app_state
             .update(cx, |app, cx| app.execute_command(command, cx));
@@ -1256,6 +1224,10 @@ impl InspectorView {
                                             .ghost()
                                             .xsmall()
                                             .compact()
+                                            .accessibility_label(format!(
+                                                "Remove blocker {}",
+                                                b.blocker_key
+                                            ))
                                             .icon(IconName::Close)
                                             .tooltip("Remove blocker")
                                             .on_click(move |_, window, cx| {
@@ -2127,6 +2099,7 @@ impl Render for InspectorView {
                                                         .ghost()
                                                         .xsmall()
                                                         .compact()
+                                                        .accessibility_label("Move Feature up")
                                                         .icon(IconName::ArrowUp)
                                                         .disabled(!can_move_up)
                                                         .tooltip("Move Feature before previous sibling")
@@ -2150,6 +2123,7 @@ impl Render for InspectorView {
                                                         .ghost()
                                                         .xsmall()
                                                         .compact()
+                                                        .accessibility_label("Move Feature down")
                                                         .icon(IconName::ArrowDown)
                                                         .disabled(!can_move_down)
                                                         .tooltip("Move Feature after next sibling")
@@ -2287,6 +2261,10 @@ impl Render for InspectorView {
                                                     .ghost()
                                                     .xsmall()
                                                     .compact()
+                                                    .accessibility_label(format!(
+                                                        "Remove from {}",
+                                                        feat.item_key
+                                                    ))
                                                     .icon(IconName::Close)
                                                     .tooltip("Remove from this Feature")
                                                     .on_click(move |_, window, cx| {
@@ -2677,7 +2655,12 @@ impl Render for InspectorView {
                                 .child(
                                     v_flex()
                                         .gap_1()
-                                        .child(Input::new(&self.title_input).small())
+                                        .child(
+                                            Input::new(&self.title_input)
+                                                .id("inspector-title-input")
+                                                .aria_label("Item title")
+                                                .small(),
+                                        )
                                         .when_some(self.title_error.clone(), |this, err| {
                                             this.child(
                                                 div()
@@ -2834,6 +2817,7 @@ impl Render for InspectorView {
                                                                 .ghost()
                                                                 .xsmall()
                                                                 .compact()
+                                                                .accessibility_label("Remove tag")
                                                                 .icon(IconName::Close)
                                                                 .tooltip("Remove tag")
                                                                 .on_click(move |_, window, cx| {
@@ -3158,6 +3142,7 @@ impl Render for InspectorView {
                                 )
                                 .child(match self.description_mode {
                                     DescriptionMode::Edit => Textarea::new(&self.description_input)
+                                        .aria_label("Item Markdown description")
                                         .small()
                                         .h(px(210.))
                                         .into_any_element(),
