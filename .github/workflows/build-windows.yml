@@ -1,0 +1,121 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v[0-9]*.*.*'
+      - '[0-9]*.*.*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable Git longpaths
+        run: git config --system core.longpaths true
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup NSIS
+        uses: nsis-dev/setup-nsis@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Resolve build version
+        id: version
+        shell: pwsh
+        run: |
+          $cargoTomlMatch = Get-Content Cargo.toml | Select-String '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $cargoTomlMatch.Matches[0].Groups[1].Value
+          $isVersionTag = 'false'
+          $isPrerelease = 'false'
+
+          $semverPattern = '^v?(([0-9]+)\.([0-9]+)\.([0-9]+)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$'
+
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cmatch $semverPattern) {
+            $version = $Matches[1]
+            $isVersionTag = 'true'
+            if (-not [string]::IsNullOrEmpty($Matches[5])) {
+              $isPrerelease = 'true'
+            }
+          }
+
+          $viVersion = '0.1.0.0'
+          if ($version -cmatch $semverPattern) {
+            $viMajor = [Math]::Min([uint64]$Matches[2], [uint64]65535)
+            $viMinor = [Math]::Min([uint64]$Matches[3], [uint64]65535)
+            $viPatch = [Math]::Min([uint64]$Matches[4], [uint64]65535)
+            $viVersion = "$viMajor.$viMinor.$viPatch.0"
+          }
+
+          Write-Host "Resolved version=$version vi_version=$viVersion is_version_tag=$isVersionTag is_prerelease=$isPrerelease"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "vi_version=$viVersion"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "is_version_tag=$isVersionTag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "is_prerelease=$isPrerelease"
+
+      - name: Build release executable
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VI_VERSION: ${{ steps.version.outputs.vi_version }}
+        run: |
+          $exePath = (Resolve-Path "target\x86_64-pc-windows-msvc\release\protrack4.exe").Path
+          $outPath = Join-Path (Get-Location) "target\x86_64-pc-windows-msvc\release\ProTrack4-Setup.exe"
+          $iconPath = (Resolve-Path "assets\icon.ico").Path
+          makensis /NOCD "/DVERSION=$env:APP_VERSION" "/DVI_VERSION=$env:APP_VI_VERSION" "/DEXE_PATH=$exePath" "/DICON_PATH=$iconPath" "/DOUTPUT_FILE=$outPath" packaging\windows\installer.nsi
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: protrack4-windows-x86_64
+          path: |
+            target/x86_64-pc-windows-msvc/release/protrack4.exe
+            target/x86_64-pc-windows-msvc/release/ProTrack4-Setup.exe
+          if-no-files-found: error
+
+      - name: Publish Release Asset
+        if: steps.version.outputs.is_version_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
+          files: |
+            target/x86_64-pc-windows-msvc/release/protrack4.exe
+            target/x86_64-pc-windows-msvc/release/ProTrack4-Setup.exe

@@ -292,7 +292,7 @@ pub fn open_workspace_modal(app_state: Entity<AppState>, window: &mut Window, cx
         let title = if has_workspace {
             "Switch Workspace"
         } else {
-            "Welcome to ProTrack"
+            "Welcome to ProTrack4"
         };
 
         let app_state_inner = app_state_for_dialog.clone();

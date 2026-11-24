@@ -213,7 +213,7 @@ fn workspace_key(path: &Path) -> String {
 }
 
 pub fn default_preferences_path() -> Result<PathBuf, DomainError> {
-    let dirs = ProjectDirs::from("io", "protrack", "protrack4").ok_or_else(|| {
+    let dirs = ProjectDirs::from("nz", "thealternator", "ProTrack4").ok_or_else(|| {
         DomainError::Storage("unable to resolve OS application config directory".to_string())
     })?;
     Ok(dirs.config_dir().join("preferences.json"))
@@ -222,9 +222,9 @@ pub fn default_preferences_path() -> Result<PathBuf, DomainError> {
 pub fn default_workspaces_dir() -> PathBuf {
     if let Some(user_dirs) = UserDirs::new() {
         if let Some(docs) = user_dirs.document_dir() {
-            return docs.join("ProTrack");
+            return docs.join("ProTrack4");
         }
-        return user_dirs.home_dir().join("ProTrack");
+        return user_dirs.home_dir().join("ProTrack4");
     }
     PathBuf::from(".")
 }

@@ -9,7 +9,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, Styled as _, Subscription, Window, div,
+    ParentElement as _, Pixels, Render, Styled as _, Subscription, Window, div, img,
     prelude::FluentBuilder as _, px,
 };
 
@@ -962,11 +962,11 @@ impl Render for WorkspaceShell {
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Icon::new(IconName::FolderOpen)
-                                        .xsmall()
-                                        .text_color(cx.theme().primary),
+                                    img(crate::branding::icon_image())
+                                        .size(px(18.))
+                                        .flex_shrink_0(),
                                 )
-                                .child(div().text_xs().font_semibold().child("ProTrack")),
+                                .child(div().text_xs().font_semibold().child("ProTrack4")),
                         )
                         .child(
                             div()

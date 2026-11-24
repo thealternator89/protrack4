@@ -1,7 +1,10 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::time::Duration;
 
 use gpui_kit::component::TitleBar;
-use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{AppContext as _, Bounds, WindowBounds, px, size};
+use protrack4::branding::{self, AppAssets};
 use protrack4::state::LaunchConfig;
 use protrack4::ui::WorkspaceShell;
 use protrack4::workspace::{install_signal_handlers, parse_cli_db_arg, take_shutdown_signal};
@@ -19,21 +22,24 @@ fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("protrack4=info,warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    tracing::info!(db_override = ?db_override, "Starting ProTrack");
+    tracing::info!(db_override = ?db_override, "Starting ProTrack4");
     install_signal_handlers();
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            branding::set_app_dock_icon();
             protrack4::ui::register_keybindings(cx);
 
             let window_bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(window_bounds)),
-                window_min_size: Some(size(px(860.), px(560.))),
-                ..TitleBar::window_options()
-            };
+            let mut options = TitleBar::window_options();
+            options.window_bounds = Some(WindowBounds::Windowed(window_bounds));
+            options.window_min_size = Some(size(px(860.), px(560.)));
+            options.app_id = Some("nz.thealternator.protrack4.app".to_string());
+            if let Some(ref mut titlebar) = options.titlebar {
+                titlebar.title = Some("ProTrack4".into());
+            }
 
             let launch_config = LaunchConfig {
                 db_override,
@@ -43,7 +49,7 @@ fn main() {
             let (_, shell) = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| WorkspaceShell::new_with_config(launch_config, window, cx))
             })
-            .expect("failed to open ProTrack main window");
+            .expect("failed to open ProTrack4 main window");
 
             let app_state_quit = shell.read(cx).app_state().clone();
             let inspector_quit = shell.read(cx).inspector().clone();
