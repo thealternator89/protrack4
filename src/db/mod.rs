@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod assignee_repo;
+pub mod blocker_repo;
 pub mod item_repo;
 pub mod migrations;
 pub mod project_repo;
@@ -189,6 +190,7 @@ pub fn load_project_snapshot(
     }
 
     let progress_by_feature = item_repo::query_feature_progress_rollup(conn, project_id)?;
+    let block_snapshot = blocker_repo::load_project_block_snapshot(conn, project_id)?;
 
     let trash_count_i64: i64 = conn
         .query_row(
@@ -208,6 +210,11 @@ pub fn load_project_snapshot(
         feature_work_items,
         item_tags,
         progress_by_feature,
+        item_blockers: block_snapshot.item_blockers,
+        direct_blockers_by_item: block_snapshot.direct_blockers_by_item,
+        inherited_blockers_by_item: block_snapshot.inherited_blockers_by_item,
+        effective_block_state: block_snapshot.effective_block_state,
+        blocker_warnings: block_snapshot.blocker_warnings,
         trash_count,
     })
 }

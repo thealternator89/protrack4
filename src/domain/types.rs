@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{DomainError, FeatureProgress};
+use crate::domain::{
+    BlockerCandidateRejection, BlockerRef, BlockerWarning, DomainError, EffectiveBlockState,
+    FeatureProgress, ItemBlocker,
+};
 
 pub const MAX_FEATURE_DEPTH: usize = 32;
 pub const VISUAL_MAX_INDENT_DEPTH: usize = 8;
@@ -345,6 +348,16 @@ pub struct ProjectSnapshot {
     pub item_tags: HashMap<ItemId, Vec<TagId>>,
     #[serde(default)]
     pub progress_by_feature: HashMap<ItemId, FeatureProgress>,
+    #[serde(default)]
+    pub item_blockers: Vec<ItemBlocker>,
+    #[serde(default)]
+    pub direct_blockers_by_item: HashMap<ItemId, Vec<BlockerRef>>,
+    #[serde(default)]
+    pub inherited_blockers_by_item: HashMap<ItemId, Vec<BlockerRef>>,
+    #[serde(default)]
+    pub effective_block_state: HashMap<ItemId, EffectiveBlockState>,
+    #[serde(default)]
+    pub blocker_warnings: HashMap<ItemId, Vec<BlockerWarning>>,
     pub trash_count: usize,
 }
 
@@ -781,6 +794,220 @@ impl ProjectSnapshot {
         self.child_features(feature.parent_feature_id)
     }
 
+    pub fn effective_block_state(&self, item_id: ItemId) -> EffectiveBlockState {
+        self.effective_block_state
+            .get(&item_id)
+            .copied()
+            .unwrap_or(EffectiveBlockState::Unblocked)
+    }
+
+    pub fn direct_blockers(&self, item_id: ItemId) -> &[BlockerRef] {
+        self.direct_blockers_by_item
+            .get(&item_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn inherited_blockers(&self, item_id: ItemId) -> &[BlockerRef] {
+        self.inherited_blockers_by_item
+            .get(&item_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn blocker_warnings(&self, item_id: ItemId) -> &[BlockerWarning] {
+        self.blocker_warnings
+            .get(&item_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn primary_active_direct_blocker_key(&self, item_id: ItemId) -> Option<&str> {
+        self.direct_blockers(item_id)
+            .iter()
+            .find(|b| b.is_active_block())
+            .map(|b| b.blocker_key.as_str())
+    }
+
+    pub fn dependents_of_feature(&self, feature_id: ItemId) -> Vec<&Item> {
+        let mut seen = HashSet::new();
+        let mut items: Vec<&Item> = self
+            .item_blockers
+            .iter()
+            .filter(|edge| {
+                edge.project_id == self.project.id
+                    && edge.blocker_feature_id == feature_id
+                    && seen.insert(edge.blocked_item_id)
+            })
+            .filter_map(|edge| self.item(edge.blocked_item_id))
+            .filter(|item| item.project_id == self.project.id && item.is_active())
+            .collect();
+        items.sort_by_key(|item| item.item_number);
+        items
+    }
+
+    /// Evaluates `INV-05` eligibility of adding `candidate_feature_id` as a direct blocker of `blocked_item_id`.
+    pub fn blocker_candidate_rejection(
+        &self,
+        blocked_item_id: ItemId,
+        candidate_feature_id: ItemId,
+    ) -> Option<BlockerCandidateRejection> {
+        if blocked_item_id == candidate_feature_id {
+            return Some(BlockerCandidateRejection::SelfReference);
+        }
+
+        if self
+            .direct_blockers(blocked_item_id)
+            .iter()
+            .any(|b| b.blocker_id == candidate_feature_id)
+        {
+            return Some(BlockerCandidateRejection::AlreadyBlockedBy);
+        }
+
+        let blocked_item = self.item(blocked_item_id)?;
+        let candidate = self.item(candidate_feature_id)?;
+        if !blocked_item.is_active()
+            || !candidate.is_active()
+            || candidate.kind != ItemKind::Feature
+            || blocked_item.project_id != self.project.id
+            || candidate.project_id != self.project.id
+        {
+            return Some(BlockerCandidateRejection::WouldCreateCycle);
+        }
+
+        if blocked_item.kind == ItemKind::WorkItem {
+            let attached = self.features_for_work_item(blocked_item_id);
+            if attached.iter().any(|f| f.id == candidate_feature_id) {
+                return Some(BlockerCandidateRejection::AttachedFeatureOfWorkItem);
+            }
+            for f in attached {
+                if self.ancestor_feature_ids(f.id).contains(&candidate_feature_id) {
+                    return Some(BlockerCandidateRejection::AncestorOfAttachedFeature);
+                }
+            }
+            return None;
+        }
+
+        if self
+            .ancestor_feature_ids(blocked_item_id)
+            .contains(&candidate_feature_id)
+        {
+            return Some(BlockerCandidateRejection::AncestorOfItem);
+        }
+
+        if self
+            .descendant_feature_ids(blocked_item_id)
+            .contains(&candidate_feature_id)
+        {
+            return Some(BlockerCandidateRejection::DescendantOfItem);
+        }
+
+        if self.combined_graph_reachable(candidate_feature_id, blocked_item_id) {
+            return Some(BlockerCandidateRejection::WouldCreateCycle);
+        }
+
+        None
+    }
+
+    /// Checks whether reparenting `feature_id` under `new_parent_id` violates `INV-05`.
+    pub fn reparent_blocker_conflict(
+        &self,
+        feature_id: ItemId,
+        new_parent_id: ItemId,
+    ) -> Option<&'static str> {
+        let mut new_ancestors = self.ancestor_feature_ids(new_parent_id);
+        new_ancestors.insert(new_parent_id);
+
+        let mut moving_subtree = self.descendant_feature_ids(feature_id);
+        moving_subtree.insert(feature_id);
+
+        if self.combined_graph_reachable(new_parent_id, feature_id) {
+            return Some("Dependency cycle");
+        }
+
+        for edge in &self.item_blockers {
+            if edge.project_id != self.project.id {
+                continue;
+            }
+            if moving_subtree.contains(&edge.blocked_item_id)
+                && new_ancestors.contains(&edge.blocker_feature_id)
+            {
+                return Some("Blocker conflict");
+            }
+            if new_ancestors.contains(&edge.blocked_item_id)
+                && moving_subtree.contains(&edge.blocker_feature_id)
+            {
+                return Some("Blocker conflict");
+            }
+        }
+
+        for link in &self.feature_work_items {
+            if link.project_id == self.project.id && moving_subtree.contains(&link.feature_id) {
+                for edge in &self.item_blockers {
+                    if edge.project_id == self.project.id
+                        && edge.blocked_item_id == link.work_item_id
+                        && new_ancestors.contains(&edge.blocker_feature_id)
+                    {
+                        return Some("Work item blocker conflict");
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn ancestor_feature_ids(&self, feature_id: ItemId) -> HashSet<ItemId> {
+        let mut ancestors = HashSet::new();
+        let mut visited = HashSet::from([feature_id]);
+        let mut cur = self.item(feature_id).and_then(|f| f.parent_feature_id);
+        while let Some(pid) = cur {
+            if !visited.insert(pid) || ancestors.len() >= MAX_FEATURE_DEPTH {
+                break;
+            }
+            let Some(parent) = self.item(pid) else {
+                break;
+            };
+            if !parent.is_active() || parent.kind != ItemKind::Feature {
+                break;
+            }
+            ancestors.insert(pid);
+            cur = parent.parent_feature_id;
+        }
+        ancestors
+    }
+
+    fn combined_graph_reachable(&self, start: ItemId, target: ItemId) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if node == target {
+                return true;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(item) = self.item(node)
+                && item.is_active()
+                && item.kind == ItemKind::Feature
+                && let Some(parent_id) = item.parent_feature_id
+            {
+                stack.push(parent_id);
+            }
+            for edge in &self.item_blockers {
+                if edge.project_id == self.project.id && edge.blocked_item_id == node {
+                    if let Some(blocker) = self.item(edge.blocker_feature_id)
+                        && blocker.is_active()
+                        && blocker.kind == ItemKind::Feature
+                    {
+                        stack.push(edge.blocker_feature_id);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn collect_tree_rows(
         &self,
         parent_id: Option<ItemId>,
@@ -946,6 +1173,11 @@ mod tests {
             ],
             item_tags: HashMap::new(),
             progress_by_feature: HashMap::new(),
+            item_blockers: Vec::new(),
+            direct_blockers_by_item: HashMap::new(),
+            inherited_blockers_by_item: HashMap::new(),
+            effective_block_state: HashMap::new(),
+            blocker_warnings: HashMap::new(),
             trash_count: 0,
         };
 

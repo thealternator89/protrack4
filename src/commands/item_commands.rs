@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use rusqlite::Transaction;
 
 use crate::commands::{CommandEffect, UndoableCommand};
+use crate::db::blocker_repo::query_active_blocker_keys_for_item;
 use crate::db::item_repo::{
     CreateFeatureInput, CreateWorkItemInput, UpdateItemFieldsInput, attach_work_item_to_feature,
     create_feature, create_work_item, detach_work_item_from_feature, get_item,
@@ -168,6 +169,7 @@ impl UndoableCommand for UpdateItemFields {
     }
 
     fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        let previous_status = get_item(tx, self.item_id)?.status;
         let item = update_item_fields(
             tx,
             UpdateItemFieldsInput {
@@ -180,10 +182,37 @@ impl UndoableCommand for UpdateItemFields {
             },
         )?;
 
+        let warning_toast = if self.status == Some(ItemStatus::InProgress)
+            && previous_status != ItemStatus::InProgress
+        {
+            let (block_state, blocker_keys) =
+                query_active_blocker_keys_for_item(tx, item.project_id, item.id)?;
+            if block_state.is_blocked() && !blocker_keys.is_empty() {
+                let preview = if blocker_keys.len() > 3 {
+                    format!(
+                        "{} (+{} more)",
+                        blocker_keys[..3].join(", "),
+                        blocker_keys.len() - 3
+                    )
+                } else {
+                    blocker_keys.join(", ")
+                };
+                Some(format!(
+                    "Warning: {} is currently blocked by {}",
+                    item.item_key, preview
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(CommandEffect {
             events: vec![DomainEvent::ItemsChanged {
                 project_id: item.project_id,
             }],
+            warning_toast,
             ..Default::default()
         })
     }

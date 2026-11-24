@@ -20,4 +20,5 @@ oneshot = "0.1"
 
 [dev-dependencies]
 gpui-kit = { version = "0.7", features = ["test-support"] }
+proptest = "1"
 tempfile = "3"

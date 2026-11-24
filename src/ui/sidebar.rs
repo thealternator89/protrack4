@@ -11,7 +11,9 @@ use gpui_kit::{
     prelude::FluentBuilder as _, px,
 };
 
-use crate::domain::{MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px};
+use crate::domain::{
+    EffectiveBlockState, MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px,
+};
 use crate::state::{AppState, CenterViewTab, ProjectStore};
 use crate::ui::modals::{
     open_assignees_manager_modal, open_create_feature_modal, open_project_settings_modal,
@@ -381,6 +383,15 @@ pub fn render_sidebar(
                         let parent_label = format!("{} {}", item.item_key, item.title);
                         let at_max_depth = row.depth + 1 >= MAX_FEATURE_DEPTH;
                         let s_color = status_color(item.status, cx);
+                        let block_state = snap.effective_block_state(row.item_id);
+                        let block_dot_color = match block_state {
+                            EffectiveBlockState::DirectlyBlocked { .. } => Some(cx.theme().danger),
+                            EffectiveBlockState::InheritedBlocked { .. } => {
+                                Some(cx.theme().warning)
+                            }
+                            EffectiveBlockState::Unblocked
+                            | EffectiveBlockState::PartiallyBlocked { .. } => None,
+                        };
 
                         Some(
                             h_flex()
@@ -472,6 +483,17 @@ pub fn render_sidebar(
                                             .font_family(cx.theme().mono_font_family.clone())
                                             .text_color(cx.theme().muted_foreground)
                                             .child(badge),
+                                    )
+                                })
+                                .when_some(block_dot_color, |this, dot_color| {
+                                    this.child(
+                                        div()
+                                            .id(("sidebar-block-dot", item.item_number as usize))
+                                            .test_support()
+                                            .size(px(7.))
+                                            .flex_shrink_0()
+                                            .rounded(px(999.))
+                                            .bg(dot_color),
                                     )
                                 })
                                 .child(progress_pill(done, total, cx))

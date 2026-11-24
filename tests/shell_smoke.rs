@@ -8,10 +8,12 @@ use gpui_kit::{
     base::Root, point, px, size,
 };
 use protrack4::commands::{
-    CreateFeature, CreateProject, ReparentFeature, ReorderSiblingFeatures, UpdateItemFields,
-    UpdateProject,
+    CreateFeature, CreateProject, CreateWorkItem, ReparentFeature, ReorderSiblingFeatures,
+    UpdateItemFields, UpdateProject,
 };
-use protrack4::domain::{ItemKind, ItemStatus, Priority, ProjectStatus};
+use protrack4::domain::{
+    BlockerWarning, EffectiveBlockState, ItemKind, ItemStatus, Priority, ProjectStatus,
+};
 use protrack4::state::{AppState, CenterViewTab, LaunchConfig, ThemePreference};
 use protrack4::ui::WorkspaceShell;
 use protrack4::ui::inspector::DescriptionMode;
@@ -1967,6 +1969,407 @@ async fn phase6_outline_view_progress_shared_popover_and_inline_add(cx: &mut Tes
 
     // 6. Verify inline-created items survive restart
     let _ = pro_5_id;
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}
+
+#[gpui_kit::test]
+async fn phase7_features_only_blocking_engine_and_transitive_propagation(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase7.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 7 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Create Project and Features: A -> A1, B (blocker), C (unblocked), plus exclusive & shared Work Items
+    let pid = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Blocking Suite",
+                    "BLK",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let fa_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Feature Alpha",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let fa1_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    Some(fa_id),
+                    "Child Alpha One",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let fb_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Blocker Beta",
+                    "",
+                    ItemStatus::InProgress,
+                    Priority::Urgent,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let fc_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Parallel Gamma",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Low,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let wi_excl_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Exclusive task",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                    vec![fa1_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let wi_shared_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Shared task",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Low,
+                    vec![fa1_id, fc_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    wait_until(cx, "6 items loaded", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.active_items().len() == 6)
+    })
+    .await;
+
+    let (fa_num, fa1_num, fb_num, fc_num, wi_excl_num, wi_shared_num) = cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        let num = |id| s.item(id).unwrap().item_number as usize;
+        (
+            num(fa_id),
+            num(fa1_id),
+            num(fb_id),
+            num(fc_id),
+            num(wi_excl_id),
+            num(wi_shared_id),
+        )
+    });
+
+    // 2. Select Feature A, open Inspector's [+ Add Blocker Feature…] popover:
+    //    - A and A1 must be pre-filtered out when search is empty
+    //    - Searching "Child Alpha" surfaces A1 as disabled with reason
+    //    - Clearing search and clicking B adds the direct blocker
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.expand_all_features();
+            s.select_item(Some(fa_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("inspector-add-blocker-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+
+        assert!(window.try_find("inspector-blocker-search").is_some());
+        assert!(window.try_find(("inspector-blocker-option", fa_num)).is_none());
+        assert!(window.try_find(("inspector-blocker-option", fa1_num)).is_none());
+        assert!(window.try_find(("inspector-blocker-option", fb_num)).is_some());
+        assert!(window.try_find(("inspector-blocker-option", fc_num)).is_some());
+
+        window.input("Child Alpha", cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("inspector-blocker-disabled", fa1_num)).is_some());
+
+        window.click("inspector-add-blocker-btn", cx);
+        window.render_frame(cx);
+        window.click("inspector-add-blocker-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click(("inspector-blocker-option", fb_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "blocker B added to A", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.effective_block_state(fa_id) == EffectiveBlockState::DirectlyBlocked { active_count: 1 }
+        })
+    })
+    .await;
+
+    // 3. Verify transitive propagation & Outline/Sidebar badges
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let snap = store.read(cx).snapshot().unwrap();
+        assert_eq!(
+            snap.effective_block_state(fa1_id),
+            EffectiveBlockState::InheritedBlocked {
+                ancestor_blocker_count: 1
+            }
+        );
+        assert_eq!(
+            snap.effective_block_state(wi_excl_id),
+            EffectiveBlockState::InheritedBlocked {
+                ancestor_blocker_count: 1
+            }
+        );
+        assert_eq!(
+            snap.effective_block_state(wi_shared_id),
+            EffectiveBlockState::PartiallyBlocked {
+                blocked_features: 1,
+                total_features: 2,
+            }
+        );
+
+        assert!(window.try_find(("sidebar-block-dot", fa_num)).is_some());
+        assert!(window.try_find(("sidebar-block-dot", fa1_num)).is_some());
+        assert!(window.try_find(("outline-feature-block", fa_num)).is_some());
+        assert!(window.try_find(("outline-feature-block", fa1_num)).is_some());
+        assert!(
+            window
+                .try_find(("outline-wi-block", fa1_num * 100_000 + wi_excl_num))
+                .is_some()
+        );
+        assert!(
+            window
+                .try_find(("outline-wi-block", fa1_num * 100_000 + wi_shared_num))
+                .is_some()
+        );
+        assert!(window.try_find("inspector-direct-blocker").is_none());
+        assert!(window.try_find(("inspector-direct-blocker", 0usize)).is_some());
+
+        // Select Child A1 and verify read-only Inherited Blockers list + jump button
+        store.update(cx, |s, cx| {
+            s.select_item(Some(fa1_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find(("inspector-inherited-blocker", 0usize)).is_some());
+        window.click(("inspector-inherited-via", 0usize), cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).selected_item_id(), Some(fa_id));
+    })
+    .unwrap();
+
+    // 4. Soft-blocking: move exclusive WI to InProgress -> succeeds with warning_toast
+    let start_eff = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpdateItemFields {
+                    item_id: wi_excl_id,
+                    title: None,
+                    description: None,
+                    status: Some(ItemStatus::InProgress),
+                    priority: None,
+                    assignee_id: None,
+                }),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        start_eff.warning_toast.as_deref(),
+        Some("Warning: BLK-5 is currently blocked by BLK-3")
+    );
+
+    wait_until(cx, "exclusive WI moved to InProgress", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.item(wi_excl_id))
+            .is_some_and(|i| i.status == ItemStatus::InProgress)
+    })
+    .await;
+
+    // 5. Mark blocker B Cancelled -> A becomes Unblocked with Cancelled warning
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpdateItemFields {
+                    item_id: fb_id,
+                    title: None,
+                    description: None,
+                    status: Some(ItemStatus::Cancelled),
+                    priority: None,
+                    assignee_id: None,
+                }),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    wait_until(cx, "cancelled blocker updates A to Unblocked with warning", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.effective_block_state(fa_id) == EffectiveBlockState::Unblocked
+                && matches!(
+                    s.blocker_warnings(fa_id),
+                    [BlockerWarning::Cancelled { .. }]
+                )
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("inspector-blocker-warning", 0usize)).is_some());
+    })
+    .unwrap();
+
+    // 6. Mark blocker B Done -> warnings and blocks clear live
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpdateItemFields {
+                    item_id: fb_id,
+                    title: None,
+                    description: None,
+                    status: Some(ItemStatus::Done),
+                    priority: None,
+                    assignee_id: None,
+                }),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    wait_until(cx, "done blocker clears blocks and warnings", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.effective_block_state(fa_id) == EffectiveBlockState::Unblocked
+                && s.effective_block_state(wi_excl_id) == EffectiveBlockState::Unblocked
+                && s.effective_block_state(wi_shared_id) == EffectiveBlockState::Unblocked
+                && s.blocker_warnings(fa_id).is_empty()
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("outline-feature-block", fa_num)).is_none());
+        assert!(window.try_find(("sidebar-block-dot", fa_num)).is_none());
+        assert!(window.try_find(("inspector-blocker-warning", 0usize)).is_none());
+    })
+    .unwrap();
+
     app_state.update(cx, |app, cx| {
         app.close_workspace_sync(cx).unwrap();
     });

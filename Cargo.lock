@@ -5425,6 +5425,7 @@ dependencies = [
  "fs4",
  "gpui-kit",
  "oneshot",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",

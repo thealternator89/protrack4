@@ -704,6 +704,11 @@ pub fn sample_snapshot() -> ProjectSnapshot {
         feature_work_items,
         item_tags,
         progress_by_feature: HashMap::new(),
+        item_blockers: Vec::new(),
+        direct_blockers_by_item: HashMap::new(),
+        inherited_blockers_by_item: HashMap::new(),
+        effective_block_state: HashMap::new(),
+        blocker_warnings: HashMap::new(),
         trash_count: 0,
     };
     snapshot.progress_by_feature = snapshot.compute_progress_map();

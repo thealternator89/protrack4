@@ -776,6 +776,13 @@ pub fn reparent_feature(
                 max_depth: MAX_FEATURE_DEPTH,
             });
         }
+
+        crate::db::blocker_repo::validate_reparent_blockers(
+            tx,
+            feature.project_id,
+            feature_id,
+            pid,
+        )?;
     }
 
     let now = Utc::now();
@@ -1284,6 +1291,7 @@ pub fn set_work_item_features(
     let desired_order = dedupe_preserve_order(feature_ids);
     for &fid in &desired_order {
         validate_active_feature_in_project(tx, work_item.project_id, fid)?;
+        crate::db::blocker_repo::validate_attach_work_item_blockers(tx, work_item_id, fid)?;
     }
 
     let wi_sql = uuid_to_sql(work_item_id.0);
@@ -1371,6 +1379,7 @@ pub fn attach_work_item_to_feature(
 ) -> Result<FeatureWorkItem, DomainError> {
     let work_item = validate_active_work_item(tx, work_item_id)?;
     let _feature = validate_active_feature_in_project(tx, work_item.project_id, feature_id)?;
+    crate::db::blocker_repo::validate_attach_work_item_blockers(tx, work_item_id, feature_id)?;
 
     let wi_sql = uuid_to_sql(work_item_id.0);
     let feat_sql = uuid_to_sql(feature_id.0);

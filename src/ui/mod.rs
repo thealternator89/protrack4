@@ -14,12 +14,13 @@ use gpui_kit::component::{
     tag::Tag,
 };
 use gpui_kit::{
-    App, Context, Entity, Hsla, IntoElement, KeyBinding, ParentElement as _, SharedString,
-    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, Context, Entity, Hsla, IntoElement, KeyBinding, ParentElement as _,
+    SharedString, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::domain::{
-    Assignee, ItemKind, ItemStatus, Priority, Project, ProjectStatus, Tag as DomainTag,
+    Assignee, BlockerWarning, EffectiveBlockState, ItemKind, ItemStatus, Priority, Project,
+    ProjectStatus, Tag as DomainTag,
 };
 use crate::state::AppState;
 use crate::ui::modals::{open_new_project_modal, open_project_settings_modal};
@@ -202,6 +203,59 @@ pub fn domain_tag_chip(tag: &DomainTag, cx: &App) -> impl IntoElement {
     Tag::custom(bg, color, border)
         .xsmall()
         .child(SharedString::from(tag.name.clone()))
+}
+
+pub fn block_state_badge(
+    state: EffectiveBlockState,
+    primary_blocker_key: Option<&str>,
+    cx: &App,
+) -> Option<AnyElement> {
+    let label = state.badge_label(primary_blocker_key)?;
+    let (color, icon, is_dashed) = match state {
+        EffectiveBlockState::Unblocked => return None,
+        EffectiveBlockState::DirectlyBlocked { .. } => (cx.theme().danger, IconName::Ban, false),
+        EffectiveBlockState::InheritedBlocked { .. } => (
+            cx.theme().warning.mix_oklab(cx.theme().danger, 0.35),
+            IconName::TriangleAlert,
+            false,
+        ),
+        EffectiveBlockState::PartiallyBlocked { .. } => {
+            (cx.theme().warning, IconName::CircleAlert, true)
+        }
+    };
+    let bg = color.opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 });
+    let border = color.opacity(if cx.theme().is_dark() { 0.42 } else { 0.30 });
+
+    let mut tag = Tag::custom(bg, color, border)
+        .xsmall()
+        .gap_1()
+        .child(Icon::new(icon).xsmall().text_color(color))
+        .child(label);
+    if is_dashed {
+        tag = tag.border_dashed();
+    }
+    Some(tag.into_any_element())
+}
+
+pub fn blocker_warning_pill(warning: &BlockerWarning, compact: bool, cx: &App) -> AnyElement {
+    let (color, icon) = match warning {
+        BlockerWarning::Cancelled { .. } => (cx.theme().warning, IconName::TriangleAlert),
+        BlockerWarning::InTrash { .. } => (cx.theme().muted_foreground, IconName::Delete),
+    };
+    let bg = color.opacity(if cx.theme().is_dark() { 0.18 } else { 0.11 });
+    let border = color.opacity(if cx.theme().is_dark() { 0.35 } else { 0.24 });
+    let label = if compact {
+        warning.short_label().to_string()
+    } else {
+        warning.message()
+    };
+
+    Tag::custom(bg, color, border)
+        .xsmall()
+        .gap_1()
+        .child(Icon::new(icon).xsmall().text_color(color))
+        .child(label)
+        .into_any_element()
 }
 
 pub fn progress_pill(done: usize, total: usize, cx: &App) -> impl IntoElement {

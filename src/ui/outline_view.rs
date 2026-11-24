@@ -28,8 +28,8 @@ use crate::domain::{
 use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::open_create_feature_modal;
 use crate::ui::{
-    assignee_pill, domain_tag_chip, parse_hex_or, priority_badge, priority_color, status_badge,
-    status_color, status_icon,
+    assignee_pill, block_state_badge, blocker_warning_pill, domain_tag_chip, parse_hex_or,
+    priority_badge, priority_color, status_badge, status_color, status_icon,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -479,6 +479,9 @@ impl OutlineView {
                 let res = task.await;
                 let _ = cx.update(|window, cx| match res {
                     Ok(effect) => {
+                        if let Some(warn) = effect.warning_toast {
+                            window.push_notification(Notification::warning(warn), cx);
+                        }
                         if let Some(msg) = effect.toast {
                             window.push_notification(Notification::success(msg), cx);
                         }
@@ -919,6 +922,14 @@ impl OutlineView {
         let depth_badge = clamped_depth_badge(actual_depth);
         let tags = snapshot.tags_for_item(feat_id);
         let assignee = feature.assignee_id.and_then(|aid| snapshot.assignee(aid));
+        let block_state = snapshot.effective_block_state(feat_id);
+        let primary_blocker_key = snapshot.primary_active_direct_blocker_key(feat_id);
+        let block_badge = block_state_badge(block_state, primary_blocker_key, cx);
+        let first_warning = if !block_state.has_any_block() {
+            snapshot.blocker_warnings(feat_id).first()
+        } else {
+            None
+        };
         let bar_color = if progress.is_complete() {
             cx.theme().success
         } else if progress.is_empty() {
@@ -1033,6 +1044,24 @@ impl OutlineView {
             .when_some(depth_badge, |this, badge| {
                 this.child(Tag::secondary().xsmall().child(badge))
             })
+            .when_some(block_badge, |this, badge| {
+                this.child(
+                    div()
+                        .id(("outline-feature-block", feat_num))
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(badge),
+                )
+            })
+            .when_some(first_warning, |this, warning| {
+                this.child(
+                    div()
+                        .id(("outline-feature-block-warn", feat_num))
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(blocker_warning_pill(warning, true, cx)),
+                )
+            })
             .when(!tags.is_empty(), |this| {
                 this.child(
                     h_flex()
@@ -1112,6 +1141,14 @@ impl OutlineView {
         let wi_assignee = wi.assignee_id.and_then(|aid| snapshot.assignee(aid));
         let is_shared = shared_feature_ids.len() > 1;
         let popover_open = self.shared_popover_key == Some((parent_feature_id, wi_id));
+        let block_state = snapshot.effective_block_state(wi_id);
+        let primary_blocker_key = snapshot.primary_active_direct_blocker_key(wi_id);
+        let block_badge = block_state_badge(block_state, primary_blocker_key, cx);
+        let first_warning = if !block_state.has_any_block() {
+            snapshot.blocker_warnings(wi_id).first()
+        } else {
+            None
+        };
 
         let shared_label = if shared_feature_ids.len() > 1 {
             let extra = shared_feature_ids.len() - 1;
@@ -1198,6 +1235,24 @@ impl OutlineView {
                     .when(wi.status.is_cancelled(), |this| this.line_through())
                     .child(wi.title.clone()),
             )
+            .when_some(block_badge, |this, badge| {
+                this.child(
+                    div()
+                        .id(("outline-wi-block", row_key))
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(badge),
+                )
+            })
+            .when_some(first_warning, |this, warning| {
+                this.child(
+                    div()
+                        .id(("outline-wi-block-warn", row_key))
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(blocker_warning_pill(warning, true, cx)),
+                )
+            })
             .when(is_shared, |this| {
                 let info = cx.theme().info;
                 let shared_count = shared_ids_owned.len();
@@ -1805,6 +1860,11 @@ mod tests {
             ],
             item_tags: HashMap::new(),
             progress_by_feature: HashMap::new(),
+            item_blockers: Vec::new(),
+            direct_blockers_by_item: HashMap::new(),
+            inherited_blockers_by_item: HashMap::new(),
+            effective_block_state: HashMap::new(),
+            blocker_warnings: HashMap::new(),
             trash_count: 0,
         };
         snap.progress_by_feature = snap.compute_progress_map();

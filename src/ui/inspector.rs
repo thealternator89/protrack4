@@ -17,12 +17,14 @@ use gpui_kit::component::{
 use gpui_kit::{
     Anchor, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, TestSupportExt as _, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::commands::{
-    AttachWorkItemToFeature, DetachWorkItemFromFeature, ReparentFeature, ReorderSiblingFeatures,
-    SetItemTags, SetWorkItemFeatures, UndoableCommand, UpdateItemFields,
+    AddBlocker, AttachWorkItemToFeature, DetachWorkItemFromFeature, RemoveBlocker,
+    ReparentFeature, ReorderSiblingFeatures, SetItemTags, SetWorkItemFeatures, UndoableCommand,
+    UpdateItemFields,
 };
 use crate::domain::{
     Assignee, AssigneeId, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority,
@@ -32,7 +34,8 @@ use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::{open_create_feature_modal, open_tags_manager_modal};
 use crate::ui::{
     PrioritySelectOption, StatusSelectOption, all_priority_options, all_status_options,
-    assignee_pill, kind_badge, parse_hex_or,
+    assignee_pill, block_state_badge, blocker_warning_pill, kind_badge, parse_hex_or, status_badge,
+    status_color, status_icon,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +151,7 @@ pub struct InspectorView {
     loaded_assignee_id: Option<AssigneeId>,
     loaded_parent_id: Option<ItemId>,
     parent_options_sig: Vec<(ItemId, String, String, Option<ItemId>)>,
+    blocker_edges_sig: Vec<(ItemId, ItemId)>,
     assignee_options_sig: Vec<(AssigneeId, String, String, String, Option<String>, bool)>,
     title_input: Entity<InputState>,
     description_input: Entity<TextareaState>,
@@ -159,6 +163,8 @@ pub struct InspectorView {
     attach_search_input: Entity<InputState>,
     tag_popover_open: bool,
     tag_search_input: Entity<InputState>,
+    blocker_popover_open: bool,
+    blocker_search_input: Entity<InputState>,
     description_mode: DescriptionMode,
     preview_revision: u64,
     dirty_title: bool,
@@ -216,6 +222,8 @@ impl InspectorView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter Features…"));
         let tag_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter project tags…"));
+        let blocker_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter blocker Features…"));
 
         let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
         let attach_search_sub = cx.subscribe_in(
@@ -229,6 +237,15 @@ impl InspectorView {
         );
         let tag_search_sub = cx.subscribe_in(
             &tag_search_input,
+            window,
+            |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
+        let blocker_search_sub = cx.subscribe_in(
+            &blocker_search_input,
             window,
             |_, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -306,7 +323,7 @@ impl InspectorView {
         let status_sub = cx.subscribe_in(
             &status_select,
             window,
-            |this, _, event: &SelectEvent<Vec<StatusSelectOption>>, _, cx| {
+            |this, _, event: &SelectEvent<Vec<StatusSelectOption>>, window, cx| {
                 if this.syncing {
                     return;
                 }
@@ -317,19 +334,55 @@ impl InspectorView {
                     if *new_status == this.loaded_status {
                         return;
                     }
+                    let previous_status = this.loaded_status;
                     this.loaded_status = *new_status;
-                    this.dispatch_item_command(
-                        Box::new(UpdateItemFields {
-                            item_id,
-                            title: None,
-                            description: None,
-                            status: Some(*new_status),
-                            priority: None,
-                            assignee_id: None,
-                        }),
-                        None,
-                        cx,
-                    );
+                    let status_select = this.status_select.clone();
+                    let command = Box::new(UpdateItemFields {
+                        item_id,
+                        title: None,
+                        description: None,
+                        status: Some(*new_status),
+                        priority: None,
+                        assignee_id: None,
+                    });
+                    this.saving = true;
+                    cx.notify();
+
+                    let task = this
+                        .app_state
+                        .update(cx, |app, cx| app.execute_command(command, cx));
+                    let view = cx.entity().downgrade();
+                    window
+                        .spawn(cx, async move |cx| {
+                            let res = task.await;
+                            let _ = view.update(cx, |this, cx| {
+                                this.saving = false;
+                                if res.is_err() && this.loaded_item_id == Some(item_id) {
+                                    this.loaded_status = previous_status;
+                                }
+                                cx.notify();
+                            });
+                            let _ = cx.update(|window, cx| match res {
+                                Ok(effect) => {
+                                    if let Some(warn) = effect.warning_toast {
+                                        window.push_notification(Notification::warning(warn), cx);
+                                    }
+                                    if let Some(msg) = effect.toast {
+                                        window.push_notification(Notification::success(msg), cx);
+                                    }
+                                }
+                                Err(err) => {
+                                    status_select.update(cx, |sel, cx| {
+                                        sel.set_selected_value(&previous_status, window, cx);
+                                    });
+                                    window.push_notification(
+                                        Notification::error(err.to_string()),
+                                        cx,
+                                    );
+                                }
+                            });
+                        })
+                        .detach();
                 }
             },
         );
@@ -489,6 +542,7 @@ impl InspectorView {
             loaded_assignee_id: None,
             loaded_parent_id: None,
             parent_options_sig: Vec::new(),
+            blocker_edges_sig: Vec::new(),
             assignee_options_sig: Vec::new(),
             title_input,
             description_input,
@@ -500,6 +554,8 @@ impl InspectorView {
             attach_search_input,
             tag_popover_open: false,
             tag_search_input,
+            blocker_popover_open: false,
+            blocker_search_input,
             description_mode: DescriptionMode::Preview,
             preview_revision: 0,
             dirty_title: false,
@@ -512,6 +568,7 @@ impl InspectorView {
                 store_sub,
                 attach_search_sub,
                 tag_search_sub,
+                blocker_search_sub,
                 title_sub,
                 desc_sub,
                 status_sub,
@@ -787,10 +844,13 @@ impl InspectorView {
 
             self.attach_popover_open = false;
             self.tag_popover_open = false;
+            self.blocker_popover_open = false;
             self.syncing = true;
             self.attach_search_input
                 .update(cx, |inp, cx| inp.set_value("", window, cx));
             self.tag_search_input
+                .update(cx, |inp, cx| inp.set_value("", window, cx));
+            self.blocker_search_input
                 .update(cx, |inp, cx| inp.set_value("", window, cx));
             if let (Some(snapshot), Some(item)) = (&snapshot_opt, current_item) {
                 self.loaded_item_id = Some(item.id);
@@ -833,6 +893,7 @@ impl InspectorView {
                 self.loaded_assignee_id = None;
                 self.loaded_parent_id = None;
                 self.parent_options_sig.clear();
+                self.blocker_edges_sig.clear();
                 self.assignee_options_sig.clear();
                 self.dirty_title = false;
                 self.dirty_description = false;
@@ -874,7 +935,9 @@ impl InspectorView {
 
         if item.kind == ItemKind::Feature {
             let new_sig = feature_tree_signature(&snapshot);
+            let new_blocker_sig = blocker_edges_signature(&snapshot);
             if new_sig != self.parent_options_sig
+                || new_blocker_sig != self.blocker_edges_sig
                 || item.parent_feature_id != self.loaded_parent_id
             {
                 self.loaded_parent_id = item.parent_feature_id;
@@ -916,6 +979,7 @@ impl InspectorView {
         cx: &mut Context<Self>,
     ) {
         self.parent_options_sig = feature_tree_signature(snapshot);
+        self.blocker_edges_sig = blocker_edges_signature(snapshot);
         let options = build_parent_feature_options(snapshot, item.id);
         let selected_parent = item.parent_feature_id;
         self.parent_select.update(cx, |sel, cx| {
@@ -963,6 +1027,9 @@ impl InspectorView {
                 });
                 let _ = cx.update(|window, cx| match res {
                     Ok(effect) => {
+                        if let Some(warn) = effect.warning_toast {
+                            window.push_notification(Notification::warning(warn), cx);
+                        }
                         if let Some(msg) = effect.toast {
                             window.push_notification(Notification::success(msg), cx);
                         }
@@ -973,6 +1040,614 @@ impl InspectorView {
                 });
             })
             .detach();
+    }
+
+    fn render_dependencies_section(
+        &self,
+        snapshot: &ProjectSnapshot,
+        item: &Item,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let item_id = item.id;
+        let block_state = snapshot.effective_block_state(item_id);
+        let primary_blocker_key = snapshot.primary_active_direct_blocker_key(item_id);
+        let direct_blockers = snapshot.direct_blockers(item_id);
+        let inherited_blockers = snapshot.inherited_blockers(item_id);
+        let warnings = snapshot.blocker_warnings(item_id);
+        let dependents = if item.kind == ItemKind::Feature {
+            snapshot.dependents_of_feature(item_id)
+        } else {
+            Vec::new()
+        };
+
+        let blocker_search_focus = self.blocker_search_input.read(cx).focus_handle(cx);
+        let inspector_entity = cx.entity();
+        let inspector_for_change = inspector_entity.clone();
+        let inspector_for_content = inspector_entity.clone();
+
+        let status_header_badge = block_state_badge(block_state, primary_blocker_key, cx)
+            .unwrap_or_else(|| {
+                let ok = cx.theme().success;
+                Tag::custom(
+                    ok.opacity(if cx.theme().is_dark() { 0.16 } else { 0.10 }),
+                    ok,
+                    ok.opacity(if cx.theme().is_dark() { 0.34 } else { 0.22 }),
+                )
+                .xsmall()
+                .child("Ready")
+                .into_any_element()
+            });
+
+        v_flex()
+            .gap_2p5()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted.opacity(0.45))
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("DEPENDENCIES"),
+                    )
+                    .child(
+                        div()
+                            .id("inspector-block-state-badge")
+                            .test_support()
+                            .child(status_header_badge),
+                    ),
+            )
+            // Blocker warnings (Cancelled / InTrash)
+            .when(!warnings.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .children(warnings.iter().enumerate().map(|(ix, warning)| {
+                            let blocker_id = warning.blocker_id();
+                            let inspector_remove = inspector_entity.clone();
+                            h_flex()
+                                .id(("inspector-blocker-warning", ix))
+                                .test_support()
+                                .px_2()
+                                .py_1()
+                                .gap_1p5()
+                                .items_center()
+                                .justify_between()
+                                .rounded(cx.theme().radius * 0.75)
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(blocker_warning_pill(warning, false, cx)),
+                                )
+                                .child(
+                                    Button::new(("inspector-remove-warning-blocker", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .compact()
+                                        .label("Remove")
+                                        .on_click(move |_, window, cx| {
+                                            inspector_remove.update(cx, |this, cx| {
+                                                this.dispatch_feature_membership_command(
+                                                    Box::new(RemoveBlocker::new(
+                                                        item_id,
+                                                        blocker_id,
+                                                    )),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                        })),
+                )
+            })
+            // Direct Blockers
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("Direct Blockers ({})", direct_blockers.len())),
+                    )
+                    .when(!direct_blockers.is_empty(), |this| {
+                        this.child(v_flex().gap_1().children(direct_blockers.iter().enumerate().map(
+                            |(ix, b)| {
+                                let blocker_id = b.blocker_id;
+                                let in_trash = b.blocker_in_trash;
+                                let inspector_remove = inspector_entity.clone();
+                                let store_jump = self.store.clone();
+
+                                h_flex()
+                                    .id(("inspector-direct-blocker", ix))
+                                    .test_support()
+                                    .px_2()
+                                    .py_1()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .rounded(cx.theme().radius * 0.75)
+                                    .bg(cx.theme().background)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .when(!in_trash, |row| {
+                                        row.cursor_pointer()
+                                            .hover(|s| s.bg(cx.theme().accent))
+                                            .on_click(move |_, _, cx| {
+                                                store_jump.update(cx, |s, cx| {
+                                                    s.expand_ancestors_of(blocker_id);
+                                                    s.select_item(Some(blocker_id));
+                                                    cx.notify();
+                                                });
+                                            })
+                                    })
+                                    .child(
+                                        Icon::new(IconName::Folder)
+                                            .xsmall()
+                                            .text_color(if in_trash {
+                                                cx.theme().muted_foreground
+                                            } else {
+                                                cx.theme().primary
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(b.blocker_key.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .font_medium()
+                                            .when(in_trash, |d| {
+                                                d.text_color(cx.theme().muted_foreground)
+                                            })
+                                            .child(b.blocker_title.clone()),
+                                    )
+                                    .child(if in_trash {
+                                        Tag::secondary()
+                                            .xsmall()
+                                            .child("In Trash")
+                                            .into_any_element()
+                                    } else {
+                                        status_badge(b.blocker_status, cx).into_any_element()
+                                    })
+                                    .child(
+                                        Button::new(("inspector-remove-blocker", ix))
+                                            .ghost()
+                                            .xsmall()
+                                            .compact()
+                                            .icon(IconName::Close)
+                                            .tooltip("Remove blocker")
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                inspector_remove.update(cx, |this, cx| {
+                                                    this.dispatch_feature_membership_command(
+                                                        Box::new(RemoveBlocker::new(
+                                                            item_id,
+                                                            blocker_id,
+                                                        )),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    )
+                            },
+                        )))
+                    })
+                    .child(
+                        Popover::new("inspector-add-blocker-popover")
+                            .anchor(Anchor::TopLeft)
+                            .open(self.blocker_popover_open)
+                            .track_focus(&blocker_search_focus)
+                            .on_open_change(move |is_open, window, cx| {
+                                inspector_for_change.update(cx, |this, cx| {
+                                    this.blocker_popover_open = *is_open;
+                                    if *is_open {
+                                        this.blocker_search_input.update(cx, |inp, cx| {
+                                            inp.set_value("", window, cx);
+                                            inp.focus(window, cx);
+                                        });
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .trigger(
+                                Button::new("inspector-add-blocker-btn")
+                                    .outline()
+                                    .xsmall()
+                                    .icon(IconName::Plus)
+                                    .label("Add Blocker Feature…")
+                                    .dropdown_caret(true),
+                            )
+                            .content(move |_, _, cx| {
+                                let view_ref = inspector_for_content.read(cx);
+                                let search_input = view_ref.blocker_search_input.clone();
+                                let query_raw = search_input.read(cx).value();
+                                let query = query_raw.trim().to_lowercase();
+                                let snap_opt = view_ref.store.read(cx).snapshot().cloned();
+
+                                let candidates: Vec<(Item, usize, Option<crate::domain::BlockerCandidateRejection>)> =
+                                    snap_opt
+                                        .as_ref()
+                                        .map(|snap| {
+                                            snap.active_features_dfs()
+                                                .into_iter()
+                                                .filter_map(|(feat, depth)| {
+                                                    let rejection = snap
+                                                        .blocker_candidate_rejection(item_id, feat.id);
+                                                    if query.is_empty() {
+                                                        // Pre-filter invalid cycle/ancestor targets when unsearched.
+                                                        if rejection.is_some() {
+                                                            return None;
+                                                        }
+                                                    } else {
+                                                        let matches_query = feat
+                                                            .item_key
+                                                            .to_lowercase()
+                                                            .contains(&query)
+                                                            || feat
+                                                                .title
+                                                                .to_lowercase()
+                                                                .contains(&query);
+                                                        if !matches_query {
+                                                            return None;
+                                                        }
+                                                    }
+                                                    Some((feat.clone(), depth, rejection))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+
+                                v_flex()
+                                    .w(px(320.))
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .child("Block on Feature (INV-04 / INV-05)"),
+                                    )
+                                    .child(
+                                        Input::new(&search_input)
+                                            .id("inspector-blocker-search")
+                                            .small()
+                                            .cleanable(true),
+                                    )
+                                    .child(if candidates.is_empty() {
+                                        div()
+                                            .px_2()
+                                            .py_3()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if query.is_empty() {
+                                                "No eligible blocker Features available."
+                                            } else {
+                                                "No matching Features."
+                                            })
+                                            .into_any_element()
+                                    } else {
+                                        v_flex()
+                                            .w_full()
+                                            .max_h(px(220.))
+                                            .overflow_hidden()
+                                            .child(
+                                                div().flex_1().overflow_hidden().child(
+                                                    v_flex()
+                                                        .size_full()
+                                                        .gap_0p5()
+                                                        .overflow_y_scrollbar()
+                                                        .id("inspector-blocker-scroll")
+                                                        .children(candidates.into_iter().map(
+                                                            |(feat, depth, rejection)| {
+                                                                let cand_id = feat.id;
+                                                                let cand_num =
+                                                                    feat.item_number as usize;
+                                                                let is_disabled =
+                                                                    rejection.is_some();
+                                                                let indent = if query.is_empty() {
+                                                                    visual_indent_px(depth)
+                                                                        .min(64.0)
+                                                                } else {
+                                                                    0.0
+                                                                };
+                                                                let inspector_pick =
+                                                                    inspector_for_content.clone();
+
+                                                                let row_id = if is_disabled {
+                                                                    (
+                                                                        "inspector-blocker-disabled",
+                                                                        cand_num,
+                                                                    )
+                                                                } else {
+                                                                    (
+                                                                        "inspector-blocker-option",
+                                                                        cand_num,
+                                                                    )
+                                                                };
+
+                                                                ListItem::new(row_id)
+                                                                    .flex_shrink_0()
+                                                                    .w_full()
+                                                                    .pl(px(8.0 + indent))
+                                                                    .pr_2()
+                                                                    .py_1p5()
+                                                                    .rounded(
+                                                                        cx.theme().radius * 0.75,
+                                                                    )
+                                                                    .disabled(is_disabled)
+                                                                    .on_click(move |_, window, cx| {
+                                                                        if is_disabled {
+                                                                            return;
+                                                                        }
+                                                                        inspector_pick.update(
+                                                                            cx,
+                                                                            |this, cx| {
+                                                                                this.blocker_popover_open = false;
+                                                                                this.dispatch_feature_membership_command(
+                                                                                    Box::new(AddBlocker::new(
+                                                                                        item_id,
+                                                                                        cand_id,
+                                                                                    )),
+                                                                                    window,
+                                                                                    cx,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                    })
+                                                                    .child(
+                                                                        h_flex()
+                                                                            .w_full()
+                                                                            .gap_1p5()
+                                                                            .items_center()
+                                                                            .child(
+                                                                                Icon::new(
+                                                                                    status_icon(
+                                                                                        feat.status,
+                                                                                    ),
+                                                                                )
+                                                                                .xsmall()
+                                                                                .text_color(
+                                                                                    status_color(
+                                                                                        feat.status,
+                                                                                        cx,
+                                                                                    ),
+                                                                                ),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .text_xs()
+                                                                                    .font_family(
+                                                                                        cx.theme()
+                                                                                            .mono_font_family
+                                                                                            .clone(),
+                                                                                    )
+                                                                                    .text_color(
+                                                                                        cx.theme()
+                                                                                            .muted_foreground,
+                                                                                    )
+                                                                                    .child(
+                                                                                        feat.item_key,
+                                                                                    ),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .flex_1()
+                                                                                    .min_w_0()
+                                                                                    .overflow_hidden()
+                                                                                    .whitespace_nowrap()
+                                                                                    .text_ellipsis()
+                                                                                    .text_xs()
+                                                                                    .when(is_disabled, |d| {
+                                                                                        d.text_color(cx.theme().muted_foreground)
+                                                                                    })
+                                                                                    .child(
+                                                                                        feat.title,
+                                                                                    ),
+                                                                            )
+                                                                            .when_some(
+                                                                                rejection,
+                                                                                |this, rej| {
+                                                                                    this.child(
+                                                                                        div()
+                                                                                            .flex_shrink_0()
+                                                                                            .text_size(px(10.))
+                                                                                            .text_color(cx.theme().danger)
+                                                                                            .child(rej.reason()),
+                                                                                    )
+                                                                                },
+                                                                            ),
+                                                                    )
+                                                            },
+                                                        )),
+                                                ),
+                                            )
+                                            .into_any_element()
+                                    })
+                            }),
+                    ),
+            )
+            // Inherited Blockers (read-only)
+            .when(!inherited_blockers.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if item.kind == ItemKind::Feature {
+                                    "Inherited Blockers (via Parent)"
+                                } else {
+                                    "Inherited Blockers (via Features)"
+                                }),
+                        )
+                        .children(inherited_blockers.iter().enumerate().map(|(ix, b)| {
+                            let via_id = b.via_ancestor_id;
+                            let via_text = b.via_label().unwrap_or_else(|| "via parent".to_string());
+                            let store_jump = self.store.clone();
+
+                            h_flex()
+                                .id(("inspector-inherited-blocker", ix))
+                                .test_support()
+                                .px_2()
+                                .py_1()
+                                .gap_1p5()
+                                .items_center()
+                                .rounded(cx.theme().radius * 0.75)
+                                .bg(cx.theme().background.opacity(0.65))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .xsmall()
+                                        .text_color(cx.theme().warning),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(b.blocker_key.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_xs()
+                                        .child(b.blocker_title.clone()),
+                                )
+                                .when_some(via_id, |row, ancestor_id| {
+                                    row.child(
+                                        Button::new(("inspector-inherited-via", ix))
+                                            .ghost()
+                                            .xsmall()
+                                            .compact()
+                                            .label(via_text)
+                                            .on_click(move |_, _, cx| {
+                                                store_jump.update(cx, |s, cx| {
+                                                    s.expand_ancestors_of(ancestor_id);
+                                                    s.select_item(Some(ancestor_id));
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                })
+                        })),
+                )
+            })
+            // Blocking Dependents (for Features)
+            .when(item.kind == ItemKind::Feature, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("Blocking Dependents ({})", dependents.len())),
+                        )
+                        .child(if dependents.is_empty() {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("No items are blocked on this Feature.")
+                                .into_any_element()
+                        } else {
+                            v_flex()
+                                .gap_1()
+                                .children(dependents.into_iter().map(|dep| {
+                                    let dep_id = dep.id;
+                                    let dep_num = dep.item_number as usize;
+                                    let store_jump = self.store.clone();
+                                    h_flex()
+                                        .id(("inspector-dependent-item", dep_num))
+                                        .test_support()
+                                        .px_2()
+                                        .py_1()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .rounded(cx.theme().radius * 0.75)
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(cx.theme().accent))
+                                        .on_click(move |_, _, cx| {
+                                            store_jump.update(cx, |s, cx| {
+                                                s.expand_ancestors_of(dep_id);
+                                                s.select_item(Some(dep_id));
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(
+                                            Icon::new(if dep.kind == ItemKind::Feature {
+                                                IconName::Folder
+                                            } else {
+                                                status_icon(dep.status)
+                                            })
+                                            .xsmall()
+                                            .text_color(if dep.kind == ItemKind::Feature {
+                                                cx.theme().primary
+                                            } else {
+                                                status_color(dep.status, cx)
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(dep.item_key.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .text_xs()
+                                                .child(dep.title.clone()),
+                                        )
+                                }))
+                                .into_any_element()
+                        }),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -1046,6 +1721,14 @@ fn feature_tree_signature(snapshot: &ProjectSnapshot) -> Vec<(ItemId, String, St
         .collect()
 }
 
+fn blocker_edges_signature(snapshot: &ProjectSnapshot) -> Vec<(ItemId, ItemId)> {
+    snapshot
+        .item_blockers
+        .iter()
+        .map(|edge| (edge.blocked_item_id, edge.blocker_feature_id))
+        .collect()
+}
+
 fn build_parent_feature_options(
     snapshot: &ProjectSnapshot,
     feature_id: ItemId,
@@ -1059,6 +1742,12 @@ fn build_parent_feature_options(
             continue;
         }
         let exceeds_depth = depth + 1 + subtree_height >= MAX_FEATURE_DEPTH;
+        let blocker_conflict = snapshot.reparent_blocker_conflict(feature_id, cand.id);
+        let reason = if exceeds_depth {
+            Some(SharedString::from("Max depth 32"))
+        } else {
+            blocker_conflict.map(SharedString::from)
+        };
         let indent = "  ".repeat(depth.min(6));
         let label = format!("{indent}{} {}", cand.item_key, cand.title);
         let display_label = format!("{} {}", cand.item_key, cand.title);
@@ -1066,8 +1755,8 @@ fn build_parent_feature_options(
             id: Some(cand.id),
             label: label.into(),
             display_label: display_label.into(),
-            disabled: exceeds_depth,
-            reason: exceeds_depth.then(|| SharedString::from("Max depth 32")),
+            disabled: exceeds_depth || blocker_conflict.is_some(),
+            reason,
         });
     }
 
@@ -2374,6 +3063,8 @@ impl Render for InspectorView {
                         )
                         // Hierarchy or Attached Features
                         .child(relation_section)
+                        // Dependencies (Blockers, Inherited, Dependents)
+                        .child(self.render_dependencies_section(&snapshot, &item, cx))
                         // Description (Edit | Preview)
                         .child(
                             v_flex()

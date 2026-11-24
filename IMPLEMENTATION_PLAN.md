@@ -43,7 +43,7 @@ When starting any phase in a fresh agent session, follow these 5 steps in order:
 | [x] | **Phase 4** | Work Items, Multi-Feature Membership & Unallocated Triage | Phase 3 | Brain-dump Work Items into Unallocated, allocate to 0..N Features, unallocate, and inspect memberships |
 | [x] | **Phase 5** | Global Local Assignees & Project-Scoped Tags | Phase 4 | Manage global Assignees and per-Project colored Tags; assign and render pills/chips across views |
 | [x] | **Phase 6** | Hierarchical Outline View & Deduplicated Progress Roll-up | Phase 5 | Flagship nested Outline tree with deduplicated completion bars, `[Shared: +N]` popovers, and inline add |
-| [ ] | **Phase 7** | Features-Only Blocking Engine & Transitive Propagation | Phase 6 | Add/remove Feature blockers, enforce DAG acyclicity (`INV-05`), see Direct/Inherited/Partial badges & warnings |
+| [x] | **Phase 7** | Features-Only Blocking Engine & Transitive Propagation | Phase 6 | Add/remove Feature blockers, enforce DAG acyclicity (`INV-05`), see Direct/Inherited/Partial badges & warnings |
 | [ ] | **Phase 8** | Strictly Guarded Feature ↔ Work Item Conversion | Phase 7 | Lossless bidirectional conversion preserving `PRO-N`, with live strict-guard tooltips when blocked |
 | [ ] | **Phase 9** | Filtered Virtualized Table / List View | Phase 8 | Deduplicated `DataTable` with multi-facet filter bar (`Ready` vs `Blocked`, Priority, Assignee, Tags) & sorting |
 | [ ] | **Phase 10** | Full-Cascade Trash, Restore & Permanent Purge | Phase 8 | Safe cascade deletion of Feature subtrees sparing shared Work Items, plus Trash View & Restore |

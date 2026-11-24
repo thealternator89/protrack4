@@ -1,3 +1,4 @@
+pub mod blocker_commands;
 pub mod item_commands;
 pub mod meta_commands;
 
@@ -5,6 +6,7 @@ use rusqlite::Transaction;
 
 use crate::domain::{AssigneeId, DomainError, DomainEvent, ItemId, ProjectId, TagId};
 
+pub use blocker_commands::{AddBlocker, RemoveBlocker};
 pub use item_commands::{
     AttachWorkItemToFeature, CreateFeature, CreateWorkItem, DetachWorkItemFromFeature,
     ReparentFeature, ReorderSiblingFeatures, SetItemTags, SetWorkItemFeatures, UpdateItemFields,
@@ -23,6 +25,7 @@ pub struct CommandEffect {
     pub created_tag_id: Option<TagId>,
     pub selected_item_id: Option<ItemId>,
     pub toast: Option<String>,
+    pub warning_toast: Option<String>,
 }
 
 /// Reversible database mutation executed inside a single `BEGIN IMMEDIATE` transaction.
@@ -437,5 +440,123 @@ mod tests {
         let snap_a_after = load_project_snapshot(&conn, pid_a).unwrap();
         assert!(snap_a_after.tags.is_empty());
         assert!(snap_a_after.tags_for_item(wi_a).is_empty());
+    }
+
+    #[test]
+    fn blocker_commands_and_soft_warning_on_in_progress() {
+        use crate::db::load_project_snapshot;
+        use crate::domain::EffectiveBlockState;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "BlockerCmdTest").unwrap();
+
+        let pid = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cp = CreateProject::new("Deps", "DEP", "", "#6366F1", ProjectStatus::Active);
+            let pid = cp.execute(&tx).unwrap().created_project_id.unwrap();
+            tx.commit().unwrap();
+            pid
+        };
+
+        let (f_a, f_b, wi_a) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut ca =
+                CreateFeature::new(pid, None, "Feature A", "", ItemStatus::Todo, Priority::High);
+            let mut cb = CreateFeature::new(
+                pid,
+                None,
+                "Blocker B",
+                "",
+                ItemStatus::Todo,
+                Priority::Medium,
+            );
+            let a = ca.execute(&tx).unwrap().created_item_id.unwrap();
+            let b = cb.execute(&tx).unwrap().created_item_id.unwrap();
+            let mut cwi =
+                CreateWorkItem::new(pid, "Child WI", "", ItemStatus::Todo, Priority::Low, vec![a]);
+            let wi = cwi.execute(&tx).unwrap().created_item_id.unwrap();
+            tx.commit().unwrap();
+            (a, b, wi)
+        };
+
+        // AddBlocker(A, B)
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut add = AddBlocker::new(f_a, f_b);
+            let eff = add.execute(&tx).unwrap();
+            assert_eq!(
+                eff.events,
+                vec![DomainEvent::ItemsChanged { project_id: pid }]
+            );
+            assert!(eff.toast.as_deref().unwrap().contains("DEP-1"));
+            assert!(eff.toast.as_deref().unwrap().contains("DEP-2"));
+            tx.commit().unwrap();
+        }
+
+        // Moving inherited-blocked Work Item to InProgress succeeds (soft blocking) and emits warning_toast
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut start_wi = UpdateItemFields {
+                item_id: wi_a,
+                title: None,
+                description: None,
+                status: Some(ItemStatus::InProgress),
+                priority: None,
+                assignee_id: None,
+            };
+            let eff = start_wi.execute(&tx).unwrap();
+            assert_eq!(
+                eff.warning_toast.as_deref(),
+                Some("Warning: DEP-3 is currently blocked by DEP-2")
+            );
+            tx.commit().unwrap();
+        }
+        assert_eq!(get_item(&conn, wi_a).unwrap().status, ItemStatus::InProgress);
+
+        // Moving unblocked Feature B to InProgress emits no warning_toast
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut start_b = UpdateItemFields {
+                item_id: f_b,
+                title: None,
+                description: None,
+                status: Some(ItemStatus::InProgress),
+                priority: None,
+                assignee_id: None,
+            };
+            let eff = start_b.execute(&tx).unwrap();
+            assert_eq!(eff.warning_toast, None);
+            tx.commit().unwrap();
+        }
+
+        // RemoveBlocker(A, B) clears block
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut rem = RemoveBlocker::new(f_a, f_b);
+            let eff = rem.execute(&tx).unwrap();
+            assert!(eff.toast.as_deref().unwrap().contains("Removed blocker"));
+            tx.commit().unwrap();
+        }
+        let snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(
+            snap.effective_block_state(f_a),
+            EffectiveBlockState::Unblocked
+        );
+        assert_eq!(
+            snap.effective_block_state(wi_a),
+            EffectiveBlockState::Unblocked
+        );
     }
 }
