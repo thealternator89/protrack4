@@ -12,7 +12,9 @@ pub use blocker_commands::{AddBlocker, RemoveBlocker};
 pub use conversion_commands::{ConvertFeatureToWorkItem, ConvertWorkItemToFeature};
 pub use item_commands::{
     AttachWorkItemToFeature, CreateFeature, CreateWorkItem, DetachWorkItemFromFeature,
-    ReparentFeature, ReorderSiblingFeatures, SetItemTags, SetWorkItemFeatures, UpdateItemFields,
+    MoveWorkItemBetweenFeatures, ReorderFeatureWorkItems, ReorderSiblingFeatures,
+    ReorderUnallocatedWorkItems, ReparentFeature, SetItemTags, SetWorkItemFeatures,
+    UpdateItemFields,
 };
 pub use meta_commands::{
     ArchiveAssignee, CreateProject, DeleteTag, UpdateProject, UpsertAssignee, UpsertTag,
@@ -733,5 +735,113 @@ mod tests {
             tx.commit().unwrap();
         }
         assert!(load_project_snapshot(&conn, pid).unwrap().active_items().is_empty());
+    }
+
+    #[test]
+    fn dnd_commands_and_quick_add_assignee_tags_execute_atomically() {
+        use crate::db::load_project_snapshot;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "Phase11CmdTest").unwrap();
+
+        let (pid, assignee_id, tag_id) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cp = CreateProject::new("Quick", "QCK", "", "#6366F1", ProjectStatus::Active);
+            let pid = cp.execute(&tx).unwrap().created_project_id.unwrap();
+            let mut ca = UpsertAssignee::create("Mark", "MB", "#6366F1", None, "");
+            let aid = ca.execute(&tx).unwrap().created_assignee_id.unwrap();
+            let mut ct = UpsertTag::create(pid, "urgent-fix", "#EF4444");
+            let tid = ct.execute(&tx).unwrap().created_tag_id.unwrap();
+            tx.commit().unwrap();
+            (pid, aid, tid)
+        };
+
+        let (f1, f2, wi1, wi2, u1, u2) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let f1 = CreateFeature::new(pid, None, "Feat 1", "", ItemStatus::Todo, Priority::High)
+                .with_assignee(Some(assignee_id))
+                .with_tags(vec![tag_id])
+                .execute(&tx)
+                .unwrap()
+                .created_item_id
+                .unwrap();
+            let f2 = CreateFeature::new(pid, None, "Feat 2", "", ItemStatus::Todo, Priority::Low)
+                .execute(&tx)
+                .unwrap()
+                .created_item_id
+                .unwrap();
+            let wi1 = CreateWorkItem::new(
+                pid,
+                "WI 1",
+                "Body",
+                ItemStatus::InProgress,
+                Priority::Urgent,
+                vec![f1],
+            )
+            .with_assignee(Some(assignee_id))
+            .with_tags(vec![tag_id])
+            .execute(&tx)
+            .unwrap()
+            .created_item_id
+            .unwrap();
+            let wi2 = CreateWorkItem::new(pid, "WI 2", "", ItemStatus::Todo, Priority::None, vec![f1])
+                .execute(&tx)
+                .unwrap()
+                .created_item_id
+                .unwrap();
+            let u1 = CreateWorkItem::new(pid, "U1", "", ItemStatus::Todo, Priority::None, vec![])
+                .execute(&tx)
+                .unwrap()
+                .created_item_id
+                .unwrap();
+            let u2 = CreateWorkItem::new(pid, "U2", "", ItemStatus::Todo, Priority::None, vec![])
+                .execute(&tx)
+                .unwrap()
+                .created_item_id
+                .unwrap();
+            tx.commit().unwrap();
+            (f1, f2, wi1, wi2, u1, u2)
+        };
+
+        let snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap.item(f1).unwrap().assignee_id, Some(assignee_id));
+        assert_eq!(snap.tags_for_item(f1).len(), 1);
+        assert_eq!(snap.item(wi1).unwrap().assignee_id, Some(assignee_id));
+        assert_eq!(snap.tags_for_item(wi1).len(), 1);
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            ReorderFeatureWorkItems::new(pid, f1, wi2, None, Some(wi1))
+                .execute(&tx)
+                .unwrap();
+            ReorderUnallocatedWorkItems::new(pid, u2, None, Some(u1))
+                .execute(&tx)
+                .unwrap();
+            let mv_eff = MoveWorkItemBetweenFeatures::new(wi1, f1, f2)
+                .execute(&tx)
+                .unwrap();
+            assert!(mv_eff.toast.unwrap().contains("Moved QCK-3 from QCK-1 to QCK-2"));
+            tx.commit().unwrap();
+        }
+
+        let snap2 = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(
+            snap2.work_items_for_feature(f1).into_iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![wi2]
+        );
+        assert_eq!(
+            snap2.work_items_for_feature(f2).into_iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![wi1]
+        );
+        assert_eq!(
+            snap2.unallocated_work_items().into_iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![u2, u1]
+        );
     }
 }

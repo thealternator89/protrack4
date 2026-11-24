@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -20,13 +20,18 @@ use gpui_kit::{
 
 use crate::commands::{
     ConvertFeatureToWorkItem, ConvertWorkItemToFeature, CreateFeature, CreateWorkItem,
-    DetachWorkItemFromFeature, TrashItemSubtree, UndoableCommand, UpdateItemFields,
+    DetachWorkItemFromFeature, ReorderFeatureWorkItems, ReorderSiblingFeatures, TrashItemSubtree,
+    UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
     ConversionEligibility, FeatureProgress, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH,
     Priority, ProjectSnapshot, clamped_depth_badge, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
+use crate::ui::dnd::{
+    DragPayload, DropEvaluation, dispatch_dnd_command, evaluate_feature_drop, handle_feature_drop,
+    is_valid_feature_sibling_gap, is_valid_feature_wi_gap, make_drag_ghost, render_drop_gap,
+};
 use crate::ui::modals::open_create_feature_modal;
 use crate::ui::{
     assignee_pill, block_state_badge, blocker_warning_pill, domain_tag_chip, parse_hex_or,
@@ -1020,9 +1025,20 @@ impl OutlineView {
 
         let item_clone = feature.clone();
         let snapshot_clone = snapshot.clone();
+        let snapshot_for_over = snapshot.clone();
         let app_state = self.app_state.clone();
+        let app_for_drop = self.app_state.clone();
         let store_for_menu = self.store.clone();
+        let store_for_drop = self.store.clone();
         let view_entity = cx.entity();
+
+        let drag_payload = DragPayload::Feature {
+            project_id: feature.project_id,
+            feature_id: feat_id,
+            parent_feature_id: feature.parent_feature_id,
+            item_key: feature.item_key.clone(),
+            title: feature.title.clone(),
+        };
 
         h_flex()
             .id(("outline-feature", feat_num))
@@ -1048,6 +1064,48 @@ impl OutlineView {
             .cursor_pointer()
             .when(!is_selected, |this| {
                 this.hover(|s| s.bg(cx.theme().list_hover))
+            })
+            .on_drag(drag_payload, make_drag_ghost)
+            .drag_over::<DragPayload>(move |style, payload, window, cx| {
+                let alt_held = window.modifiers().alt;
+                match evaluate_feature_drop(&snapshot_for_over, payload, feat_id, alt_held) {
+                    DropEvaluation::Valid => {
+                        let accent = if alt_held
+                            && matches!(
+                                payload,
+                                DragPayload::WorkItem {
+                                    source_feature_id: Some(_),
+                                    ..
+                                }
+                            ) {
+                            cx.theme().info
+                        } else {
+                            cx.theme().primary
+                        };
+                        style
+                            .bg(accent.opacity(if cx.theme().is_dark() { 0.22 } else { 0.14 }))
+                            .border_color(accent)
+                    }
+                    DropEvaluation::Invalid(_) => {
+                        let danger = cx.theme().danger;
+                        style
+                            .bg(danger.opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 }))
+                            .border_color(danger)
+                    }
+                    DropEvaluation::NoOp => style,
+                }
+            })
+            .on_drop::<DragPayload>(move |payload, window, cx| {
+                let alt_held = window.modifiers().alt;
+                handle_feature_drop(
+                    &app_for_drop,
+                    &store_for_drop,
+                    payload,
+                    feat_id,
+                    alt_held,
+                    window,
+                    cx,
+                );
             })
             .on_click({
                 let store = self.store.clone();
@@ -1243,6 +1301,14 @@ impl OutlineView {
         let store_for_menu = self.store.clone();
         let view_for_menu = cx.entity();
 
+        let drag_payload = DragPayload::WorkItem {
+            project_id: wi.project_id,
+            work_item_id: wi_id,
+            source_feature_id: Some(parent_feature_id),
+            item_key: wi.item_key.clone(),
+            title: wi.title.clone(),
+        };
+
         h_flex()
             .id(("outline-wi", row_key))
             .test_support()
@@ -1268,6 +1334,7 @@ impl OutlineView {
             .when(!is_selected, |this| {
                 this.hover(|s| s.bg(cx.theme().list_hover))
             })
+            .on_drag(drag_payload, make_drag_ghost)
             .on_click({
                 let store = self.store.clone();
                 move |_, _, cx| {
@@ -1747,12 +1814,16 @@ impl Render for OutlineView {
                 .flex_1()
                 .min_h_0()
                 .p_3()
-                .gap_0p5()
+                .gap_0()
                 .overflow_y_scrollbar()
                 .id("center-outline-scroll");
 
-            for row in rows {
-                match row {
+            let project_id = snapshot.project.id;
+            let mut last_visible_child_feature: HashMap<Option<ItemId>, (ItemId, usize)> =
+                HashMap::new();
+
+            for idx in 0..rows.len() {
+                match rows[idx] {
                     OutlineRow::Feature {
                         feature_id,
                         depth,
@@ -1763,6 +1834,49 @@ impl Render for OutlineView {
                         let Some(feature) = snapshot.item(feature_id) else {
                             continue;
                         };
+                        let feat_num = feature.item_number as usize;
+                        let parent_id = feature.parent_feature_id;
+                        let siblings = snapshot.child_features(parent_id);
+                        let prev_sib_id = siblings
+                            .iter()
+                            .position(|s| s.id == feature_id)
+                            .and_then(|pos| pos.checked_sub(1).map(|p| siblings[p].id));
+
+                        let app_before = self.app_state.clone();
+                        list = list.child(render_drop_gap(
+                            ("outline-feature-gap-before", feat_num),
+                            10.0 + visual_indent_px(depth),
+                            move |payload| {
+                                is_valid_feature_sibling_gap(
+                                    payload,
+                                    project_id,
+                                    parent_id,
+                                    prev_sib_id,
+                                    Some(feature_id),
+                                )
+                            },
+                            move |payload, window, cx| {
+                                if let DragPayload::Feature {
+                                    feature_id: moving_id,
+                                    ..
+                                } = payload
+                                {
+                                    dispatch_dnd_command(
+                                        app_before.clone(),
+                                        Box::new(ReorderSiblingFeatures::new(
+                                            project_id,
+                                            *moving_id,
+                                            prev_sib_id,
+                                            Some(feature_id),
+                                        )),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        ));
+                        last_visible_child_feature.insert(parent_id, (feature_id, feat_num));
+
                         let is_selected = selected_item_id == Some(feature_id);
                         list = list.child(self.render_feature_row(
                             &snapshot,
@@ -1779,7 +1893,7 @@ impl Render for OutlineView {
                         work_item_id,
                         parent_feature_id,
                         depth,
-                        shared_feature_ids,
+                        ref shared_feature_ids,
                     } => {
                         let Some(wi) = snapshot.item(work_item_id) else {
                             continue;
@@ -1787,6 +1901,49 @@ impl Render for OutlineView {
                         let Some(parent_feature) = snapshot.item(parent_feature_id) else {
                             continue;
                         };
+                        let row_key = (parent_feature.item_number as usize) * 100_000
+                            + (wi.item_number as usize);
+                        let wis = snapshot.work_items_for_feature(parent_feature_id);
+                        let prev_wi_id = wis
+                            .iter()
+                            .position(|w| w.id == work_item_id)
+                            .and_then(|pos| pos.checked_sub(1).map(|p| wis[p].id));
+
+                        let app_wi_before = self.app_state.clone();
+                        list = list.child(render_drop_gap(
+                            ("outline-wi-gap-before", row_key),
+                            10.0 + visual_indent_px(depth),
+                            move |payload| {
+                                is_valid_feature_wi_gap(
+                                    payload,
+                                    project_id,
+                                    parent_feature_id,
+                                    prev_wi_id,
+                                    Some(work_item_id),
+                                )
+                            },
+                            move |payload, window, cx| {
+                                if let DragPayload::WorkItem {
+                                    work_item_id: moving_wi,
+                                    ..
+                                } = payload
+                                {
+                                    dispatch_dnd_command(
+                                        app_wi_before.clone(),
+                                        Box::new(ReorderFeatureWorkItems::new(
+                                            project_id,
+                                            parent_feature_id,
+                                            *moving_wi,
+                                            prev_wi_id,
+                                            Some(work_item_id),
+                                        )),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        ));
+
                         let parent_actual_depth = snapshot.feature_depth(parent_feature_id);
                         let is_selected = selected_item_id == Some(work_item_id);
                         list = list.child(self.render_work_item_row(
@@ -1795,16 +1952,98 @@ impl Render for OutlineView {
                             parent_feature,
                             parent_actual_depth,
                             depth,
-                            &shared_feature_ids,
+                            shared_feature_ids,
                             is_selected,
                             cx,
                         ));
+
+                        let next_is_same_parent_wi = matches!(
+                            rows.get(idx + 1),
+                            Some(OutlineRow::WorkItem {
+                                parent_feature_id: next_pfid,
+                                ..
+                            }) if *next_pfid == parent_feature_id
+                        );
+                        if !next_is_same_parent_wi {
+                            let app_wi_after = self.app_state.clone();
+                            list = list.child(render_drop_gap(
+                                ("outline-wi-gap-after", row_key),
+                                10.0 + visual_indent_px(depth),
+                                move |payload| {
+                                    is_valid_feature_wi_gap(
+                                        payload,
+                                        project_id,
+                                        parent_feature_id,
+                                        Some(work_item_id),
+                                        None,
+                                    )
+                                },
+                                move |payload, window, cx| {
+                                    if let DragPayload::WorkItem {
+                                        work_item_id: moving_wi,
+                                        ..
+                                    } = payload
+                                    {
+                                        dispatch_dnd_command(
+                                            app_wi_after.clone(),
+                                            Box::new(ReorderFeatureWorkItems::new(
+                                                project_id,
+                                                parent_feature_id,
+                                                *moving_wi,
+                                                Some(work_item_id),
+                                                None,
+                                            )),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                },
+                            ));
+                        }
                     }
                     OutlineRow::InlineAdd {
                         feature_id,
                         parent_actual_depth,
                         depth,
                     } => {
+                        if let Some((last_child_id, last_child_num)) =
+                            last_visible_child_feature.get(&Some(feature_id)).copied()
+                        {
+                            let app_child_after = self.app_state.clone();
+                            list = list.child(render_drop_gap(
+                                ("outline-feature-gap-after", last_child_num),
+                                10.0 + visual_indent_px(depth),
+                                move |payload| {
+                                    is_valid_feature_sibling_gap(
+                                        payload,
+                                        project_id,
+                                        Some(feature_id),
+                                        Some(last_child_id),
+                                        None,
+                                    )
+                                },
+                                move |payload, window, cx| {
+                                    if let DragPayload::Feature {
+                                        feature_id: moving_id,
+                                        ..
+                                    } = payload
+                                    {
+                                        dispatch_dnd_command(
+                                            app_child_after.clone(),
+                                            Box::new(ReorderSiblingFeatures::new(
+                                                project_id,
+                                                *moving_id,
+                                                Some(last_child_id),
+                                                None,
+                                            )),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                },
+                            ));
+                        }
+
                         let Some(feature) = snapshot.item(feature_id) else {
                             continue;
                         };
@@ -1816,6 +2055,45 @@ impl Render for OutlineView {
                         ));
                     }
                 }
+            }
+
+            if self.scope == OutlineScope::AllFeatures
+                && let Some((last_root_id, last_root_num)) =
+                    last_visible_child_feature.get(&None).copied()
+            {
+                let app_root_after = self.app_state.clone();
+                list = list.child(render_drop_gap(
+                    ("outline-feature-gap-after", last_root_num),
+                    10.0,
+                    move |payload| {
+                        is_valid_feature_sibling_gap(
+                            payload,
+                            project_id,
+                            None,
+                            Some(last_root_id),
+                            None,
+                        )
+                    },
+                    move |payload, window, cx| {
+                        if let DragPayload::Feature {
+                            feature_id: moving_id,
+                            ..
+                        } = payload
+                        {
+                            dispatch_dnd_command(
+                                app_root_after.clone(),
+                                Box::new(ReorderSiblingFeatures::new(
+                                    project_id,
+                                    *moving_id,
+                                    Some(last_root_id),
+                                    None,
+                                )),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                ));
             }
 
             list.into_any_element()

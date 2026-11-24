@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -6,15 +8,21 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    App, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+    AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
 
+use crate::commands::ReorderSiblingFeatures;
 use crate::domain::{
-    EffectiveBlockState, MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px,
+    EffectiveBlockState, ItemId, MAX_FEATURE_DEPTH, clamped_depth_badge, visual_indent_px,
 };
 use crate::state::{AppState, CenterViewTab, ProjectStore};
+use crate::ui::dnd::{
+    DragPayload, DropEvaluation, dispatch_dnd_command, evaluate_feature_drop, evaluate_root_drop,
+    evaluate_unallocated_drop, handle_feature_drop, handle_root_drop, handle_unallocated_drop,
+    is_valid_feature_sibling_gap, make_drag_ghost, render_drop_gap,
+};
 use crate::ui::modals::{
     open_assignees_manager_modal, open_create_feature_modal, open_project_settings_modal,
     open_tags_manager_modal,
@@ -198,7 +206,10 @@ pub fn render_sidebar(
         .child(project_header)
         // Pinned Unallocated row
         .child(
-            div().px_2().pt_2().pb_1().child(
+            div().px_2().pt_2().pb_1().child({
+                let snap_for_unalloc_over = snapshot.cloned();
+                let app_for_unalloc_drop = app_state.clone();
+                let store_for_unalloc_drop = store.clone();
                 h_flex()
                     .id("sidebar-unallocated-row")
                     .test_support()
@@ -208,6 +219,8 @@ pub fn render_sidebar(
                     .gap_2()
                     .items_center()
                     .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().transparent)
                     .cursor_pointer()
                     .when(active_tab == CenterViewTab::Unallocated, |this| {
                         this.bg(cx.theme().sidebar_accent)
@@ -215,6 +228,27 @@ pub fn render_sidebar(
                     })
                     .when(active_tab != CenterViewTab::Unallocated, |this| {
                         this.hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                    })
+                    .drag_over::<DragPayload>(move |style, payload, _, cx| {
+                        if let Some(snap) = snap_for_unalloc_over.as_ref()
+                            && evaluate_unallocated_drop(snap, payload) == DropEvaluation::Valid
+                        {
+                            let warn = cx.theme().warning;
+                            style
+                                .bg(warn.opacity(if cx.theme().is_dark() { 0.22 } else { 0.14 }))
+                                .border_color(warn)
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop::<DragPayload>(move |payload, window, cx| {
+                        handle_unallocated_drop(
+                            &app_for_unalloc_drop,
+                            &store_for_unalloc_drop,
+                            payload,
+                            window,
+                            cx,
+                        );
                     })
                     .on_click({
                         let store = store.clone();
@@ -253,17 +287,41 @@ pub fn render_sidebar(
                                     .text_color(cx.theme().muted_foreground)
                             })
                             .child(unallocated_count.to_string()),
-                    ),
-            ),
+                    )
+            }),
         )
-        // FEATURES header
-        .child(
+        // FEATURES header (also acts as Root Drop Zone to promote nested Features to root)
+        .child({
+            let snap_for_root_over = snapshot.cloned();
+            let app_for_root_drop = app_state.clone();
+            let store_for_root_drop = store.clone();
             h_flex()
-                .px_3()
-                .pt_2()
+                .id("sidebar-root-drop-zone")
+                .test_support()
+                .mx_1p5()
+                .px_1p5()
+                .pt_1p5()
                 .pb_1()
                 .items_center()
                 .justify_between()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().transparent)
+                .drag_over::<DragPayload>(move |style, payload, _, cx| {
+                    if let Some(snap) = snap_for_root_over.as_ref()
+                        && evaluate_root_drop(snap, payload) == DropEvaluation::Valid
+                    {
+                        let primary = cx.theme().primary;
+                        style
+                            .bg(primary.opacity(if cx.theme().is_dark() { 0.22 } else { 0.14 }))
+                            .border_color(primary)
+                    } else {
+                        style
+                    }
+                })
+                .on_drop::<DragPayload>(move |payload, window, cx| {
+                    handle_root_drop(&app_for_root_drop, &store_for_root_drop, payload, window, cx);
+                })
                 .child(
                     div()
                         .text_size(px(10.))
@@ -324,8 +382,8 @@ pub fn render_sidebar(
                                     }
                                 }),
                         ),
-                ),
-        )
+                )
+        })
         // Nested Feature tree
         .child(if let Some(snap) = snapshot {
             if tree_rows.is_empty() {
@@ -364,144 +422,242 @@ pub fn render_sidebar(
                     )
                     .into_any_element()
             } else {
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .px_1p5()
-                    .pb_2()
-                    .gap_0p5()
-                    .overflow_y_scrollbar()
-                    .id("sidebar-feature-tree")
-                    .children(tree_rows.into_iter().filter_map(|row| {
-                        let item = snap.item(row.item_id)?;
-                        let is_selected = selected_item_id == Some(row.item_id);
-                        let (done, total) = snap.feature_progress(row.item_id);
-                        let depth_badge = clamped_depth_badge(row.depth);
-                        let indent = visual_indent_px(row.depth);
-                        let item_id = row.item_id;
-                        let project_id = item.project_id;
-                        let parent_label = format!("{} {}", item.item_key, item.title);
-                        let at_max_depth = row.depth + 1 >= MAX_FEATURE_DEPTH;
-                        let s_color = status_color(item.status, cx);
-                        let block_state = snap.effective_block_state(row.item_id);
-                        let block_dot_color = match block_state {
-                            EffectiveBlockState::DirectlyBlocked { .. } => Some(cx.theme().danger),
-                            EffectiveBlockState::InheritedBlocked { .. } => {
-                                Some(cx.theme().warning)
-                            }
-                            EffectiveBlockState::Unblocked
-                            | EffectiveBlockState::PartiallyBlocked { .. } => None,
-                        };
+                let mut tree_elements: Vec<AnyElement> = Vec::with_capacity(tree_rows.len() * 2);
+                let mut open_last_by_depth: HashMap<usize, (ItemId, Option<ItemId>, usize)> =
+                    HashMap::new();
+                let mut prev_by_depth: HashMap<usize, (Option<ItemId>, ItemId)> = HashMap::new();
 
-                        Some(
-                            h_flex()
-                                .id(("sidebar-feature", item.item_number as usize))
-                                .w_full()
-                                .pl(px(6.0 + indent))
-                                .pr_1p5()
-                                .py_1()
-                                .gap_1()
-                                .items_center()
-                                .rounded(cx.theme().radius)
-                                .cursor_pointer()
-                                .when(is_selected, |this| {
-                                    this.bg(cx.theme().sidebar_accent)
-                                        .text_color(cx.theme().sidebar_accent_foreground)
-                                })
-                                .when(!is_selected, |this| {
-                                    this.hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
-                                })
-                                .on_click({
-                                    let store = store.clone();
-                                    move |_, _, cx| {
-                                        store.update(cx, |s, cx| {
-                                            s.select_item(Some(item_id));
-                                            if s.active_tab() == CenterViewTab::Trash {
-                                                s.set_active_tab(CenterViewTab::Outline);
-                                            }
-                                            cx.notify();
-                                        });
+                for (idx, row) in tree_rows.iter().enumerate() {
+                    let Some(item) = snap.item(row.item_id) else {
+                        continue;
+                    };
+                    let is_selected = selected_item_id == Some(row.item_id);
+                    let (done, total) = snap.feature_progress(row.item_id);
+                    let depth_badge = clamped_depth_badge(row.depth);
+                    let indent = visual_indent_px(row.depth);
+                    let item_id = row.item_id;
+                    let item_num = item.item_number as usize;
+                    let project_id = item.project_id;
+                    let parent_feature_id = item.parent_feature_id;
+                    let parent_label = format!("{} {}", item.item_key, item.title);
+                    let at_max_depth = row.depth + 1 >= MAX_FEATURE_DEPTH;
+                    let s_color = status_color(item.status, cx);
+                    let block_state = snap.effective_block_state(row.item_id);
+                    let block_dot_color = match block_state {
+                        EffectiveBlockState::DirectlyBlocked { .. } => Some(cx.theme().danger),
+                        EffectiveBlockState::InheritedBlocked { .. } => Some(cx.theme().warning),
+                        EffectiveBlockState::Unblocked
+                        | EffectiveBlockState::PartiallyBlocked { .. } => None,
+                    };
+
+                    let prev_sib_id = prev_by_depth
+                        .get(&row.depth)
+                        .filter(|(p, _)| *p == parent_feature_id)
+                        .map(|(_, prev_id)| *prev_id);
+
+                    let app_gap_before = app_state.clone();
+                    tree_elements.push(render_drop_gap(
+                        ("sidebar-feature-gap-before", item_num),
+                        6.0 + indent,
+                        move |payload| {
+                            is_valid_feature_sibling_gap(
+                                payload,
+                                project_id,
+                                parent_feature_id,
+                                prev_sib_id,
+                                Some(item_id),
+                            )
+                        },
+                        move |payload, window, cx| {
+                            if let DragPayload::Feature { feature_id, .. } = payload {
+                                dispatch_dnd_command(
+                                    app_gap_before.clone(),
+                                    Box::new(ReorderSiblingFeatures::new(
+                                        project_id,
+                                        *feature_id,
+                                        prev_sib_id,
+                                        Some(item_id),
+                                    )),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        },
+                    ));
+
+                    prev_by_depth.insert(row.depth, (parent_feature_id, item_id));
+                    open_last_by_depth.insert(row.depth, (item_id, parent_feature_id, item_num));
+
+                    let drag_payload = DragPayload::Feature {
+                        project_id,
+                        feature_id: item_id,
+                        parent_feature_id,
+                        item_key: item.item_key.clone(),
+                        title: item.title.clone(),
+                    };
+                    let snap_for_over = snap.clone();
+                    let app_for_drop = app_state.clone();
+                    let store_for_drop = store.clone();
+
+                    tree_elements.push(
+                        h_flex()
+                            .id(("sidebar-feature", item_num))
+                            .test_support()
+                            .w_full()
+                            .pl(px(6.0 + indent))
+                            .pr_1p5()
+                            .py_1()
+                            .gap_1()
+                            .items_center()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(cx.theme().transparent)
+                            .cursor_pointer()
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().sidebar_accent)
+                                    .text_color(cx.theme().sidebar_accent_foreground)
+                            })
+                            .when(!is_selected, |this| {
+                                this.hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                            })
+                            .on_drag(drag_payload, make_drag_ghost)
+                            .drag_over::<DragPayload>(move |style, payload, window, cx| {
+                                let alt_held = window.modifiers().alt;
+                                match evaluate_feature_drop(&snap_for_over, payload, item_id, alt_held) {
+                                    DropEvaluation::Valid => {
+                                        let accent = if alt_held
+                                            && matches!(
+                                                payload,
+                                                DragPayload::WorkItem {
+                                                    source_feature_id: Some(_),
+                                                    ..
+                                                }
+                                            ) {
+                                            cx.theme().info
+                                        } else {
+                                            cx.theme().primary
+                                        };
+                                        style
+                                            .bg(accent.opacity(if cx.theme().is_dark() {
+                                                0.22
+                                            } else {
+                                                0.14
+                                            }))
+                                            .border_color(accent)
                                     }
-                                })
-                                .child(if row.has_children {
-                                    let chevron = if row.is_expanded {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    };
-                                    div()
-                                        .id(("sidebar-chevron", item.item_number as usize))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size(px(16.))
-                                        .flex_shrink_0()
-                                        .rounded(px(4.))
-                                        .hover(|s| s.bg(cx.theme().muted))
-                                        .on_click({
-                                            let store = store.clone();
-                                            move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                store.update(cx, |s, cx| {
-                                                    s.toggle_feature_expanded(item_id);
-                                                    cx.notify();
-                                                });
-                                            }
-                                        })
-                                        .child(
-                                            Icon::new(chevron)
-                                                .xsmall()
-                                                .text_color(cx.theme().muted_foreground),
-                                        )
-                                        .into_any_element()
+                                    DropEvaluation::Invalid(_) => {
+                                        let danger = cx.theme().danger;
+                                        style
+                                            .bg(danger.opacity(if cx.theme().is_dark() {
+                                                0.20
+                                            } else {
+                                                0.12
+                                            }))
+                                            .border_color(danger)
+                                    }
+                                    DropEvaluation::NoOp => style,
+                                }
+                            })
+                            .on_drop::<DragPayload>(move |payload, window, cx| {
+                                let alt_held = window.modifiers().alt;
+                                handle_feature_drop(
+                                    &app_for_drop,
+                                    &store_for_drop,
+                                    payload,
+                                    item_id,
+                                    alt_held,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .on_click({
+                                let store = store.clone();
+                                move |_, _, cx| {
+                                    store.update(cx, |s, cx| {
+                                        s.select_item(Some(item_id));
+                                        if s.active_tab() == CenterViewTab::Trash {
+                                            s.set_active_tab(CenterViewTab::Outline);
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .child(if row.has_children {
+                                let chevron = if row.is_expanded {
+                                    IconName::ChevronDown
                                 } else {
-                                    div().w(px(16.)).flex_shrink_0().into_any_element()
-                                })
-                                .child(
-                                    Icon::new(status_icon(item.status))
-                                        .xsmall()
-                                        .text_color(s_color),
-                                )
-                                .child(
+                                    IconName::ChevronRight
+                                };
+                                div()
+                                    .id(("sidebar-chevron", item_num))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(16.))
+                                    .flex_shrink_0()
+                                    .rounded(px(4.))
+                                    .hover(|s| s.bg(cx.theme().muted))
+                                    .on_click({
+                                        let store = store.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            store.update(cx, |s, cx| {
+                                                s.toggle_feature_expanded(item_id);
+                                                cx.notify();
+                                            });
+                                        }
+                                    })
+                                    .child(
+                                        Icon::new(chevron)
+                                            .xsmall()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div().w(px(16.)).flex_shrink_0().into_any_element()
+                            })
+                            .child(
+                                Icon::new(status_icon(item.status))
+                                    .xsmall()
+                                    .text_color(s_color),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .font_medium()
+                                    .child(item.title.clone()),
+                            )
+                            .when_some(depth_badge, |this, badge| {
+                                this.child(
                                     div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_xs()
-                                        .font_medium()
-                                        .child(item.title.clone()),
+                                        .px_1()
+                                        .rounded(px(3.))
+                                        .bg(cx.theme().muted)
+                                        .text_size(px(9.))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(badge),
                                 )
-                                .when_some(depth_badge, |this, badge| {
-                                    this.child(
-                                        div()
-                                            .px_1()
-                                            .rounded(px(3.))
-                                            .bg(cx.theme().muted)
-                                            .text_size(px(9.))
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(badge),
-                                    )
-                                })
-                                .when_some(block_dot_color, |this, dot_color| {
-                                    this.child(
-                                        div()
-                                            .id(("sidebar-block-dot", item.item_number as usize))
-                                            .test_support()
-                                            .size(px(7.))
-                                            .flex_shrink_0()
-                                            .rounded(px(999.))
-                                            .bg(dot_color),
-                                    )
-                                })
-                                .child(progress_pill(done, total, cx))
-                                .child(
-                                    Button::new((
-                                        "sidebar-add-subfeature",
-                                        item.item_number as usize,
-                                    ))
+                            })
+                            .when_some(block_dot_color, |this, dot_color| {
+                                this.child(
+                                    div()
+                                        .id(("sidebar-block-dot", item_num))
+                                        .test_support()
+                                        .size(px(7.))
+                                        .flex_shrink_0()
+                                        .rounded(px(999.))
+                                        .bg(dot_color),
+                                )
+                            })
+                            .child(progress_pill(done, total, cx))
+                            .child(
+                                Button::new(("sidebar-add-subfeature", item_num))
                                     .ghost()
                                     .xsmall()
                                     .compact()
@@ -527,9 +683,70 @@ pub fn render_sidebar(
                                             );
                                         }
                                     }),
-                                ),
-                        )
-                    }))
+                            )
+                            .into_any_element(),
+                    );
+
+                    let close_from_depth = if idx + 1 == tree_rows.len() {
+                        Some(0usize)
+                    } else {
+                        let next_depth = tree_rows[idx + 1].depth;
+                        if next_depth < row.depth {
+                            Some(next_depth + 1)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(min_close_depth) = close_from_depth {
+                        for d in (min_close_depth..=row.depth).rev() {
+                            if let Some((last_id, last_parent, last_num)) =
+                                open_last_by_depth.remove(&d)
+                            {
+                                prev_by_depth.remove(&d);
+                                let app_gap_after = app_state.clone();
+                                tree_elements.push(render_drop_gap(
+                                    ("sidebar-feature-gap-after", last_num),
+                                    6.0 + visual_indent_px(d),
+                                    move |payload| {
+                                        is_valid_feature_sibling_gap(
+                                            payload,
+                                            project_id,
+                                            last_parent,
+                                            Some(last_id),
+                                            None,
+                                        )
+                                    },
+                                    move |payload, window, cx| {
+                                        if let DragPayload::Feature { feature_id, .. } = payload {
+                                            dispatch_dnd_command(
+                                                app_gap_after.clone(),
+                                                Box::new(ReorderSiblingFeatures::new(
+                                                    project_id,
+                                                    *feature_id,
+                                                    Some(last_id),
+                                                    None,
+                                                )),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .px_1p5()
+                    .pb_2()
+                    .gap_0()
+                    .overflow_y_scrollbar()
+                    .id("sidebar-feature-tree")
+                    .children(tree_elements)
                     .into_any_element()
             }
         } else {

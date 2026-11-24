@@ -1119,6 +1119,26 @@ impl ProjectSnapshot {
         None
     }
 
+    /// Checks whether attaching `work_item_id` to `target_feature_id` violates `INV-05`.
+    pub fn attach_work_item_blocker_conflict(
+        &self,
+        work_item_id: ItemId,
+        target_feature_id: ItemId,
+    ) -> Option<&'static str> {
+        let mut target_and_ancestors = self.ancestor_feature_ids(target_feature_id);
+        target_and_ancestors.insert(target_feature_id);
+
+        for edge in &self.item_blockers {
+            if edge.project_id == self.project.id
+                && edge.blocked_item_id == work_item_id
+                && target_and_ancestors.contains(&edge.blocker_feature_id)
+            {
+                return Some("Work Item is blocked by target Feature or an ancestor");
+            }
+        }
+        None
+    }
+
     fn ancestor_feature_ids(&self, feature_id: ItemId) -> HashSet<ItemId> {
         let mut ancestors = HashSet::new();
         let mut visited = HashSet::from([feature_id]);

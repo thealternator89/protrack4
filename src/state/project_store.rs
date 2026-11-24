@@ -83,6 +83,7 @@ impl ThemePreference {
             Self::Light => Theme::change(ThemeMode::Light, window, cx),
             Self::Dark => Theme::change(ThemeMode::Dark, window, cx),
         }
+        Theme::global_mut(cx).notification.placement = gpui_kit::Anchor::BottomRight;
     }
 }
 

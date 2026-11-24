@@ -1,3 +1,4 @@
+pub mod dnd;
 pub mod inspector;
 pub mod modals;
 pub mod outline_view;
@@ -27,13 +28,25 @@ use crate::domain::{
 use crate::state::AppState;
 use crate::ui::modals::{open_new_project_modal, open_project_settings_modal};
 
-gpui_kit::actions!(protrack, [ToggleSidebar, ToggleInspector, OpenWorkspace, Quit]);
+gpui_kit::actions!(
+    protrack,
+    [
+        ToggleSidebar,
+        ToggleInspector,
+        OpenWorkspace,
+        OpenQuickSearch,
+        OpenQuickAdd,
+        Quit
+    ]
+);
 
 pub fn register_keybindings(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-i", ToggleInspector, None),
         KeyBinding::new("secondary-o", OpenWorkspace, None),
+        KeyBinding::new("secondary-k", OpenQuickSearch, None),
+        KeyBinding::new("secondary-n", OpenQuickAdd, None),
         KeyBinding::new("secondary-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());

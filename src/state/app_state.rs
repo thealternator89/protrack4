@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use gpui_kit::{AppContext as _, Context, Entity, Task};
 
 use crate::commands::{CommandEffect, UndoableCommand};
-use crate::db::{DbService, DomainEventReceiver};
-use crate::domain::{DomainError, DomainEvent, ProjectId};
-use crate::state::{ProjectStore, ThemePreference};
+use crate::db::{DbService, DomainEventReceiver, SearchResultItem};
+use crate::domain::{DomainError, DomainEvent, ItemId, ItemKind, ProjectId};
+use crate::state::{CenterViewTab, ProjectStore, ThemePreference};
 use crate::workspace::{
     AppPreferences, WorkspaceManager, default_preferences_path, normalize_protrack_path,
 };
@@ -221,6 +221,73 @@ impl AppState {
             .map_err(|_| {
                 DomainError::Storage("AppState dropped before project switch completed".into())
             })?;
+            Ok(())
+        })
+    }
+
+    pub fn search_items_fts(
+        &self,
+        query: String,
+        project_id: Option<ProjectId>,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<SearchResultItem>, DomainError>> {
+        let Some(handle) = self.workspace_manager.active() else {
+            return Task::ready(Ok(Vec::new()));
+        };
+        let db = handle.db.clone();
+        cx.spawn(async move |_, _| db.search_items_fts(query, project_id, limit).await)
+    }
+
+    pub fn jump_to_item(
+        &mut self,
+        project_id: ProjectId,
+        item_id: ItemId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), DomainError>> {
+        let current_project_id = self
+            .project_store
+            .read(cx)
+            .snapshot()
+            .map(|snap| snap.project.id);
+
+        if current_project_id == Some(project_id) {
+            self.project_store.update(cx, |store, cx| {
+                apply_jump_selection(store, item_id);
+                cx.notify();
+            });
+            return Task::ready(Ok(()));
+        }
+
+        let Some(handle) = self.workspace_manager.active() else {
+            return Task::ready(Err(DomainError::Validation(
+                "No workspace is currently open".to_string(),
+            )));
+        };
+        let db = handle.db.clone();
+        let active_path = handle.path.clone();
+
+        self.desired_project_id = Some(project_id);
+        self.preferences
+            .set_active_project_for(&active_path, project_id);
+        self.persist_preferences_if_allowed();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let overview = db.load_workspace_overview(Some(project_id)).await?;
+            this.update(cx, |app, cx| {
+                if app.desired_project_id == Some(project_id)
+                    && app.active_workspace_path() == Some(active_path.as_path())
+                {
+                    app.project_store.update(cx, |store, cx| {
+                        store.apply_workspace_overview(active_path, overview);
+                        apply_jump_selection(store, item_id);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+            })
+            .map_err(|_| DomainError::Storage("AppState dropped before jump completed".into()))?;
             Ok(())
         })
     }
@@ -625,4 +692,28 @@ impl AppState {
         cx.notify();
         res
     }
+}
+
+fn apply_jump_selection(store: &mut ProjectStore, item_id: ItemId) {
+    let is_unallocated_wi = store.snapshot().is_some_and(|snap| {
+        snap.item(item_id).is_some_and(|item| {
+            item.is_active()
+                && item.kind == ItemKind::WorkItem
+                && snap.features_for_work_item(item_id).is_empty()
+        })
+    });
+
+    if is_unallocated_wi {
+        store.set_active_tab(CenterViewTab::Unallocated);
+    } else {
+        store.set_active_tab(CenterViewTab::Outline);
+        store.expand_ancestors_of(item_id);
+        if store.snapshot().is_some_and(|snap| {
+            snap.item(item_id)
+                .is_some_and(|item| item.is_active() && item.kind == ItemKind::Feature)
+        }) {
+            store.expand_feature(item_id);
+        }
+    }
+    store.select_item(Some(item_id));
 }

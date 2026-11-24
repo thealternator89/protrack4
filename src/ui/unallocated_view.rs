@@ -13,14 +13,19 @@ use gpui_kit::component::{
 use gpui_kit::{
     Anchor, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Subscription, TestSupportExt as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::commands::{ConvertWorkItemToFeature, CreateWorkItem, SetWorkItemFeatures};
+use crate::commands::{
+    ConvertWorkItemToFeature, CreateWorkItem, ReorderUnallocatedWorkItems, SetWorkItemFeatures,
+};
 use crate::domain::{
     ItemId, ItemStatus, Priority, clamped_depth_badge, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
+use crate::ui::dnd::{
+    DragPayload, dispatch_dnd_command, is_valid_unallocated_gap, make_drag_ghost, render_drop_gap,
+};
 use crate::ui::{
     assignee_pill, domain_tag_chip, priority_badge, status_color, status_icon,
 };
@@ -303,26 +308,69 @@ impl Render for UnallocatedView {
                     )
                     .into_any_element()
             } else {
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_1p5()
-                    .overflow_y_scrollbar()
-                    .id("center-unallocated-scroll")
-                    .children(unallocated.into_iter().map(|wi| {
-                        let wi_id = wi.id;
-                        let wi_num = wi.item_number as usize;
-                        let is_selected = selected_item_id == Some(wi_id);
-                        let assignee = wi.assignee_id.and_then(|aid| snapshot.assignee(aid));
-                        let tags = snapshot.tags_for_item(wi_id);
-                        let picker_open = self.picker_item_id == Some(wi_id);
+                let project_id = snapshot.project.id;
+                let wi_ids: Vec<ItemId> = unallocated.iter().map(|wi| wi.id).collect();
+                let last_wi = unallocated.last().map(|wi| (wi.id, wi.item_number as usize));
+                let mut scroll_children = Vec::with_capacity(unallocated.len() * 2 + 1);
 
-                        let view_for_change = view_entity.clone();
-                        let view_for_content = view_entity.clone();
-                        let search_focus = search_focus.clone();
+                for (idx, wi) in unallocated.into_iter().enumerate() {
+                    let wi_id = wi.id;
+                    let wi_num = wi.item_number as usize;
+                    let prev_wi_id = idx.checked_sub(1).map(|p| wi_ids[p]);
+                    let app_gap_before = self.app_state.clone();
+                    scroll_children.push(render_drop_gap(
+                        ("unallocated-gap-before", wi_num),
+                        0.0,
+                        move |payload| {
+                            is_valid_unallocated_gap(
+                                payload,
+                                project_id,
+                                prev_wi_id,
+                                Some(wi_id),
+                            )
+                        },
+                        move |payload, window, cx| {
+                            if let DragPayload::WorkItem {
+                                work_item_id: moving_wi,
+                                ..
+                            } = payload
+                            {
+                                dispatch_dnd_command(
+                                    app_gap_before.clone(),
+                                    Box::new(ReorderUnallocatedWorkItems::new(
+                                        project_id,
+                                        *moving_wi,
+                                        prev_wi_id,
+                                        Some(wi_id),
+                                    )),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        },
+                    ));
 
+                    let is_selected = selected_item_id == Some(wi_id);
+                    let assignee = wi.assignee_id.and_then(|aid| snapshot.assignee(aid));
+                    let tags = snapshot.tags_for_item(wi_id);
+                    let picker_open = self.picker_item_id == Some(wi_id);
+
+                    let view_for_change = view_entity.clone();
+                    let view_for_content = view_entity.clone();
+                    let search_focus = search_focus.clone();
+
+                    let drag_payload = DragPayload::WorkItem {
+                        project_id,
+                        work_item_id: wi_id,
+                        source_feature_id: None,
+                        item_key: wi.item_key.clone(),
+                        title: wi.title.clone(),
+                    };
+
+                    scroll_children.push(
                         h_flex()
                             .id(("unallocated-row", wi_num))
+                            .test_support()
                             .w_full()
                             .px_3()
                             .py_2()
@@ -344,6 +392,7 @@ impl Render for UnallocatedView {
                             .when(!is_selected, |this| {
                                 this.hover(|s| s.bg(cx.theme().list_hover))
                             })
+                            .on_drag(drag_payload, make_drag_ghost)
                             .on_click({
                                 let store = self.store.clone();
                                 move |_, _, cx| {
@@ -724,7 +773,52 @@ impl Render for UnallocatedView {
                                             .detach();
                                     })
                             })
-                    }))
+                            .into_any_element(),
+                    );
+                }
+
+                if let Some((last_wi_id, last_wi_num)) = last_wi {
+                    let app_gap_after = self.app_state.clone();
+                    scroll_children.push(render_drop_gap(
+                        ("unallocated-gap-after", last_wi_num),
+                        0.0,
+                        move |payload| {
+                            is_valid_unallocated_gap(
+                                payload,
+                                project_id,
+                                Some(last_wi_id),
+                                None,
+                            )
+                        },
+                        move |payload, window, cx| {
+                            if let DragPayload::WorkItem {
+                                work_item_id: moving_wi,
+                                ..
+                            } = payload
+                            {
+                                dispatch_dnd_command(
+                                    app_gap_after.clone(),
+                                    Box::new(ReorderUnallocatedWorkItems::new(
+                                        project_id,
+                                        *moving_wi,
+                                        Some(last_wi_id),
+                                        None,
+                                    )),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        },
+                    ));
+                }
+
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_0()
+                    .overflow_y_scrollbar()
+                    .id("center-unallocated-scroll")
+                    .children(scroll_children)
                     .into_any_element()
             })
             .into_any_element()

@@ -19,6 +19,7 @@ use crate::domain::{
 
 pub use actor::{DbRequest, DbService, DomainEventReceiver};
 pub use assignee_repo::list_assignees;
+pub use item_repo::SearchResultItem;
 pub use migrations::{
     APP_MAX_SCHEMA_VERSION, checkpoint_and_switch_to_delete_mode, inspect_and_migrate,
     seed_sample_project,
@@ -2937,6 +2938,397 @@ mod tests {
         assert_eq!(list_trash_groups(&conn, pid_b).unwrap().len(), 1);
         assert!(!get_item(&conn, fb.id).unwrap().is_active());
         assert!(get_item(&conn, w1_shared.id).unwrap().is_active());
+    }
+
+    #[test]
+    fn fts5_search_ranks_exact_key_first_supports_prefixes_punctuation_and_project_scope() {
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, build_fts_query, create_feature,
+            create_work_item, search_items_fts, trash_item_subtree,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::domain::{ItemStatus, Priority, ProjectStatus};
+        use rusqlite::TransactionBehavior;
+
+        assert_eq!(build_fts_query("PRO-12"), Some("\"PRO\"* \"12\"*".to_string()));
+        assert_eq!(build_fts_query("  --- \"foo:bar\"  "), Some("\"foo\"* \"bar\"*".to_string()));
+        assert_eq!(build_fts_query("   !!!   "), None);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "SearchTest").unwrap();
+
+        let (pid_a, pid_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let pa = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Alpha".to_string(),
+                    key_prefix: "PRO".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let pb = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Beta".to_string(),
+                    key_prefix: "BET".to_string(),
+                    description: String::new(),
+                    color: "#10B981".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (pa.id, pb.id)
+        };
+
+        let (pro_1, pro_2, _pro_3, _pro_10, bet_1) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            // PRO-1
+            let p1 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Schema Migrations".to_string(),
+                    description: "Core database setup".to_string(),
+                    status: ItemStatus::InProgress,
+                    priority: Priority::High,
+                },
+            )
+            .unwrap();
+            // PRO-2: mentions PRO-1 in body
+            let p2 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid_a,
+                    title: "Document upgrade steps".to_string(),
+                    description: "See PRO-1 for migration rules".to_string(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Low,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            // PRO-3: trashed item should never appear
+            let p3 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid_a,
+                    title: "Trashed migration draft".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            trash_item_subtree(&tx, p3.id).unwrap();
+
+            // Advance sequence to PRO-10 so PRO-1 vs PRO-10 prefix ranking is tested
+            for n in 4..=9 {
+                create_work_item(
+                    &tx,
+                    CreateWorkItemInput {
+                        project_id: pid_a,
+                        title: format!("Filler {n}"),
+                        description: String::new(),
+                        status: ItemStatus::Todo,
+                        priority: Priority::None,
+                        feature_ids: vec![],
+                    },
+                )
+                .unwrap();
+            }
+            let p10 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid_a,
+                    title: "Migrate telemetry pipeline".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+
+            // BET-1 in Project B
+            let b1 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_b,
+                    parent_feature_id: None,
+                    title: "Beta Migration Helper".to_string(),
+                    description: "Cross project search check".to_string(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Urgent,
+                },
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+            (p1, p2, p3, p10, b1)
+        };
+
+        // Exact key match ranks #1 ahead of body mention (PRO-2) and prefix match (PRO-10)
+        let key_hits = search_items_fts(&conn, "PRO-1", Some(pid_a), 50).unwrap();
+        assert!(!key_hits.is_empty());
+        assert_eq!(key_hits[0].item_key, "PRO-1");
+        assert_eq!(key_hits[0].id, pro_1.id);
+        assert!(key_hits.iter().any(|r| r.id == pro_2.id));
+
+        // Prefix stem query matches PRO-1 and PRO-10 while excluding trashed PRO-3 and Project B BET-1
+        let scoped_hits = search_items_fts(&conn, "migrat", Some(pid_a), 50).unwrap();
+        let scoped_keys: Vec<_> = scoped_hits.iter().map(|r| r.item_key.as_str()).collect();
+        assert!(scoped_keys.contains(&"PRO-1"));
+        assert!(scoped_keys.contains(&"PRO-10"));
+        assert!(!scoped_keys.contains(&"PRO-3"));
+        assert!(!scoped_keys.contains(&"BET-1"));
+
+        // Global search (project_id = None) includes BET-1 with project prefix
+        let global_hits = search_items_fts(&conn, "migrat", None, 50).unwrap();
+        let bet_hit = global_hits.iter().find(|r| r.id == bet_1.id).unwrap();
+        assert_eq!(bet_hit.project_key_prefix, "BET");
+
+        // Arbitrary punctuation never fails
+        assert!(search_items_fts(&conn, "\"unterminated: (foo*bar)", None, 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn dnd_reorder_feature_work_items_unallocated_and_atomic_move() {
+        use crate::db::blocker_repo::add_blocker;
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, create_feature, create_work_item,
+            move_work_item_between_features, query_unallocated_work_items,
+            query_work_items_for_feature, reorder_feature_work_items,
+            reorder_unallocated_work_items,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::domain::{ItemStatus, Priority, ProjectStatus};
+        use rusqlite::TransactionBehavior;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "DndRepoTest").unwrap();
+
+        let pid = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let p = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "DnD".to_string(),
+                    key_prefix: "DND".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            p.id
+        };
+
+        let (fa, fb, fc, w1, w2, w3, u1, u2, u3) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let fa = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Feature A".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let fb = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Feature B".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let fc = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Blocker C".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let w1 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "W1".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![fa.id, fb.id],
+                },
+            )
+            .unwrap();
+            let w2 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "W2".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![fa.id, fb.id],
+                },
+            )
+            .unwrap();
+            let w3 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "W3".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![fa.id],
+                },
+            )
+            .unwrap();
+            add_blocker(&tx, w3.id, fc.id).unwrap();
+
+            let u1 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "U1".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            let u2 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "U2".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            let u3 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "U3".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+
+            tx.commit().unwrap();
+            (fa, fb, fc, w1, w2, w3, u1, u2, u3)
+        };
+
+        // Reorder W3 before W1 inside Feature A; Feature B order [W1, W2] remains untouched
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            reorder_feature_work_items(&tx, pid, fa.id, w3.id, None, Some(w1.id)).unwrap();
+            tx.commit().unwrap();
+        }
+        let fa_wis: Vec<_> = query_work_items_for_feature(&conn, fa.id)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        let fb_wis: Vec<_> = query_work_items_for_feature(&conn, fb.id)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(fa_wis, vec![w3.id, w1.id, w2.id]);
+        assert_eq!(fb_wis, vec![w1.id, w2.id]);
+
+        // Reorder unallocated U3 before U1, and verify allocated W1 is rejected
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            reorder_unallocated_work_items(&tx, pid, u3.id, None, Some(u1.id)).unwrap();
+            assert!(reorder_unallocated_work_items(&tx, pid, w1.id, None, None).is_err());
+            tx.commit().unwrap();
+        }
+        let unalloc_ids: Vec<_> = query_unallocated_work_items(&conn, pid)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(unalloc_ids, vec![u3.id, u1.id, u2.id]);
+
+        // Move W3 from FA to FC (blocker) must fail atomically without detaching FA
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(move_work_item_between_features(&tx, w3.id, fa.id, fc.id).is_err());
+        }
+        assert!(
+            query_work_items_for_feature(&conn, fa.id)
+                .unwrap()
+                .iter()
+                .any(|i| i.id == w3.id)
+        );
+
+        // Move W3 from FA to FB succeeds and detaches FA
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            move_work_item_between_features(&tx, w3.id, fa.id, fb.id).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(
+            !query_work_items_for_feature(&conn, fa.id)
+                .unwrap()
+                .iter()
+                .any(|i| i.id == w3.id)
+        );
+        assert!(
+            query_work_items_for_feature(&conn, fb.id)
+                .unwrap()
+                .iter()
+                .any(|i| i.id == w3.id)
+        );
     }
 }
 

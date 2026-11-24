@@ -10,7 +10,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::commands::{CommandEffect, UndoableCommand};
 use crate::db::migrations::{checkpoint_and_switch_to_delete_mode, seed_sample_project};
-use crate::db::{load_project_snapshot, load_workspace_overview, map_sqlite_err};
+use crate::db::{SearchResultItem, load_project_snapshot, load_workspace_overview, map_sqlite_err};
 use crate::domain::{
     DomainError, DomainEvent, ProjectId, ProjectSnapshot, WorkspaceOverview,
 };
@@ -23,6 +23,12 @@ pub enum DbRequest {
     LoadProjectSnapshot {
         project_id: ProjectId,
         reply: oneshot::Sender<Result<ProjectSnapshot, DomainError>>,
+    },
+    SearchItemsFts {
+        query: String,
+        project_id: Option<ProjectId>,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<SearchResultItem>, DomainError>>,
     },
     SeedSampleProject {
         reply: oneshot::Sender<Result<ProjectId, DomainError>>,
@@ -204,6 +210,40 @@ impl DbService {
         await_oneshot(reply_rx).await
     }
 
+    pub async fn search_items_fts(
+        &self,
+        query: String,
+        project_id: Option<ProjectId>,
+        limit: usize,
+    ) -> Result<Vec<SearchResultItem>, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::SearchItemsFts {
+            query,
+            project_id,
+            limit,
+            reply: reply_tx,
+        })?;
+        await_oneshot(reply_rx).await
+    }
+
+    pub fn search_items_fts_blocking(
+        &self,
+        query: String,
+        project_id: Option<ProjectId>,
+        limit: usize,
+    ) -> Result<Vec<SearchResultItem>, DomainError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_request(DbRequest::SearchItemsFts {
+            query,
+            project_id,
+            limit,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .recv()
+            .map_err(|_| DomainError::Storage("DbService actor terminated unexpectedly".into()))?
+    }
+
     pub async fn seed_sample_project(&self) -> Result<ProjectId, DomainError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send_request(DbRequest::SeedSampleProject { reply: reply_tx })?;
@@ -296,6 +336,15 @@ fn run_actor_loop(conn: Connection, rx: Receiver<DbRequest>, bus: Arc<DomainEven
             }
             DbRequest::LoadProjectSnapshot { project_id, reply } => {
                 let res = load_project_snapshot(conn, project_id);
+                let _ = reply.send(res);
+            }
+            DbRequest::SearchItemsFts {
+                query,
+                project_id,
+                limit,
+                reply,
+            } => {
+                let res = crate::db::item_repo::search_items_fts(conn, &query, project_id, limit);
                 let _ = reply.send(res);
             }
             DbRequest::SeedSampleProject { reply } => {

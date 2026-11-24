@@ -2494,3 +2494,419 @@ pub fn empty_project_trash(
         purged_item_count,
     })
 }
+
+fn resolve_reorder_bounds<'a>(
+    ordered: &'a [(ItemId, String)],
+    moving_id: ItemId,
+    before_id: Option<ItemId>,
+    after_id: Option<ItemId>,
+    kind_label: &str,
+) -> Result<(usize, Option<&'a str>, Option<&'a str>), DomainError> {
+    let before_idx = match before_id {
+        Some(bid) => {
+            if bid == moving_id {
+                return Err(DomainError::Validation(format!(
+                    "before_id cannot equal {kind_label} id"
+                )));
+            }
+            let pos = ordered.iter().position(|(id, _)| *id == bid).ok_or_else(|| {
+                DomainError::Validation(format!("before_id is not a valid {kind_label} sibling"))
+            })?;
+            Some(pos)
+        }
+        None => None,
+    };
+
+    let after_idx = match after_id {
+        Some(aid) => {
+            if aid == moving_id {
+                return Err(DomainError::Validation(format!(
+                    "after_id cannot equal {kind_label} id"
+                )));
+            }
+            let pos = ordered.iter().position(|(id, _)| *id == aid).ok_or_else(|| {
+                DomainError::Validation(format!("after_id is not a valid {kind_label} sibling"))
+            })?;
+            Some(pos)
+        }
+        None => None,
+    };
+
+    if let (Some(b), Some(a)) = (before_idx, after_idx)
+        && b >= a
+    {
+        return Err(DomainError::Validation(format!(
+            "before_id must precede after_id among {kind_label} siblings"
+        )));
+    }
+
+    let bounds = match (before_idx, after_idx) {
+        (Some(b), Some(_a)) => (
+            b + 1,
+            Some(ordered[b].1.as_str()),
+            ordered.get(b + 1).map(|(_, k)| k.as_str()),
+        ),
+        (Some(b), None) => (
+            b + 1,
+            Some(ordered[b].1.as_str()),
+            ordered.get(b + 1).map(|(_, k)| k.as_str()),
+        ),
+        (None, Some(a)) => (
+            a,
+            a.checked_sub(1).map(|i| ordered[i].1.as_str()),
+            Some(ordered[a].1.as_str()),
+        ),
+        (None, None) => (
+            ordered.len(),
+            ordered.last().map(|(_, k)| k.as_str()),
+            None,
+        ),
+    };
+
+    Ok(bounds)
+}
+
+/// Reorders `work_item_id` inside `feature_id`'s `feature_work_items` list using fractional indexing.
+pub fn reorder_feature_work_items(
+    tx: &Transaction<'_>,
+    project_id: ProjectId,
+    feature_id: ItemId,
+    work_item_id: ItemId,
+    before_work_item_id: Option<ItemId>,
+    after_work_item_id: Option<ItemId>,
+) -> Result<FeatureWorkItem, DomainError> {
+    let _feature = validate_active_feature_in_project(tx, project_id, feature_id)?;
+    let work_item = validate_active_work_item(tx, work_item_id)?;
+    if work_item.project_id != project_id {
+        return Err(DomainError::CrossProjectReference);
+    }
+
+    let feat_sql = uuid_to_sql(feature_id.0);
+    let wi_sql = uuid_to_sql(work_item_id.0);
+
+    let existing_link = tx
+        .query_row(
+            "SELECT project_id, feature_id, work_item_id, sort_order, created_at
+             FROM feature_work_items
+             WHERE feature_id = ?1 AND work_item_id = ?2;",
+            params![&feat_sql, &wi_sql],
+            |row| {
+                Ok(FeatureWorkItem {
+                    project_id: ProjectId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
+                    feature_id: ItemId::from_uuid(parse_uuid_col(1, row.get(1)?)?),
+                    work_item_id: ItemId::from_uuid(parse_uuid_col(2, row.get(2)?)?),
+                    sort_order: row.get(3)?,
+                    created_at: parse_ts_col(4, row.get(4)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_err)?
+        .ok_or_else(|| {
+            DomainError::Validation("Work Item is not attached to the target Feature".to_string())
+        })?;
+
+    let other_links: Vec<(ItemId, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT fwi.work_item_id, fwi.sort_order
+                 FROM feature_work_items fwi
+                 JOIN items wi ON wi.id = fwi.work_item_id
+                 WHERE fwi.feature_id = ?1
+                   AND wi.deleted_at IS NULL
+                   AND wi.kind = 'work_item'
+                   AND fwi.work_item_id != ?2
+                 ORDER BY fwi.sort_order ASC, wi.item_number ASC;",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![&feat_sql, &wi_sql], |row| {
+                let id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+                let sort_order: String = row.get(1)?;
+                Ok((id, sort_order))
+            })
+            .map_err(map_sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+    };
+
+    let (insert_idx, lower_key, upper_key) = resolve_reorder_bounds(
+        &other_links,
+        work_item_id,
+        before_work_item_id,
+        after_work_item_id,
+        "feature work item",
+    )?;
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+
+    let sort_order = match fractional_index::midpoint(lower_key, upper_key) {
+        Ok(key) if !fractional_index::needs_rebalance(&key) => {
+            tx.execute(
+                "UPDATE feature_work_items
+                 SET sort_order = ?1
+                 WHERE feature_id = ?2 AND work_item_id = ?3;",
+                params![&key, &feat_sql, &wi_sql],
+            )
+            .map_err(map_sqlite_err)?;
+            key
+        }
+        _ => {
+            let mut ordered_ids: Vec<ItemId> = other_links.iter().map(|(id, _)| *id).collect();
+            ordered_ids.insert(insert_idx, work_item_id);
+            let keys = fractional_index::rebalance_keys(ordered_ids.len());
+            for (id, key) in ordered_ids.iter().zip(keys.iter()) {
+                tx.execute(
+                    "UPDATE feature_work_items
+                     SET sort_order = ?1
+                     WHERE feature_id = ?2 AND work_item_id = ?3;",
+                    params![key, &feat_sql, uuid_to_sql(id.0)],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            keys[insert_idx].clone()
+        }
+    };
+
+    tx.execute(
+        "UPDATE items SET updated_at = ?1 WHERE id = ?2;",
+        params![&now_sql, &wi_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    Ok(FeatureWorkItem {
+        sort_order,
+        ..existing_link
+    })
+}
+
+/// Reorders an unallocated Work Item within the Project's Unallocated bucket (`items.sort_order`).
+pub fn reorder_unallocated_work_items(
+    tx: &Transaction<'_>,
+    project_id: ProjectId,
+    work_item_id: ItemId,
+    before_work_item_id: Option<ItemId>,
+    after_work_item_id: Option<ItemId>,
+) -> Result<Item, DomainError> {
+    let work_item = validate_active_work_item(tx, work_item_id)?;
+    if work_item.project_id != project_id {
+        return Err(DomainError::CrossProjectReference);
+    }
+    if !query_features_for_work_item(tx, work_item_id)?.is_empty() {
+        return Err(DomainError::Validation(
+            "Only Unallocated Work Items can be reordered in Unallocated View".to_string(),
+        ));
+    }
+
+    let project_sql = uuid_to_sql(project_id.0);
+    let wi_sql = uuid_to_sql(work_item_id.0);
+
+    let other_unallocated: Vec<(ItemId, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT i.id, i.sort_order
+                 FROM items i
+                 WHERE i.project_id = ?1
+                   AND i.kind = 'work_item'
+                   AND i.deleted_at IS NULL
+                   AND i.id != ?2
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM feature_work_items fwi
+                       JOIN items f ON f.id = fwi.feature_id
+                       WHERE fwi.work_item_id = i.id
+                         AND f.deleted_at IS NULL
+                   )
+                 ORDER BY i.sort_order ASC, i.item_number ASC;",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![&project_sql, &wi_sql], |row| {
+                let id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+                let sort_order: String = row.get(1)?;
+                Ok((id, sort_order))
+            })
+            .map_err(map_sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+    };
+
+    let (insert_idx, lower_key, upper_key) = resolve_reorder_bounds(
+        &other_unallocated,
+        work_item_id,
+        before_work_item_id,
+        after_work_item_id,
+        "unallocated work item",
+    )?;
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+
+    let sort_order = match fractional_index::midpoint(lower_key, upper_key) {
+        Ok(key) if !fractional_index::needs_rebalance(&key) => {
+            tx.execute(
+                "UPDATE items SET sort_order = ?1, updated_at = ?2 WHERE id = ?3;",
+                params![&key, &now_sql, &wi_sql],
+            )
+            .map_err(map_sqlite_err)?;
+            key
+        }
+        _ => {
+            let mut ordered_ids: Vec<ItemId> =
+                other_unallocated.iter().map(|(id, _)| *id).collect();
+            ordered_ids.insert(insert_idx, work_item_id);
+            let keys = fractional_index::rebalance_keys(ordered_ids.len());
+            for (id, key) in ordered_ids.iter().zip(keys.iter()) {
+                tx.execute(
+                    "UPDATE items SET sort_order = ?1, updated_at = ?2 WHERE id = ?3;",
+                    params![key, &now_sql, uuid_to_sql(id.0)],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            keys[insert_idx].clone()
+        }
+    };
+
+    Ok(Item {
+        sort_order,
+        updated_at: now,
+        ..work_item
+    })
+}
+
+/// Atomically moves a Work Item from `from_feature_id` to `to_feature_id`.
+/// Attaches to `to_feature_id` first so `INV-05` blocker violations abort before detaching `from_feature_id`.
+pub fn move_work_item_between_features(
+    tx: &Transaction<'_>,
+    work_item_id: ItemId,
+    from_feature_id: ItemId,
+    to_feature_id: ItemId,
+) -> Result<FeatureWorkItem, DomainError> {
+    let work_item = validate_active_work_item(tx, work_item_id)?;
+    let _from = validate_active_feature_in_project(tx, work_item.project_id, from_feature_id)?;
+    let _to = validate_active_feature_in_project(tx, work_item.project_id, to_feature_id)?;
+
+    let link = attach_work_item_to_feature(tx, work_item_id, to_feature_id)?;
+    if from_feature_id != to_feature_id {
+        let _ = detach_work_item_from_feature(tx, work_item_id, from_feature_id)?;
+    }
+    Ok(link)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResultItem {
+    pub id: ItemId,
+    pub project_id: ProjectId,
+    pub project_name: String,
+    pub project_key_prefix: String,
+    pub project_color: String,
+    pub item_key: String,
+    pub kind: ItemKind,
+    pub title: String,
+    pub status: ItemStatus,
+    pub priority: Priority,
+    pub rank: f64,
+}
+
+/// Sanitizes arbitrary user text into a safe FTS5 prefix-search query (`"tok1"* "tok2"*`).
+pub fn build_fts_query(raw: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    if tokens.is_empty() {
+        return None;
+    }
+
+    Some(
+        tokens
+            .into_iter()
+            .map(|tok| format!("\"{tok}\"*"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Executes FTS5 + exact/prefix `item_key` search across `items_fts` (`DATA_MODEL.md` §4.8).
+pub fn search_items_fts(
+    conn: &Connection,
+    raw_query: &str,
+    project_id: Option<ProjectId>,
+    limit: usize,
+) -> Result<Vec<SearchResultItem>, DomainError> {
+    let trimmed = raw_query.trim();
+    let Some(fts_query) = build_fts_query(trimmed) else {
+        return Ok(Vec::new());
+    };
+
+    let project_sql = project_id.map(|pid| uuid_to_sql(pid.0));
+    let limit_i64 = i64::try_from(limit.clamp(1, 100)).unwrap_or(50);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                i.id,
+                i.project_id,
+                p.name,
+                p.key_prefix,
+                p.color,
+                i.item_key,
+                i.kind,
+                i.title,
+                i.status,
+                i.priority,
+                bm25(items_fts, 10.0, 5.0, 1.0) AS rank
+             FROM items_fts
+             JOIN items i ON i.rowid = items_fts.rowid
+             JOIN projects p ON p.id = i.project_id
+             WHERE items_fts MATCH ?1
+               AND (?3 IS NULL OR i.project_id = ?3)
+               AND i.deleted_at IS NULL
+             ORDER BY
+                 CASE
+                     WHEN upper(i.item_key) = upper(?2) THEN 0
+                     WHEN instr(upper(i.item_key), upper(?2)) = 1 THEN 1
+                     ELSE 2
+                 END ASC,
+                 rank ASC,
+                 i.item_number ASC
+             LIMIT ?4;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![fts_query, trimmed, project_sql, limit_i64], |row| {
+            let kind_raw: String = row.get(6)?;
+            let kind = parse_domain_col(6, ItemKind::from_db_str(&kind_raw))?;
+            let status_raw: String = row.get(8)?;
+            let status = parse_domain_col(8, ItemStatus::from_db_str(&status_raw))?;
+            let priority_raw: String = row.get(9)?;
+            let priority = parse_domain_col(9, Priority::from_db_str(&priority_raw))?;
+
+            Ok(SearchResultItem {
+                id: ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
+                project_id: ProjectId::from_uuid(parse_uuid_col(1, row.get(1)?)?),
+                project_name: row.get(2)?,
+                project_key_prefix: row.get(3)?,
+                project_color: row.get(4)?,
+                item_key: row.get(5)?,
+                kind,
+                title: row.get(7)?,
+                status,
+                priority,
+                rank: row.get(10)?,
+            })
+        })
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}

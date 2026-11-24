@@ -7,7 +7,8 @@ use crate::db::blocker_repo::query_active_blocker_keys_for_item;
 use crate::db::item_repo::{
     CreateFeatureInput, CreateWorkItemInput, UpdateItemFieldsInput, attach_work_item_to_feature,
     create_feature, create_work_item, detach_work_item_from_feature, get_item,
-    query_features_for_work_item, reparent_feature, reorder_sibling_features,
+    move_work_item_between_features, query_features_for_work_item, reorder_feature_work_items,
+    reorder_sibling_features, reorder_unallocated_work_items, reparent_feature,
     set_work_item_features, update_item_fields,
 };
 use crate::db::tag_repo::set_item_tags;
@@ -23,6 +24,8 @@ pub struct CreateFeature {
     pub description: String,
     pub status: ItemStatus,
     pub priority: Priority,
+    pub assignee_id: Option<AssigneeId>,
+    pub tag_ids: Vec<TagId>,
     created_id: Option<ItemId>,
 }
 
@@ -42,8 +45,20 @@ impl CreateFeature {
             description: description.into(),
             status,
             priority,
+            assignee_id: None,
+            tag_ids: Vec::new(),
             created_id: None,
         }
+    }
+
+    pub fn with_assignee(mut self, assignee_id: Option<AssigneeId>) -> Self {
+        self.assignee_id = assignee_id;
+        self
+    }
+
+    pub fn with_tags(mut self, tag_ids: Vec<TagId>) -> Self {
+        self.tag_ids = tag_ids;
+        self
     }
 }
 
@@ -53,7 +68,7 @@ impl UndoableCommand for CreateFeature {
     }
 
     fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
-        let item = create_feature(
+        let mut item = create_feature(
             tx,
             CreateFeatureInput {
                 project_id: self.project_id,
@@ -64,6 +79,19 @@ impl UndoableCommand for CreateFeature {
                 priority: self.priority,
             },
         )?;
+        if self.assignee_id.is_some() {
+            item = update_item_fields(
+                tx,
+                UpdateItemFieldsInput {
+                    item_id: item.id,
+                    assignee_id: Some(self.assignee_id),
+                    ..Default::default()
+                },
+            )?;
+        }
+        if !self.tag_ids.is_empty() {
+            set_item_tags(tx, item.id, &self.tag_ids)?;
+        }
         self.created_id = Some(item.id);
 
         Ok(CommandEffect {
@@ -92,6 +120,8 @@ pub struct CreateWorkItem {
     pub status: ItemStatus,
     pub priority: Priority,
     pub feature_ids: Vec<ItemId>,
+    pub assignee_id: Option<AssigneeId>,
+    pub tag_ids: Vec<TagId>,
     created_id: Option<ItemId>,
 }
 
@@ -111,8 +141,20 @@ impl CreateWorkItem {
             status,
             priority,
             feature_ids,
+            assignee_id: None,
+            tag_ids: Vec::new(),
             created_id: None,
         }
+    }
+
+    pub fn with_assignee(mut self, assignee_id: Option<AssigneeId>) -> Self {
+        self.assignee_id = assignee_id;
+        self
+    }
+
+    pub fn with_tags(mut self, tag_ids: Vec<TagId>) -> Self {
+        self.tag_ids = tag_ids;
+        self
     }
 }
 
@@ -122,7 +164,7 @@ impl UndoableCommand for CreateWorkItem {
     }
 
     fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
-        let item = create_work_item(
+        let mut item = create_work_item(
             tx,
             CreateWorkItemInput {
                 project_id: self.project_id,
@@ -133,6 +175,19 @@ impl UndoableCommand for CreateWorkItem {
                 feature_ids: self.feature_ids.clone(),
             },
         )?;
+        if self.assignee_id.is_some() {
+            item = update_item_fields(
+                tx,
+                UpdateItemFieldsInput {
+                    item_id: item.id,
+                    assignee_id: Some(self.assignee_id),
+                    ..Default::default()
+                },
+            )?;
+        }
+        if !self.tag_ids.is_empty() {
+            set_item_tags(tx, item.id, &self.tag_ids)?;
+        }
         self.created_id = Some(item.id);
 
         Ok(CommandEffect {
@@ -480,6 +535,175 @@ impl UndoableCommand for DetachWorkItemFromFeature {
                 project_id: wi.project_id,
             }],
             toast: Some(toast),
+            ..Default::default()
+        })
+    }
+
+    fn undo(&mut self, _tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        Err(DomainError::Validation(
+            "Undo is not yet enabled (Phase 12)".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReorderFeatureWorkItems {
+    pub project_id: ProjectId,
+    pub feature_id: ItemId,
+    pub work_item_id: ItemId,
+    pub before_work_item_id: Option<ItemId>,
+    pub after_work_item_id: Option<ItemId>,
+}
+
+impl ReorderFeatureWorkItems {
+    pub fn new(
+        project_id: ProjectId,
+        feature_id: ItemId,
+        work_item_id: ItemId,
+        before_work_item_id: Option<ItemId>,
+        after_work_item_id: Option<ItemId>,
+    ) -> Self {
+        Self {
+            project_id,
+            feature_id,
+            work_item_id,
+            before_work_item_id,
+            after_work_item_id,
+        }
+    }
+}
+
+impl UndoableCommand for ReorderFeatureWorkItems {
+    fn label(&self) -> String {
+        "Reorder Feature Work Items".to_string()
+    }
+
+    fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        let link = reorder_feature_work_items(
+            tx,
+            self.project_id,
+            self.feature_id,
+            self.work_item_id,
+            self.before_work_item_id,
+            self.after_work_item_id,
+        )?;
+        Ok(CommandEffect {
+            events: vec![DomainEvent::ItemsChanged {
+                project_id: link.project_id,
+            }],
+            selected_item_id: Some(link.work_item_id),
+            ..Default::default()
+        })
+    }
+
+    fn undo(&mut self, _tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        Err(DomainError::Validation(
+            "Undo is not yet enabled (Phase 12)".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReorderUnallocatedWorkItems {
+    pub project_id: ProjectId,
+    pub work_item_id: ItemId,
+    pub before_work_item_id: Option<ItemId>,
+    pub after_work_item_id: Option<ItemId>,
+}
+
+impl ReorderUnallocatedWorkItems {
+    pub fn new(
+        project_id: ProjectId,
+        work_item_id: ItemId,
+        before_work_item_id: Option<ItemId>,
+        after_work_item_id: Option<ItemId>,
+    ) -> Self {
+        Self {
+            project_id,
+            work_item_id,
+            before_work_item_id,
+            after_work_item_id,
+        }
+    }
+}
+
+impl UndoableCommand for ReorderUnallocatedWorkItems {
+    fn label(&self) -> String {
+        "Reorder Unallocated Work Items".to_string()
+    }
+
+    fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        let item = reorder_unallocated_work_items(
+            tx,
+            self.project_id,
+            self.work_item_id,
+            self.before_work_item_id,
+            self.after_work_item_id,
+        )?;
+        Ok(CommandEffect {
+            events: vec![DomainEvent::ItemsChanged {
+                project_id: item.project_id,
+            }],
+            selected_item_id: Some(item.id),
+            ..Default::default()
+        })
+    }
+
+    fn undo(&mut self, _tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        Err(DomainError::Validation(
+            "Undo is not yet enabled (Phase 12)".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MoveWorkItemBetweenFeatures {
+    pub work_item_id: ItemId,
+    pub from_feature_id: ItemId,
+    pub to_feature_id: ItemId,
+}
+
+impl MoveWorkItemBetweenFeatures {
+    pub fn new(work_item_id: ItemId, from_feature_id: ItemId, to_feature_id: ItemId) -> Self {
+        Self {
+            work_item_id,
+            from_feature_id,
+            to_feature_id,
+        }
+    }
+}
+
+impl UndoableCommand for MoveWorkItemBetweenFeatures {
+    fn label(&self) -> String {
+        "Move Work Item Between Features".to_string()
+    }
+
+    fn execute(&mut self, tx: &Transaction<'_>) -> Result<CommandEffect, DomainError> {
+        let link = move_work_item_between_features(
+            tx,
+            self.work_item_id,
+            self.from_feature_id,
+            self.to_feature_id,
+        )?;
+        let wi = get_item(tx, self.work_item_id)?;
+        let from_feat = get_item(tx, self.from_feature_id)?;
+        let to_feat = get_item(tx, self.to_feature_id)?;
+
+        let toast = if self.from_feature_id == self.to_feature_id {
+            None
+        } else {
+            Some(format!(
+                "Moved {} from {} to {}",
+                wi.item_key, from_feat.item_key, to_feat.item_key
+            ))
+        };
+
+        Ok(CommandEffect {
+            events: vec![DomainEvent::ItemsChanged {
+                project_id: link.project_id,
+            }],
+            selected_item_id: Some(wi.id),
+            toast,
             ..Default::default()
         })
     }

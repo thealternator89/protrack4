@@ -15,14 +15,17 @@ use gpui_kit::{
 
 use crate::state::{AppState, CenterViewTab, LaunchConfig, ProjectStore, ThemePreference};
 use crate::ui::inspector::InspectorView;
-use crate::ui::modals::{open_new_project_modal, open_workspace_modal};
+use crate::ui::modals::{
+    open_new_project_modal, open_quick_add_modal, open_quick_search_modal, open_workspace_modal,
+};
 use crate::ui::outline_view::OutlineView;
 use crate::ui::sidebar::render_sidebar;
 use crate::ui::table_view::TableView;
 use crate::ui::trash_view::TrashView;
 use crate::ui::unallocated_view::UnallocatedView;
 use crate::ui::{
-    OpenWorkspace, ToggleInspector, ToggleSidebar, build_project_switcher_menu, parse_hex_or,
+    OpenQuickAdd, OpenQuickSearch, OpenWorkspace, ToggleInspector, ToggleSidebar,
+    build_project_switcher_menu, parse_hex_or,
 };
 
 pub struct WorkspaceShell {
@@ -194,6 +197,24 @@ impl WorkspaceShell {
         cx: &mut Context<Self>,
     ) {
         open_workspace_modal(self.app_state.clone(), window, cx);
+    }
+
+    fn open_quick_search_action(
+        &mut self,
+        _: &OpenQuickSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        open_quick_search_modal(self.app_state.clone(), self.store.clone(), window, cx);
+    }
+
+    fn open_quick_add_action(
+        &mut self,
+        _: &OpenQuickAdd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        open_quick_add_modal(self.app_state.clone(), self.store.clone(), window, cx);
     }
 
     fn toggle_sidebar_inner(&mut self, cx: &mut Context<Self>) {
@@ -395,28 +416,44 @@ impl WorkspaceShell {
             )
             // Center group: View tabs
             .child(tab_bar)
-            // Right group: Disabled Cmd+K / + New stubs + Theme toggle + Inspector toggle
+            // Right group: Search (Cmd+K), Quick Add (Cmd+N), Theme toggle, Inspector toggle
             .child(
                 h_flex()
                     .gap_1p5()
                     .items_center()
                     .child(
-                        Button::new("toolbar-search-stub")
+                        Button::new("toolbar-search-btn")
                             .outline()
                             .small()
                             .icon(IconName::Search)
                             .label("Search ⌘K")
-                            .disabled(true)
-                            .tooltip("Quick Search (Cmd+K) — Available in Phase 11"),
+                            .disabled(!has_workspace)
+                            .tooltip_with_action("Quick Search & Commands", &OpenQuickSearch, None)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                open_quick_search_modal(
+                                    this.app_state.clone(),
+                                    this.store.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
                     )
                     .child(
-                        Button::new("toolbar-new-stub")
+                        Button::new("toolbar-new-btn")
                             .primary()
                             .small()
                             .icon(IconName::Plus)
                             .label("New")
-                            .disabled(true)
-                            .tooltip("Quick Add (Cmd+N) — Available in Phase 11"),
+                            .disabled(snapshot.is_none())
+                            .tooltip_with_action("Quick Add Work Item or Feature", &OpenQuickAdd, None)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                open_quick_add_modal(
+                                    this.app_state.clone(),
+                                    this.store.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
                     )
                     .child(
                         Button::new("toolbar-theme-toggle")
@@ -740,6 +777,8 @@ impl Render for WorkspaceShell {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_inspector_action))
             .on_action(cx.listener(Self::open_workspace_action))
+            .on_action(cx.listener(Self::open_quick_search_action))
+            .on_action(cx.listener(Self::open_quick_add_action))
             .child(
                 TitleBar::new().child(
                     h_flex()

@@ -9,7 +9,7 @@ use gpui_kit::{
 };
 use protrack4::commands::{
     CreateFeature, CreateProject, CreateWorkItem, ReparentFeature, ReorderSiblingFeatures,
-    UpdateItemFields, UpdateProject,
+    UpdateItemFields, UpdateProject, UpsertAssignee, UpsertTag,
 };
 use protrack4::domain::{
     BlockerWarning, EffectiveBlockState, ItemKind, ItemStatus, Priority, ProjectStatus,
@@ -3421,6 +3421,714 @@ async fn phase10_full_cascade_trash_restore_and_permanent_purge(cx: &mut TestApp
             .read(cx)
             .snapshot()
             .is_some_and(|s| s.trash_count == 0 && s.trash_groups.is_empty())
+    })
+    .await;
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}
+
+fn drag_to_with_modifiers(
+    window: &mut gpui_kit::Window,
+    from_id: impl Into<gpui_kit::ElementId>,
+    to_id: impl Into<gpui_kit::ElementId>,
+    modifiers: gpui_kit::Modifiers,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::{InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+
+    window.render_frame(cx);
+    let from = window.find(from_id).bounds().center();
+    let to = window.find(to_id).bounds().center();
+
+    window.dispatch_event(
+        MouseMoveEvent {
+            position: from,
+            pressed_button: None,
+            modifiers,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+
+    window.dispatch_event(
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+
+    for step in 1..=8 {
+        let fraction = step as f32 / 8.0;
+        let pos = point(
+            from.x + (to.x - from.x) * fraction,
+            from.y + (to.y - from.y) * fraction,
+        );
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: pos,
+                pressed_button: Some(MouseButton::Left),
+                modifiers,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    }
+
+    window.dispatch_event(
+        MouseUpEvent {
+            button: MouseButton::Left,
+            position: to,
+            modifiers,
+            click_count: 1,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+#[gpui_kit::test]
+async fn phase11_dnd_quick_search_and_quick_add(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase11.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    {
+        let mut manager = WorkspaceManager::new();
+        manager
+            .create_workspace(&db_path, Some("Phase11"), false)
+            .unwrap();
+        manager.close_workspace().unwrap();
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open WorkspaceShell test window");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // Seed two projects, assignees, tags, features, and work items
+    let p1_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateProject::new(
+                        "Platform",
+                        "PRO",
+                        "",
+                        "#6366F1",
+                        ProjectStatus::Active,
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let p2_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateProject::new(
+                        "Security",
+                        "SEC",
+                        "",
+                        "#10B981",
+                        ProjectStatus::Active,
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let s1_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateFeature::new(
+                        p2_id,
+                        None,
+                        "Audit Trail Engine",
+                        "Security migration log",
+                        ItemStatus::InProgress,
+                        Priority::High,
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    // Switch back to P1 and seed F1, F2, F3, W1, W2, U1, U2, Assignee, Tag
+    cx.update(|cx| {
+        app_state.update(cx, |app, cx| app.switch_project(p1_id, cx))
+    })
+    .await
+    .unwrap();
+
+    let _tag_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(Box::new(UpsertTag::create(p1_id, "core", "#8B5CF6")), cx)
+            })
+        })
+        .await
+        .unwrap()
+        .created_tag_id
+        .unwrap();
+
+    let _assignee_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(UpsertAssignee::create("Mark", "MB", "#6366F1", None, "")),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_assignee_id
+        .unwrap();
+
+    let mut f_ids = Vec::new();
+    for title in ["Auth Core", "Token Cache", "Billing"] {
+        let id = cx
+            .update(|cx| {
+                app_state.update(cx, |app, cx| {
+                    app.execute_command(
+                        Box::new(CreateFeature::new(
+                            p1_id,
+                            None,
+                            title,
+                            "",
+                            ItemStatus::Todo,
+                            Priority::Medium,
+                        )),
+                        cx,
+                    )
+                })
+            })
+            .await
+            .unwrap()
+            .created_item_id
+            .unwrap();
+        f_ids.push(id);
+    }
+    let (f1_id, f2_id, f3_id) = (f_ids[0], f_ids[1], f_ids[2]);
+
+    let w1_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateWorkItem::new(
+                        p1_id,
+                        "JWT Signer",
+                        "",
+                        ItemStatus::Todo,
+                        Priority::High,
+                        vec![f1_id],
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let w2_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateWorkItem::new(
+                        p1_id,
+                        "Session Store",
+                        "",
+                        ItemStatus::Todo,
+                        Priority::Low,
+                        vec![f1_id],
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let u1_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateWorkItem::new(
+                        p1_id,
+                        "Inbox One",
+                        "",
+                        ItemStatus::Backlog,
+                        Priority::None,
+                        vec![],
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let u2_id = cx
+        .update(|cx| {
+            app_state.update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateWorkItem::new(
+                        p1_id,
+                        "Inbox Two",
+                        "",
+                        ItemStatus::Todo,
+                        Priority::Medium,
+                        vec![],
+                    )),
+                    cx,
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    wait_until(cx, "P1 seeded snapshot ready", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.project.id == p1_id
+                && s.child_features(None).len() == 3
+                && s.work_items_for_feature(f1_id).len() == 2
+                && s.unallocated_work_items().len() == 2
+        })
+    })
+    .await;
+
+    let (f1_num, f2_num, f3_num, w1_num, w2_num, u1_num, u2_num) = cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        (
+            s.item(f1_id).unwrap().item_number as usize,
+            s.item(f2_id).unwrap().item_number as usize,
+            s.item(f3_id).unwrap().item_number as usize,
+            s.item(w1_id).unwrap().item_number as usize,
+            s.item(w2_id).unwrap().item_number as usize,
+            s.item(u1_id).unwrap().item_number as usize,
+            s.item(u2_id).unwrap().item_number as usize,
+        )
+    });
+
+    // 1. Sidebar DnD: Feature sibling reorder (F2 before F1)
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Outline);
+            s.expand_all_features();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.drag_to(
+            ("sidebar-feature", f2_num),
+            ("sidebar-feature-gap-before", f1_num),
+            cx,
+        );
+    })
+    .unwrap();
+
+    wait_until(cx, "F2 reordered before F1", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.child_features(None)
+                .into_iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>()
+                == vec![f2_id, f1_id, f3_id]
+        })
+    })
+    .await;
+
+    // 2. Sidebar DnD: Reparent F2 under F1, test cycle rejection F1->F2, then promote F2 to Root
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(("sidebar-feature", f2_num), ("sidebar-feature", f1_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "F2 reparented under F1", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.item(f2_id))
+            .is_some_and(|f| f.parent_feature_id == Some(f1_id))
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(("sidebar-feature", f1_num), ("sidebar-feature", f2_num), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        assert_eq!(s.item(f1_id).unwrap().parent_feature_id, None);
+        assert_eq!(s.item(f2_id).unwrap().parent_feature_id, Some(f1_id));
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(("sidebar-feature", f2_num), "sidebar-root-drop-zone", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "F2 promoted back to root", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .and_then(|s| s.item(f2_id))
+            .is_some_and(|f| f.parent_feature_id.is_none())
+    })
+    .await;
+
+    // 3. Outline DnD: reorder W2 before W1 inside F1
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(
+            ("outline-wi", f1_num * 100_000 + w2_num),
+            ("outline-wi-gap-before", f1_num * 100_000 + w1_num),
+            cx,
+        );
+    })
+    .unwrap();
+
+    wait_until(cx, "W2 reordered before W1 inside F1", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.work_items_for_feature(f1_id)
+                .into_iter()
+                .map(|w| w.id)
+                .collect::<Vec<_>>()
+                == vec![w2_id, w1_id]
+        })
+    })
+    .await;
+
+    // 4. Outline DnD: default move W1 from F1 -> F2, then Option/Alt-drag W1 from F2 -> F3 (multi-attach)
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(
+            ("outline-wi", f1_num * 100_000 + w1_num),
+            ("outline-feature", f2_num),
+            cx,
+        );
+    })
+    .unwrap();
+
+    wait_until(cx, "W1 moved from F1 to F2", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.features_for_work_item(w1_id)
+                .into_iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>()
+                == vec![f2_id]
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        drag_to_with_modifiers(
+            window,
+            ("outline-wi", f2_num * 100_000 + w1_num),
+            ("outline-feature", f3_num),
+            gpui_kit::Modifiers::alt(),
+            cx,
+        );
+    })
+    .unwrap();
+
+    wait_until(cx, "W1 Alt-attached to F3 while keeping F2", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            let fids: Vec<_> = s
+                .features_for_work_item(w1_id)
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            fids.len() == 2 && fids.contains(&f2_id) && fids.contains(&f3_id)
+        })
+    })
+    .await;
+
+    // 5. Drag W2 (single feature) -> sidebar-unallocated-row, then drag W1 (multi-feature) -> confirm Unallocate All
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(
+            ("outline-wi", f1_num * 100_000 + w2_num),
+            "sidebar-unallocated-row",
+            cx,
+        );
+    })
+    .unwrap();
+
+    wait_until(cx, "W2 unallocated via sidebar drop", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.unallocated_work_items().iter().any(|w| w.id == w2_id)
+                && s.unallocated_work_items().len() == 3
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(
+            ("outline-wi", f2_num * 100_000 + w1_num),
+            "sidebar-unallocated-row",
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        window.click("dnd-unalloc-all", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "W1 unallocated via multi-feature drop dialog", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.unallocated_work_items().iter().any(|w| w.id == w1_id)
+                && s.unallocated_work_items().len() == 4
+        })
+    })
+    .await;
+
+    // 6. Unallocated View: reorder U2 before U1, then drag U1 onto Sidebar Feature F1
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("sidebar-unallocated-row", cx);
+        window.render_frame(cx);
+        window.drag_to(
+            ("unallocated-row", u2_num),
+            ("unallocated-gap-before", u1_num),
+            cx,
+        );
+    })
+    .unwrap();
+
+    wait_until(cx, "U2 reordered before U1 in Unallocated", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            let ids: Vec<_> = s.unallocated_work_items().into_iter().map(|w| w.id).collect();
+            let pos_u2 = ids.iter().position(|id| *id == u2_id);
+            let pos_u1 = ids.iter().position(|id| *id == u1_id);
+            matches!((pos_u2, pos_u1), (Some(a), Some(b)) if a < b)
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to(("unallocated-row", u1_num), ("sidebar-feature", f1_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "U1 allocated to F1 via drag from Unallocated", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.work_items_for_feature(f1_id).iter().any(|w| w.id == u1_id)
+                && s.unallocated_work_items().len() == 3
+        })
+    })
+    .await;
+
+    // 7. Quick Search (Cmd+K): search across Projects & jump to SEC-1, plus Toggle Theme
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toolbar-search-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert_eq!(window.find("quick-search-input").focused(), Some(true));
+        window.input("Audit", cx);
+    })
+    .unwrap();
+
+    // Wait for active-project search (0 items), then switch to All Projects to find SEC-1
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("quick-search-item", 0usize)).is_none());
+        window.click("quick-search-scope-all", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "All Projects search finds SEC-1", |cx| {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(("quick-search-item", 0usize)).is_some()
+        })
+        .unwrap()
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click(("quick-search-item", 0usize), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Jump from Quick Search switches to SEC project & selects SEC-1", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.project.id == p2_id
+                && store.read(cx).selected_item_id() == Some(s1_id)
+                && store.read(cx).active_tab() == CenterViewTab::Outline
+        })
+    })
+    .await;
+
+    // Test Quick Search action: Toggle Theme + switch back to P1
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toolbar-search-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("quick-search-cmd-toggle-theme", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        assert_eq!(store.read(cx).theme_preference(), ThemePreference::Light);
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        app_state.update(cx, |app, cx| app.switch_project(p1_id, cx))
+    })
+    .await
+    .unwrap();
+
+    wait_until(cx, "switched back to P1", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| s.project.id == p1_id)
+    })
+    .await;
+
+    // 8. Quick Add (Cmd+N): Unallocated context vs Feature context
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("sidebar-unallocated-row", cx);
+        window.render_frame(cx);
+        window.click("toolbar-new-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert_eq!(window.find("quick-add-title").focused(), Some(true));
+        window.input("Quick Unallocated Task", cx);
+        window.click(("quick-add-tag", 0usize), cx);
+        window.click("quick-add-submit", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Quick Add creates unallocated WI with tag", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.unallocated_work_items()
+                .iter()
+                .find(|w| w.title == "Quick Unallocated Task")
+                .is_some_and(|w| s.tags_for_item(w.id).len() == 1)
+        })
+    })
+    .await;
+
+    // Contextual Quick Add from Outline with F1 selected: creates WI on F1, then Sub-Feature under F1
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Outline);
+            s.select_item(Some(f1_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("toolbar-new-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.input("Contextual F1 Task", cx);
+        window.click("quick-add-submit", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Contextual Quick Add attaches WI to F1", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.work_items_for_feature(f1_id)
+                .iter()
+                .any(|w| w.title == "Contextual F1 Task")
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(f1_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("toolbar-new-btn", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("quick-add-kind-feature", cx);
+        window.click("quick-add-title", cx);
+        window.input("Contextual Sub-Feature", cx);
+        window.click("quick-add-submit", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Contextual Quick Add creates Sub-Feature under F1", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.child_features(Some(f1_id))
+                .iter()
+                .any(|f| f.title == "Contextual Sub-Feature")
+        })
     })
     .await;
 
