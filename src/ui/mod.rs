@@ -4,6 +4,7 @@ pub mod outline_view;
 pub mod shell;
 pub mod sidebar;
 pub mod table_view;
+pub mod trash_view;
 pub mod unallocated_view;
 
 pub use shell::WorkspaceShell;

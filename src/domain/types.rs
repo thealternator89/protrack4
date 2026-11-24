@@ -330,6 +330,15 @@ pub enum DomainEvent {
     TagsChanged { project_id: ProjectId },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashGroup {
+    pub root: Item,
+    pub deleted_at: DateTime<Utc>,
+    pub descendant_feature_count: usize,
+    pub descendant_work_item_count: usize,
+    pub total_item_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceOverview {
     pub meta: WorkspaceMeta,
@@ -360,6 +369,8 @@ pub struct ProjectSnapshot {
     #[serde(default)]
     pub blocker_warnings: HashMap<ItemId, Vec<BlockerWarning>>,
     pub trash_count: usize,
+    #[serde(default)]
+    pub trash_groups: Vec<TrashGroup>,
 }
 
 impl ProjectSnapshot {
@@ -1146,13 +1157,13 @@ impl ProjectSnapshot {
                 stack.push(parent_id);
             }
             for edge in &self.item_blockers {
-                if edge.project_id == self.project.id && edge.blocked_item_id == node {
-                    if let Some(blocker) = self.item(edge.blocker_feature_id)
-                        && blocker.is_active()
-                        && blocker.kind == ItemKind::Feature
-                    {
-                        stack.push(edge.blocker_feature_id);
-                    }
+                if edge.project_id == self.project.id
+                    && edge.blocked_item_id == node
+                    && let Some(blocker) = self.item(edge.blocker_feature_id)
+                    && blocker.is_active()
+                    && blocker.kind == ItemKind::Feature
+                {
+                    stack.push(edge.blocker_feature_id);
                 }
             }
         }
@@ -1330,6 +1341,7 @@ mod tests {
             effective_block_state: HashMap::new(),
             blocker_warnings: HashMap::new(),
             trash_count: 0,
+            trash_groups: Vec::new(),
         };
 
         // Shared WI counted once under F1; cancelled WI excluded.

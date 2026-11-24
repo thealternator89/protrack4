@@ -3080,3 +3080,354 @@ async fn phase9_filtered_virtualized_table_view(cx: &mut TestAppContext) {
     assert!(!shm_path_for(&db_path).exists());
     assert!(!lock_path_for(&db_path).exists());
 }
+
+
+#[gpui_kit::test]
+async fn phase10_full_cascade_trash_restore_and_permanent_purge(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase10.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 10 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Seed a Project with:
+    //    F1 -> F2, F3, exclusive W2 on [F2], shared W1 on [F2, F3], and unallocated W3
+    let pid = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Trash Suite",
+                    "TRS",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let f1_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Auth Epic",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f2_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    Some(f1_id),
+                    "OAuth Flow",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f3_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "CLI Client",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let w1_shared_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Shared Token Refresh",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                    vec![f2_id, f3_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let _w2_excl_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Exclusive Callback",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Low,
+                    vec![f2_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let w3_unalloc_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Standalone Task",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::None,
+                    vec![],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    wait_until(cx, "6 items loaded", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.active_items().len() == 6)
+    })
+    .await;
+
+    let (f1_num, f3_num, w3_num) = cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        (
+            s.item(f1_id).unwrap().item_number as usize,
+            s.item(f3_id).unwrap().item_number as usize,
+            s.item(w3_unalloc_id).unwrap().item_number as usize,
+        )
+    });
+
+    // 2. Select F1 in Inspector, scroll to the footer, and click [Move to Trash]
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(f1_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.scroll(
+            "inspector-viewport",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click("inspector-trash-btn", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "F1 subtree moved to Trash and shared W1 kept active", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.trash_count == 1
+                && s.active_items().len() == 3
+                && s.item(w1_shared_id).is_some_and(|w| w.is_active())
+                && s.features_for_work_item(w1_shared_id).len() == 1
+        })
+    })
+    .await;
+
+    // 3. Click Sidebar Trash nav -> TrashView renders F1 group; click [Restore] -> subtree + shared link return
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("sidebar-trash-nav", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).active_tab(), CenterViewTab::Trash);
+        assert!(window.try_find(("trash-group-row", f1_num)).is_some());
+        window.click(("trash-restore-btn", f1_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "F1 subtree restored with shared W1 link", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.trash_count == 0
+                && s.active_items().len() == 6
+                && s.features_for_work_item(w1_shared_id).len() == 2
+        })
+    })
+    .await;
+
+    // 4. Right-click F1 in Outline and verify context menu triggers Move to Trash;
+    //    also trash W3 from Table context menu so Trash has 2 groups
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Outline);
+            s.expand_all_features();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.right_click(("outline-feature", f1_num), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(11usize, cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "F1 trashed via Outline context menu", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.trash_count == 1 && s.active_items().len() == 3)
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Table);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.right_click(("table-row", w3_num), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.within("popup-menu").click(7usize, cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "W3 trashed via Table context menu", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.trash_count == 2 && s.active_items().len() == 2)
+    })
+    .await;
+
+    // 5. Open Trash View -> test [Delete Forever] Cancel then Confirm on F1 (sparing W1 on F3)
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("sidebar-trash-nav", cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("trash-group-row", f1_num)).is_some());
+        assert!(window.try_find(("trash-group-row", w3_num)).is_some());
+
+        window.click(("trash-purge-btn", f1_num), cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        window.click("trash-confirm-cancel", cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        assert_eq!(store.read(cx).snapshot().unwrap().trash_count, 2);
+
+        window.click(("trash-purge-btn", f1_num), cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        window.click("trash-confirm-purge", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "F1 permanently purged while W1 survives", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.trash_count == 1
+                && s.item(w1_shared_id).is_some_and(|w| w.is_active())
+                && s.features_for_work_item(w1_shared_id).len() == 1
+                && s.features_for_work_item(w1_shared_id)[0].item_number as usize == f3_num
+        })
+    })
+    .await;
+
+    // 6. Test [Empty Trash] confirmation dialog removes W3 cleanly
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("trash-empty-btn", cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        window.click("trash-confirm-empty", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Trash emptied", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.trash_count == 0 && s.trash_groups.is_empty())
+    })
+    .await;
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}

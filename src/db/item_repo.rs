@@ -12,7 +12,7 @@ use crate::domain::fractional_index;
 use crate::domain::{
     AssigneeId, ConversionBlockReason, ConversionEligibility, DomainError, FeatureProgress,
     FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId,
-    format_conversion_block_message,
+    TrashGroup, format_conversion_block_message,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1802,4 +1802,695 @@ pub fn convert_feature_to_work_item(
     };
 
     Ok((converted, old_parent_id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashSubtreeResult {
+    pub project_id: ProjectId,
+    pub root: Item,
+    pub trashed_feature_ids: Vec<ItemId>,
+    pub trashed_work_item_ids: Vec<ItemId>,
+    pub spared_shared_work_item_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTrashResult {
+    pub project_id: ProjectId,
+    pub root: Item,
+    pub restored_count: usize,
+    pub promoted_to_root: bool,
+    pub pruned_blocker_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeTrashResult {
+    pub project_id: ProjectId,
+    pub root_key: String,
+    pub root_title: String,
+    pub purged_item_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyTrashResult {
+    pub project_id: ProjectId,
+    pub purged_group_count: usize,
+    pub purged_item_count: usize,
+}
+
+/// Soft-deletes a Work Item or an entire Feature subtree while sparing shared active Work Items (`DATA_MODEL.md` §4.7 / `INV-12`).
+pub fn trash_item_subtree(
+    tx: &Transaction<'_>,
+    target_id: ItemId,
+) -> Result<TrashSubtreeResult, DomainError> {
+    let target = get_item(tx, target_id)?;
+    if !target.is_active() {
+        return Err(DomainError::Validation(
+            "Item is already in Trash".to_string(),
+        ));
+    }
+
+    let target_sql = uuid_to_sql(target_id.0);
+
+    let (trashed_feature_ids, trashed_work_item_ids, spared_shared_work_item_count) =
+        if target.kind == ItemKind::WorkItem {
+            (Vec::new(), vec![target.id], 0usize)
+        } else {
+            let feature_ids = {
+                let mut stmt = tx
+                    .prepare(
+                        "WITH RECURSIVE target_subtree(id, depth) AS (
+                            SELECT id, 0 FROM items WHERE id = ?1 AND deleted_at IS NULL
+                            UNION ALL
+                            SELECT c.id, ts.depth + 1
+                            FROM items c
+                            JOIN target_subtree ts ON c.parent_feature_id = ts.id
+                            WHERE c.kind = 'feature'
+                              AND c.deleted_at IS NULL
+                              AND ts.depth < 32
+                        )
+                        SELECT ts.id
+                        FROM target_subtree ts
+                        JOIN items i ON i.id = ts.id
+                        ORDER BY ts.depth ASC, i.item_number ASC;",
+                    )
+                    .map_err(map_sqlite_err)?;
+                let rows = stmt
+                    .query_map(params![&target_sql], |row| {
+                        Ok(ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?))
+                    })
+                    .map_err(map_sqlite_err)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+            };
+
+            let exclusive_wi_ids = {
+                let mut stmt = tx
+                    .prepare(
+                        "WITH RECURSIVE target_subtree(id, depth) AS (
+                            SELECT id, 0 FROM items WHERE id = ?1 AND deleted_at IS NULL
+                            UNION ALL
+                            SELECT c.id, ts.depth + 1
+                            FROM items c
+                            JOIN target_subtree ts ON c.parent_feature_id = ts.id
+                            WHERE c.kind = 'feature'
+                              AND c.deleted_at IS NULL
+                              AND ts.depth < 32
+                        )
+                        SELECT DISTINCT wi.id
+                        FROM feature_work_items fwi
+                        JOIN items wi ON wi.id = fwi.work_item_id
+                        WHERE fwi.feature_id IN (SELECT id FROM target_subtree)
+                          AND wi.deleted_at IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM feature_work_items other_fwi
+                              JOIN items other_f ON other_f.id = other_fwi.feature_id
+                              WHERE other_fwi.work_item_id = wi.id
+                                AND other_f.deleted_at IS NULL
+                                AND other_f.id NOT IN (SELECT id FROM target_subtree)
+                          )
+                        ORDER BY wi.item_number ASC;",
+                    )
+                    .map_err(map_sqlite_err)?;
+                let rows = stmt
+                    .query_map(params![&target_sql], |row| {
+                        Ok(ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?))
+                    })
+                    .map_err(map_sqlite_err)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+            };
+
+            let spared_i64: i64 = tx
+                .query_row(
+                    "WITH RECURSIVE target_subtree(id, depth) AS (
+                        SELECT id, 0 FROM items WHERE id = ?1 AND deleted_at IS NULL
+                        UNION ALL
+                        SELECT c.id, ts.depth + 1
+                        FROM items c
+                        JOIN target_subtree ts ON c.parent_feature_id = ts.id
+                        WHERE c.kind = 'feature'
+                          AND c.deleted_at IS NULL
+                          AND ts.depth < 32
+                    )
+                    SELECT COUNT(DISTINCT wi.id)
+                    FROM feature_work_items fwi
+                    JOIN items wi ON wi.id = fwi.work_item_id
+                    WHERE fwi.feature_id IN (SELECT id FROM target_subtree)
+                      AND wi.deleted_at IS NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM feature_work_items other_fwi
+                          JOIN items other_f ON other_f.id = other_fwi.feature_id
+                          WHERE other_fwi.work_item_id = wi.id
+                            AND other_f.deleted_at IS NULL
+                            AND other_f.id NOT IN (SELECT id FROM target_subtree)
+                      );",
+                    params![&target_sql],
+                    |row| row.get(0),
+                )
+                .map_err(map_sqlite_err)?;
+            let spared = usize::try_from(spared_i64).unwrap_or(0);
+
+            (feature_ids, exclusive_wi_ids, spared)
+        };
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+
+    tx.execute(
+        "WITH RECURSIVE target_subtree(id, depth) AS (
+            SELECT id, 0 FROM items WHERE id = ?1 AND deleted_at IS NULL
+            UNION ALL
+            SELECT c.id, ts.depth + 1
+            FROM items c
+            JOIN target_subtree ts ON c.parent_feature_id = ts.id
+            WHERE c.kind = 'feature'
+              AND c.deleted_at IS NULL
+              AND ts.depth < 32
+        ),
+        exclusively_owned_wis AS (
+            SELECT DISTINCT fwi.work_item_id AS id
+            FROM feature_work_items fwi
+            JOIN items wi ON wi.id = fwi.work_item_id
+            WHERE fwi.feature_id IN (SELECT id FROM target_subtree)
+              AND wi.deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM feature_work_items other_fwi
+                  JOIN items other_f ON other_f.id = other_fwi.feature_id
+                  WHERE other_fwi.work_item_id = wi.id
+                    AND other_f.deleted_at IS NULL
+                    AND other_f.id NOT IN (SELECT id FROM target_subtree)
+              )
+        )
+        UPDATE items
+        SET deleted_at = ?2,
+            trash_root_id = ?1,
+            updated_at = ?2
+        WHERE id IN (
+            SELECT id FROM target_subtree
+            UNION
+            SELECT id FROM exclusively_owned_wis
+        );",
+        params![&target_sql, &now_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    let root = Item {
+        deleted_at: Some(now),
+        trash_root_id: Some(target.id),
+        updated_at: now,
+        ..target
+    };
+
+    Ok(TrashSubtreeResult {
+        project_id: root.project_id,
+        root,
+        trashed_feature_ids,
+        trashed_work_item_ids,
+        spared_shared_work_item_count,
+    })
+}
+
+/// Lists all grouped Trash roots for `project_id`, ordered newest deleted first.
+pub fn list_trash_groups(
+    conn: &Connection,
+    project_id: ProjectId,
+) -> Result<Vec<TrashGroup>, DomainError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.id, r.project_id, r.item_number, r.item_key, r.kind, r.parent_feature_id,
+                    r.title, r.description, r.status, r.priority, r.assignee_id, r.sort_order,
+                    r.deleted_at, r.trash_root_id, r.created_at, r.updated_at,
+                    COUNT(m.id) AS total_count,
+                    SUM(CASE WHEN m.id != r.id AND m.kind = 'feature' THEN 1 ELSE 0 END) AS desc_feat_count,
+                    SUM(CASE WHEN m.id != r.id AND m.kind = 'work_item' THEN 1 ELSE 0 END) AS desc_wi_count
+             FROM items r
+             JOIN items m
+               ON m.project_id = r.project_id
+              AND m.trash_root_id = r.id
+              AND m.deleted_at IS NOT NULL
+             WHERE r.project_id = ?1
+               AND r.deleted_at IS NOT NULL
+               AND r.trash_root_id = r.id
+             GROUP BY r.id
+             ORDER BY r.deleted_at DESC, r.item_number DESC;",
+        )
+        .map_err(map_sqlite_err)?;
+
+    let rows = stmt
+        .query_map(params![uuid_to_sql(project_id.0)], |row| {
+            let root = row_to_item(row)?;
+            let total_i64: i64 = row.get(16)?;
+            let feat_i64: i64 = row.get(17)?;
+            let wi_i64: i64 = row.get(18)?;
+            let deleted_at = root.deleted_at.unwrap_or(root.updated_at);
+            Ok(TrashGroup {
+                root,
+                deleted_at,
+                descendant_feature_count: usize::try_from(feat_i64).unwrap_or(0),
+                descendant_work_item_count: usize::try_from(wi_i64).unwrap_or(0),
+                total_item_count: usize::try_from(total_i64).unwrap_or(1),
+            })
+        })
+        .map_err(map_sqlite_err)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)
+}
+
+fn self_and_ancestors(
+    start: ItemId,
+    parent_of: &HashMap<ItemId, Option<ItemId>>,
+) -> HashSet<ItemId> {
+    let mut out = HashSet::new();
+    let mut curr = Some(start);
+    while let Some(id) = curr {
+        if !out.insert(id) || out.len() > MAX_FEATURE_DEPTH + 1 {
+            break;
+        }
+        curr = parent_of.get(&id).copied().flatten();
+    }
+    out
+}
+
+fn is_reachable_in_adj(start: ItemId, target: ItemId, adj: &HashMap<ItemId, Vec<ItemId>>) -> bool {
+    let mut visited = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        if node == target {
+            return true;
+        }
+        if !visited.insert(node) {
+            continue;
+        }
+        if let Some(nexts) = adj.get(&node) {
+            for &next in nexts {
+                if !visited.contains(&next) {
+                    stack.push(next);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Atomically restores an entire Trash group (`trash_root_id`), promoting root if its parent was
+/// purged/trashed/converted and pruning any blocker edges that would violate `INV-05`.
+pub fn restore_trash_group(
+    tx: &Transaction<'_>,
+    trash_root_id: ItemId,
+) -> Result<RestoreTrashResult, DomainError> {
+    let root = get_item(tx, trash_root_id)?;
+    if root.is_active() || root.trash_root_id != Some(trash_root_id) {
+        return Err(DomainError::Validation(
+            "Selected item is not a Trash group root".to_string(),
+        ));
+    }
+
+    let project_sql = uuid_to_sql(root.project_id.0);
+    let root_sql = uuid_to_sql(trash_root_id.0);
+
+    let members: Vec<Item> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, project_id, item_number, item_key, kind, parent_feature_id,
+                        title, description, status, priority, assignee_id, sort_order,
+                        deleted_at, trash_root_id, created_at, updated_at
+                 FROM items
+                 WHERE project_id = ?1
+                   AND trash_root_id = ?2
+                   AND deleted_at IS NOT NULL
+                 ORDER BY item_number ASC;",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![&project_sql, &root_sql], row_to_item)
+            .map_err(map_sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+    };
+
+    if members.is_empty() {
+        return Err(DomainError::ItemNotFound(trash_root_id));
+    }
+
+    let member_ids: HashSet<ItemId> = members.iter().map(|m| m.id).collect();
+
+    let mut promoted_to_root = false;
+    if root.kind == ItemKind::Feature
+        && let Some(parent_id) = root.parent_feature_id
+    {
+        let parent_valid = get_item(tx, parent_id)
+            .ok()
+            .is_some_and(|p| p.project_id == root.project_id && p.is_active() && p.kind == ItemKind::Feature);
+        if !parent_valid {
+            promoted_to_root = true;
+        } else {
+            let mut children_by_parent: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+            for m in &members {
+                if m.kind == ItemKind::Feature
+                    && m.id != root.id
+                    && let Some(pid) = m.parent_feature_id
+                {
+                    children_by_parent.entry(pid).or_default().push(m.id);
+                }
+            }
+            let mut max_offset = 0usize;
+            let mut visited = HashSet::from([root.id]);
+            let mut stack = vec![(root.id, 0usize)];
+            while let Some((fid, offset)) = stack.pop() {
+                max_offset = max_offset.max(offset);
+                if let Some(children) = children_by_parent.get(&fid) {
+                    for &cid in children {
+                        if visited.insert(cid) {
+                            stack.push((cid, offset + 1));
+                        }
+                    }
+                }
+            }
+            let parent_depth = feature_depth(tx, parent_id)?;
+            if parent_depth + 1 + max_offset >= MAX_FEATURE_DEPTH {
+                promoted_to_root = true;
+            }
+        }
+    }
+
+    let mut orphaned_member_ids = Vec::new();
+    for m in &members {
+        if m.id != root.id
+            && m.kind == ItemKind::Feature
+            && let Some(pid) = m.parent_feature_id
+        {
+            let valid_in_group = member_ids.contains(&pid);
+            let valid_active = !valid_in_group
+                && get_item(tx, pid).ok().is_some_and(|p| {
+                    p.project_id == root.project_id && p.is_active() && p.kind == ItemKind::Feature
+                });
+            if !valid_in_group && !valid_active {
+                orphaned_member_ids.push(m.id);
+            }
+        }
+    }
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+
+    tx.execute(
+        "UPDATE items
+         SET deleted_at = NULL,
+             trash_root_id = NULL,
+             updated_at = ?1
+         WHERE project_id = ?2
+           AND trash_root_id = ?3
+           AND deleted_at IS NOT NULL;",
+        params![&now_sql, &project_sql, &root_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    if promoted_to_root {
+        let new_sort_order =
+            append_sort_order_for_parent(tx, root.project_id, None, Some(root.id), &now_sql)?;
+        tx.execute(
+            "UPDATE items
+             SET parent_feature_id = NULL,
+                 sort_order = ?1,
+                 updated_at = ?2
+             WHERE id = ?3;",
+            params![&new_sort_order, &now_sql, &root_sql],
+        )
+        .map_err(map_sqlite_err)?;
+    }
+
+    for orphan_id in orphaned_member_ids {
+        let new_sort_order =
+            append_sort_order_for_parent(tx, root.project_id, None, Some(orphan_id), &now_sql)?;
+        tx.execute(
+            "UPDATE items
+             SET parent_feature_id = NULL,
+                 sort_order = ?1,
+                 updated_at = ?2
+             WHERE id = ?3;",
+            params![&new_sort_order, &now_sql, uuid_to_sql(orphan_id.0)],
+        )
+        .map_err(map_sqlite_err)?;
+    }
+
+    // Re-validate INV-05 DAG acyclicity & ancestor/descendant exclusion for restored edges.
+    let mut parent_of: HashMap<ItemId, Option<ItemId>> = HashMap::new();
+    let mut adj: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, parent_feature_id
+                 FROM items
+                 WHERE project_id = ?1
+                   AND kind = 'feature'
+                   AND deleted_at IS NULL;",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![&project_sql], |row| {
+                let id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+                let parent_opt: Option<String> = row.get(1)?;
+                let parent_id = parent_opt
+                    .map(|raw| parse_uuid_col(1, raw).map(ItemId::from_uuid))
+                    .transpose()?;
+                Ok((id, parent_id))
+            })
+            .map_err(map_sqlite_err)?;
+        for pair in rows {
+            let (id, pid) = pair.map_err(map_sqlite_err)?;
+            parent_of.insert(id, pid);
+            if let Some(parent_id) = pid {
+                adj.entry(id).or_default().push(parent_id);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ActiveBlockerEdge {
+        blocked_id: ItemId,
+        blocked_kind: ItemKind,
+        blocked_num: i64,
+        blocker_id: ItemId,
+        blocker_num: i64,
+    }
+
+    let active_edges: Vec<ActiveBlockerEdge> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT ib.blocked_item_id, b.kind, b.item_number, ib.blocker_feature_id, r.item_number
+                 FROM item_blockers ib
+                 JOIN items b ON b.id = ib.blocked_item_id
+                 JOIN items r ON r.id = ib.blocker_feature_id
+                 WHERE ib.project_id = ?1
+                   AND b.deleted_at IS NULL
+                   AND r.deleted_at IS NULL
+                 ORDER BY b.item_number ASC, r.item_number ASC;",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![&project_sql], |row| {
+                let blocked_id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+                let kind_raw: String = row.get(1)?;
+                let blocked_kind = parse_domain_col(1, ItemKind::from_db_str(&kind_raw))?;
+                let blocked_num: i64 = row.get(2)?;
+                let blocker_id = ItemId::from_uuid(parse_uuid_col(3, row.get(3)?)?);
+                let blocker_num: i64 = row.get(4)?;
+                Ok(ActiveBlockerEdge {
+                    blocked_id,
+                    blocked_kind,
+                    blocked_num,
+                    blocker_id,
+                    blocker_num,
+                })
+            })
+            .map_err(map_sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_err)?
+    };
+
+    let mut feature_candidates = Vec::new();
+    let mut wi_edges = Vec::new();
+
+    for edge in active_edges {
+        if edge.blocked_kind == ItemKind::Feature {
+            if member_ids.contains(&edge.blocked_id) || member_ids.contains(&edge.blocker_id) {
+                feature_candidates.push(edge);
+            } else {
+                adj.entry(edge.blocked_id).or_default().push(edge.blocker_id);
+            }
+        } else {
+            wi_edges.push(edge);
+        }
+    }
+
+    feature_candidates.sort_by_key(|e| (e.blocked_num, e.blocker_num));
+    let mut pruned_blocker_count = 0usize;
+
+    for edge in feature_candidates {
+        let b = edge.blocked_id;
+        let r = edge.blocker_id;
+        let b_ancestors = self_and_ancestors(b, &parent_of);
+        let r_ancestors = self_and_ancestors(r, &parent_of);
+        let invalid_exclusion = b == r || b_ancestors.contains(&r) || r_ancestors.contains(&b);
+        let creates_cycle = !invalid_exclusion && is_reachable_in_adj(r, b, &adj);
+
+        if invalid_exclusion || creates_cycle {
+            tx.execute(
+                "DELETE FROM item_blockers
+                 WHERE blocked_item_id = ?1 AND blocker_feature_id = ?2;",
+                params![uuid_to_sql(b.0), uuid_to_sql(r.0)],
+            )
+            .map_err(map_sqlite_err)?;
+            pruned_blocker_count += 1;
+        } else {
+            adj.entry(b).or_default().push(r);
+        }
+    }
+
+    if !wi_edges.is_empty() {
+        let mut wi_features: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT fwi.work_item_id, fwi.feature_id
+                     FROM feature_work_items fwi
+                     JOIN items f ON f.id = fwi.feature_id
+                     JOIN items wi ON wi.id = fwi.work_item_id
+                     WHERE fwi.project_id = ?1
+                       AND f.deleted_at IS NULL
+                       AND wi.deleted_at IS NULL;",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![&project_sql], |row| {
+                    let wi_id = ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?);
+                    let fid = ItemId::from_uuid(parse_uuid_col(1, row.get(1)?)?);
+                    Ok((wi_id, fid))
+                })
+                .map_err(map_sqlite_err)?;
+            for pair in rows {
+                let (wi_id, fid) = pair.map_err(map_sqlite_err)?;
+                wi_features.entry(wi_id).or_default().push(fid);
+            }
+        }
+
+        for edge in wi_edges {
+            if let Some(attached) = wi_features.get(&edge.blocked_id) {
+                let mut forbidden = HashSet::new();
+                for &fid in attached {
+                    forbidden.extend(self_and_ancestors(fid, &parent_of));
+                }
+                if forbidden.contains(&edge.blocker_id) {
+                    tx.execute(
+                        "DELETE FROM item_blockers
+                         WHERE blocked_item_id = ?1 AND blocker_feature_id = ?2;",
+                        params![
+                            uuid_to_sql(edge.blocked_id.0),
+                            uuid_to_sql(edge.blocker_id.0)
+                        ],
+                    )
+                    .map_err(map_sqlite_err)?;
+                    pruned_blocker_count += 1;
+                }
+            }
+        }
+    }
+
+    let restored_root = get_item(tx, trash_root_id)?;
+    Ok(RestoreTrashResult {
+        project_id: restored_root.project_id,
+        root: restored_root,
+        restored_count: members.len(),
+        promoted_to_root,
+        pruned_blocker_count,
+    })
+}
+
+/// Permanently deletes a Trash group (`trash_root_id`), cascading only to items inside that Trash
+/// group and join rows while keeping shared active Work Items intact (`INV-12`).
+pub fn purge_trash_group(
+    tx: &Transaction<'_>,
+    trash_root_id: ItemId,
+) -> Result<PurgeTrashResult, DomainError> {
+    let root = get_item(tx, trash_root_id)?;
+    if root.is_active() || root.trash_root_id != Some(trash_root_id) {
+        return Err(DomainError::Validation(
+            "Selected item is not a Trash group root".to_string(),
+        ));
+    }
+
+    let project_sql = uuid_to_sql(root.project_id.0);
+    let root_sql = uuid_to_sql(trash_root_id.0);
+
+    let count_i64: i64 = tx
+        .query_row(
+            "SELECT COUNT(*)
+             FROM items
+             WHERE project_id = ?1
+               AND trash_root_id = ?2
+               AND deleted_at IS NOT NULL;",
+            params![&project_sql, &root_sql],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    let purged_item_count = usize::try_from(count_i64).unwrap_or(1);
+
+    // Detach any separately trashed child groups so purging this group does not cascade-delete them.
+    tx.execute(
+        "UPDATE items
+         SET parent_feature_id = NULL
+         WHERE project_id = ?1
+           AND deleted_at IS NOT NULL
+           AND trash_root_id != ?2
+           AND parent_feature_id IN (
+               SELECT id FROM items WHERE project_id = ?1 AND trash_root_id = ?2
+           );",
+        params![&project_sql, &root_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    tx.execute("DELETE FROM items WHERE id = ?1;", params![&root_sql])
+        .map_err(map_sqlite_err)?;
+
+    Ok(PurgeTrashResult {
+        project_id: root.project_id,
+        root_key: root.item_key,
+        root_title: root.title,
+        purged_item_count,
+    })
+}
+
+/// Permanently deletes all trashed items in `project_id` (`INV-01`, `INV-12`).
+pub fn empty_project_trash(
+    tx: &Transaction<'_>,
+    project_id: ProjectId,
+) -> Result<EmptyTrashResult, DomainError> {
+    let _project = get_project(tx, project_id)?;
+    let project_sql = uuid_to_sql(project_id.0);
+
+    let (group_i64, item_i64): (i64, i64) = tx
+        .query_row(
+            "SELECT COUNT(DISTINCT trash_root_id), COUNT(*)
+             FROM items
+             WHERE project_id = ?1 AND deleted_at IS NOT NULL;",
+            params![&project_sql],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(map_sqlite_err)?;
+
+    let purged_group_count = usize::try_from(group_i64).unwrap_or(0);
+    let purged_item_count = usize::try_from(item_i64).unwrap_or(0);
+
+    if purged_item_count > 0 {
+        tx.execute(
+            "DELETE FROM items WHERE project_id = ?1 AND deleted_at IS NOT NULL;",
+            params![&project_sql],
+        )
+        .map_err(map_sqlite_err)?;
+    }
+
+    Ok(EmptyTrashResult {
+        project_id,
+        purged_group_count,
+        purged_item_count,
+    })
 }

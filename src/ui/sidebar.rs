@@ -560,6 +560,7 @@ pub fn render_sidebar(
                 .child(
                     h_flex()
                         .id("sidebar-trash-nav")
+                        .test_support()
                         .w_full()
                         .px_2()
                         .py_1()
@@ -591,6 +592,8 @@ pub fn render_sidebar(
                         .child(div().flex_1().text_xs().child("Trash"))
                         .child(
                             div()
+                                .id("sidebar-trash-count")
+                                .test_support()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!("({trash_count})")),

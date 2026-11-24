@@ -20,7 +20,7 @@ use gpui_kit::{
 
 use crate::commands::{
     ConvertFeatureToWorkItem, ConvertWorkItemToFeature, CreateFeature, CreateWorkItem,
-    DetachWorkItemFromFeature, UndoableCommand, UpdateItemFields,
+    DetachWorkItemFromFeature, TrashItemSubtree, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
     ConversionEligibility, FeatureProgress, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH,
@@ -726,6 +726,7 @@ impl OutlineView {
             "Convert to Feature"
         };
         let app_convert = app_state.clone();
+        let app_trash = app_state.clone();
 
         if is_feature {
             let store_focus = store;
@@ -759,6 +760,19 @@ impl OutlineView {
                                 cx,
                             );
                         }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Move to Trash")
+                        .icon(IconName::Delete)
+                        .on_click(move |_, window, cx| {
+                            OutlineView::dispatch_command(
+                                app_trash.clone(),
+                                Box::new(TrashItemSubtree::new(item_id)),
+                                window,
+                                cx,
+                            );
+                        }),
                 );
         } else {
             let pfid = parent_feature.id;
@@ -786,6 +800,19 @@ impl OutlineView {
                             OutlineView::dispatch_command(
                                 app_detach.clone(),
                                 Box::new(DetachWorkItemFromFeature::new(item_id, pfid)),
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Move to Trash")
+                        .icon(IconName::Delete)
+                        .on_click(move |_, window, cx| {
+                            OutlineView::dispatch_command(
+                                app_trash.clone(),
+                                Box::new(TrashItemSubtree::new(item_id)),
                                 window,
                                 cx,
                             );
@@ -1908,6 +1935,7 @@ mod tests {
             effective_block_state: HashMap::new(),
             blocker_warnings: HashMap::new(),
             trash_count: 0,
+            trash_groups: Vec::new(),
         };
         snap.progress_by_feature = snap.compute_progress_map();
         (snap, f1, f2, f3, w_shared, w_done)

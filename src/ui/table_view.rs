@@ -19,7 +19,8 @@ use gpui_kit::{
 };
 
 use crate::commands::{
-    ConvertFeatureToWorkItem, ConvertWorkItemToFeature, UndoableCommand, UpdateItemFields,
+    ConvertFeatureToWorkItem, ConvertWorkItemToFeature, TrashItemSubtree, UndoableCommand,
+    UpdateItemFields,
 };
 use crate::domain::{
     Assignee, AssigneeId, BlockerWarning, ConversionEligibility, EffectiveBlockState, Item,
@@ -807,6 +808,20 @@ impl TableDelegate for ItemTableDelegate {
                     }),
             );
         }
+
+        let app_trash = self.app_state.clone();
+        menu = menu.separator().item(
+            PopupMenuItem::new("Move to Trash")
+                .icon(IconName::Delete)
+                .on_click(move |_, window, cx| {
+                    Self::dispatch_command(
+                        app_trash.clone(),
+                        Box::new(TrashItemSubtree::new(item_id)),
+                        window,
+                        cx,
+                    );
+                }),
+        );
 
         menu
     }
@@ -1825,6 +1840,7 @@ mod tests {
             effective_block_state,
             blocker_warnings,
             trash_count: 0,
+            trash_groups: Vec::new(),
         };
 
         (snap, f1, f2, f3, wi_shared_3, wi_partial, wi_inherited, wi_warn, a1, t_bug)

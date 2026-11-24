@@ -46,7 +46,7 @@ When starting any phase in a fresh agent session, follow these 5 steps in order:
 | [x] | **Phase 7** | Features-Only Blocking Engine & Transitive Propagation | Phase 6 | Add/remove Feature blockers, enforce DAG acyclicity (`INV-05`), see Direct/Inherited/Partial badges & warnings |
 | [x] | **Phase 8** | Strictly Guarded Feature ↔ Work Item Conversion | Phase 7 | Lossless bidirectional conversion preserving `PRO-N`, with live strict-guard tooltips when blocked |
 | [x] | **Phase 9** | Filtered Virtualized Table / List View | Phase 8 | Deduplicated `DataTable` with multi-facet filter bar (`Ready` vs `Blocked`, Priority, Assignee, Tags) & sorting |
-| [ ] | **Phase 10** | Full-Cascade Trash, Restore & Permanent Purge | Phase 8 | Safe cascade deletion of Feature subtrees sparing shared Work Items, plus Trash View & Restore |
+| [x] | **Phase 10** | Full-Cascade Trash, Restore & Permanent Purge | Phase 8 | Safe cascade deletion of Feature subtrees sparing shared Work Items, plus Trash View & Restore |
 | [ ] | **Phase 11** | Drag-and-Drop, Quick Search (`Cmd+K`) & Quick Add (`Cmd+N`) | Phase 9, 10 | Full DnD matrix (`Option`-drag to multi-attach), FTS5 `Cmd+K` search palette, and contextual `Cmd+N` modal |
 | [ ] | **Phase 12** | Session Undo/Redo (`Cmd+Z`), Hardening & Polish | Phase 11 | Full session Undo/Redo, hardened cloud-sync WAL shutdown, AccessKit audit, and fuzz/round-trip suite |
 

@@ -19,6 +19,7 @@ use crate::ui::modals::{open_new_project_modal, open_workspace_modal};
 use crate::ui::outline_view::OutlineView;
 use crate::ui::sidebar::render_sidebar;
 use crate::ui::table_view::TableView;
+use crate::ui::trash_view::TrashView;
 use crate::ui::unallocated_view::UnallocatedView;
 use crate::ui::{
     OpenWorkspace, ToggleInspector, ToggleSidebar, build_project_switcher_menu, parse_hex_or,
@@ -30,6 +31,7 @@ pub struct WorkspaceShell {
     inspector: Entity<InspectorView>,
     outline_view: Entity<OutlineView>,
     table_view: Entity<TableView>,
+    trash_view: Entity<TrashView>,
     unallocated_view: Entity<UnallocatedView>,
     focus_handle: FocusHandle,
     resizable_state: Entity<ResizableState>,
@@ -58,6 +60,8 @@ impl WorkspaceShell {
             cx.new(|cx| OutlineView::new(app_state.clone(), store.clone(), window, cx));
         let table_view =
             cx.new(|cx| TableView::new(app_state.clone(), store.clone(), window, cx));
+        let trash_view =
+            cx.new(|cx| TrashView::new(app_state.clone(), store.clone(), window, cx));
         let unallocated_view =
             cx.new(|cx| UnallocatedView::new(app_state.clone(), store.clone(), window, cx));
         let prefs = app_state.read(cx).preferences().clone();
@@ -112,6 +116,7 @@ impl WorkspaceShell {
             inspector,
             outline_view,
             table_view,
+            trash_view,
             unallocated_view,
             focus_handle,
             resizable_state,
@@ -142,6 +147,10 @@ impl WorkspaceShell {
 
     pub fn table_view(&self) -> &Entity<TableView> {
         &self.table_view
+    }
+
+    pub fn trash_view(&self) -> &Entity<TrashView> {
+        &self.trash_view
     }
 
     pub fn unallocated_view(&self) -> &Entity<UnallocatedView> {
@@ -628,7 +637,7 @@ impl WorkspaceShell {
             CenterViewTab::Outline => self.outline_view.clone().into_any_element(),
             CenterViewTab::Table => self.table_view.clone().into_any_element(),
             CenterViewTab::Unallocated => self.unallocated_view.clone().into_any_element(),
-            CenterViewTab::Trash => self.render_trash_body(cx).into_any_element(),
+            CenterViewTab::Trash => self.trash_view.clone().into_any_element(),
         };
 
         v_flex()
@@ -637,27 +646,6 @@ impl WorkspaceShell {
             .bg(cx.theme().background)
             .child(header)
             .child(body)
-    }
-
-    fn render_trash_body(&self, cx: &App) -> impl IntoElement {
-        v_flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .p_8()
-            .gap_2()
-            .child(
-                Icon::new(IconName::Delete)
-                    .large()
-                    .text_color(cx.theme().muted_foreground),
-            )
-            .child(div().text_sm().font_semibold().child("Trash is empty"))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Full-cascade Feature Trash & Restore will arrive in Phase 10."),
-            )
     }
 }
 

@@ -2,6 +2,7 @@ pub mod blocker_commands;
 pub mod conversion_commands;
 pub mod item_commands;
 pub mod meta_commands;
+pub mod trash_commands;
 
 use rusqlite::Transaction;
 
@@ -16,6 +17,7 @@ pub use item_commands::{
 pub use meta_commands::{
     ArchiveAssignee, CreateProject, DeleteTag, UpdateProject, UpsertAssignee, UpsertTag,
 };
+pub use trash_commands::{EmptyTrash, PurgeTrashGroup, RestoreTrashGroup, TrashItemSubtree};
 
 /// Result emitted by executing or undoing a command inside a SQLite transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -639,5 +641,97 @@ mod tests {
         let snap = load_project_snapshot(&conn, pid).unwrap();
         assert_eq!(snap.item(wi_id).unwrap().item_key, "CNV-2");
         assert_eq!(snap.features_for_work_item(wi_id).len(), 1);
+    }
+
+    #[test]
+    fn trash_commands_execute_atomically_and_emit_events_and_toasts() {
+        use crate::db::load_project_snapshot;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "TrashCmdTest").unwrap();
+
+        let pid = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cp = CreateProject::new("TrashCmd", "TRSH", "", "#6366F1", ProjectStatus::Active);
+            let pid = cp.execute(&tx).unwrap().created_project_id.unwrap();
+            tx.commit().unwrap();
+            pid
+        };
+
+        let (f1_id, f3_id) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cf1 = CreateFeature::new(pid, None, "Epic", "", ItemStatus::Todo, Priority::High);
+            let f1 = cf1.execute(&tx).unwrap().created_item_id.unwrap();
+            let mut cf2 = CreateFeature::new(pid, Some(f1), "Sub", "", ItemStatus::Todo, Priority::Medium);
+            let f2 = cf2.execute(&tx).unwrap().created_item_id.unwrap();
+            let mut cf3 = CreateFeature::new(pid, None, "Other", "", ItemStatus::Todo, Priority::Low);
+            let f3 = cf3.execute(&tx).unwrap().created_item_id.unwrap();
+            let mut c_excl = CreateWorkItem::new(pid, "Exclusive", "", ItemStatus::Todo, Priority::None, vec![f2]);
+            c_excl.execute(&tx).unwrap();
+            let mut c_shared = CreateWorkItem::new(pid, "Shared", "", ItemStatus::Todo, Priority::None, vec![f2, f3]);
+            c_shared.execute(&tx).unwrap();
+            tx.commit().unwrap();
+            (f1, f3)
+        };
+
+        // TrashItemSubtree
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cmd = TrashItemSubtree::new(f1_id);
+            let eff = cmd.execute(&tx).unwrap();
+            assert_eq!(
+                eff.events,
+                vec![
+                    DomainEvent::ItemsChanged { project_id: pid },
+                    DomainEvent::TrashChanged { project_id: pid },
+                ]
+            );
+            let toast = eff.toast.unwrap();
+            assert!(toast.contains("TRSH-1"));
+            assert!(toast.contains("+1 sub-feature"));
+            assert!(toast.contains("+1 work item"));
+            assert!(toast.contains("1 shared work item kept active"));
+            tx.commit().unwrap();
+        }
+        assert_eq!(load_project_snapshot(&conn, pid).unwrap().trash_count, 1);
+
+        // RestoreTrashGroup
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cmd = RestoreTrashGroup::new(f1_id);
+            let eff = cmd.execute(&tx).unwrap();
+            assert_eq!(eff.selected_item_id, Some(f1_id));
+            assert!(eff.toast.unwrap().contains("Restored TRSH-1 (3 items)"));
+            tx.commit().unwrap();
+        }
+        assert_eq!(load_project_snapshot(&conn, pid).unwrap().trash_count, 0);
+
+        // Trash again, PurgeTrashGroup, then Trash F3 + EmptyTrash
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            TrashItemSubtree::new(f1_id).execute(&tx).unwrap();
+            let mut purge = PurgeTrashGroup::new(f1_id);
+            let purge_eff = purge.execute(&tx).unwrap();
+            assert!(purge_eff.toast.unwrap().contains("Permanently deleted TRSH-1 (3 items)"));
+            assert!(purge.undo(&tx).is_err());
+
+            TrashItemSubtree::new(f3_id).execute(&tx).unwrap();
+            let mut empty = EmptyTrash::new(pid);
+            let empty_eff = empty.execute(&tx).unwrap();
+            assert!(empty_eff.toast.unwrap().contains("Emptied Trash (2 items permanently deleted)"));
+            assert!(empty.undo(&tx).is_err());
+            tx.commit().unwrap();
+        }
+        assert!(load_project_snapshot(&conn, pid).unwrap().active_items().is_empty());
     }
 }

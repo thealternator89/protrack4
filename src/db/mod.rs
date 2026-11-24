@@ -191,15 +191,8 @@ pub fn load_project_snapshot(
 
     let progress_by_feature = item_repo::query_feature_progress_rollup(conn, project_id)?;
     let block_snapshot = blocker_repo::load_project_block_snapshot(conn, project_id)?;
-
-    let trash_count_i64: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT trash_root_id) FROM items WHERE project_id = ?1 AND deleted_at IS NOT NULL;",
-            params![&project_id_sql],
-            |row| row.get(0),
-        )
-        .map_err(map_sqlite_err)?;
-    let trash_count = usize::try_from(trash_count_i64).unwrap_or(0);
+    let trash_groups = item_repo::list_trash_groups(conn, project_id)?;
+    let trash_count = trash_groups.len();
 
     Ok(ProjectSnapshot {
         project,
@@ -216,6 +209,7 @@ pub fn load_project_snapshot(
         effective_block_state: block_snapshot.effective_block_state,
         blocker_warnings: block_snapshot.blocker_warnings,
         trash_count,
+        trash_groups,
     })
 }
 
@@ -2504,6 +2498,445 @@ mod tests {
         let final_snap = load_project_snapshot(&conn, pid).unwrap();
         assert_eq!(final_snap.direct_blockers(f_leaf_with_trash.id).len(), 1);
         assert_eq!(get_item(&conn, f_leaf_with_trash.id).unwrap().kind, ItemKind::WorkItem);
+    }
+
+    #[test]
+    fn inv12_cascade_trash_shared_work_item_protection_restore_purge_and_empty() {
+        use crate::db::blocker_repo::add_blocker;
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, convert_feature_to_work_item, create_feature,
+            create_work_item, empty_project_trash, get_item, list_trash_groups, purge_trash_group,
+            query_features_for_work_item, restore_trash_group, trash_item_subtree,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::domain::{
+            BlockerWarning, EffectiveBlockState, ItemStatus, Priority, ProjectStatus,
+        };
+        use rusqlite::TransactionBehavior;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "TrashTest").unwrap();
+
+        let (pid_a, pid_b) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let pa = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Alpha".to_string(),
+                    key_prefix: "ALP".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let pb = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Beta".to_string(),
+                    key_prefix: "BET".to_string(),
+                    description: String::new(),
+                    color: "#10B981".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (pa.id, pb.id)
+        };
+
+        // Setup: F1 -> F2, F3, F_dep (blocked on F1), exclusive W2 on [F2], shared W1 on [F2, F3]
+        let (f1, f2, f3, f_dep, w1_shared, w2_excl, fb) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let f1 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Auth Epic".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                },
+            )
+            .unwrap();
+            let f2 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: Some(f1.id),
+                    title: "OAuth Flow".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                },
+            )
+            .unwrap();
+            let f3 = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "CLI Client".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                },
+            )
+            .unwrap();
+            let f_dep = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Launch App".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                },
+            )
+            .unwrap();
+            add_blocker(&tx, f_dep.id, f1.id).unwrap();
+
+            let w1 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid_a,
+                    title: "Token Refresh".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::High,
+                    feature_ids: vec![f2.id, f3.id],
+                },
+            )
+            .unwrap();
+            let w2 = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid_a,
+                    title: "Callback Handler".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Low,
+                    feature_ids: vec![f2.id],
+                },
+            )
+            .unwrap();
+
+            let fb = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_b,
+                    parent_feature_id: None,
+                    title: "Beta Trashed".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Low,
+                },
+            )
+            .unwrap();
+            trash_item_subtree(&tx, fb.id).unwrap();
+            tx.commit().unwrap();
+            (f1, f2, f3, f_dep, w1, w2, fb)
+        };
+
+        // 1. Trash F1: F1, F2, W2 move to Trash; shared W1 stays active on F3; F_dep unblocks w/ InTrash warning
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let res = trash_item_subtree(&tx, f1.id).unwrap();
+            assert_eq!(res.trashed_feature_ids, vec![f1.id, f2.id]);
+            assert_eq!(res.trashed_work_item_ids, vec![w2_excl.id]);
+            assert_eq!(res.spared_shared_work_item_count, 1);
+            tx.commit().unwrap();
+        }
+
+        assert!(!get_item(&conn, f1.id).unwrap().is_active());
+        assert_eq!(get_item(&conn, f2.id).unwrap().trash_root_id, Some(f1.id));
+        assert_eq!(
+            get_item(&conn, w2_excl.id).unwrap().trash_root_id,
+            Some(f1.id)
+        );
+        assert!(get_item(&conn, w1_shared.id).unwrap().is_active());
+        let w1_feats = query_features_for_work_item(&conn, w1_shared.id).unwrap();
+        assert_eq!(w1_feats.iter().map(|f| f.id).collect::<Vec<_>>(), vec![f3.id]);
+
+        let snap_trashed = load_project_snapshot(&conn, pid_a).unwrap();
+        assert_eq!(snap_trashed.trash_count, 1);
+        assert_eq!(snap_trashed.trash_groups.len(), 1);
+        assert_eq!(snap_trashed.trash_groups[0].descendant_feature_count, 1);
+        assert_eq!(snap_trashed.trash_groups[0].descendant_work_item_count, 1);
+        assert_eq!(snap_trashed.trash_groups[0].total_item_count, 3);
+        assert_eq!(
+            snap_trashed.effective_block_state(f_dep.id),
+            EffectiveBlockState::Unblocked
+        );
+        assert_eq!(
+            snap_trashed.blocker_warnings(f_dep.id),
+            vec![BlockerWarning::InTrash {
+                blocker_id: f1.id,
+                blocker_key: f1.item_key.clone(),
+                title: f1.title.clone(),
+            }]
+        );
+
+        // 2. Restore F1: F1, F2, W2 return active, W1 regains link to F2, F_dep is blocked again
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let res = restore_trash_group(&tx, f1.id).unwrap();
+            assert_eq!(res.restored_count, 3);
+            assert!(!res.promoted_to_root);
+            assert_eq!(res.pruned_blocker_count, 0);
+            tx.commit().unwrap();
+        }
+
+        let snap_restored = load_project_snapshot(&conn, pid_a).unwrap();
+        assert_eq!(snap_restored.trash_count, 0);
+        assert!(snap_restored.trash_groups.is_empty());
+        assert_eq!(snap_restored.features_for_work_item(w1_shared.id).len(), 2);
+        assert_eq!(
+            snap_restored.effective_block_state(f_dep.id),
+            EffectiveBlockState::DirectlyBlocked { active_count: 1 }
+        );
+        assert!(snap_restored.blocker_warnings(f_dep.id).is_empty());
+
+        // 3. Trash F1 again and permanently purge F1: F1, F2, W2 deleted; W1 survives intact on F3
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            trash_item_subtree(&tx, f1.id).unwrap();
+            let purged = purge_trash_group(&tx, f1.id).unwrap();
+            assert_eq!(purged.purged_item_count, 3);
+            assert_eq!(purged.root_key, f1.item_key);
+            tx.commit().unwrap();
+        }
+
+        assert!(matches!(
+            get_item(&conn, f1.id),
+            Err(DomainError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            get_item(&conn, f2.id),
+            Err(DomainError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            get_item(&conn, w2_excl.id),
+            Err(DomainError::ItemNotFound(_))
+        ));
+        assert!(get_item(&conn, w1_shared.id).unwrap().is_active());
+        let w1_feats_after = query_features_for_work_item(&conn, w1_shared.id).unwrap();
+        assert_eq!(
+            w1_feats_after.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![f3.id]
+        );
+        let snap_after_purge = load_project_snapshot(&conn, pid_a).unwrap();
+        assert_eq!(snap_after_purge.trash_count, 0);
+        assert!(snap_after_purge.direct_blockers(f_dep.id).is_empty());
+        assert!(snap_after_purge.blocker_warnings(f_dep.id).is_empty());
+
+        // FTS5 index integrity remains clean after cascade DELETE
+        conn.execute("INSERT INTO items_fts(items_fts) VALUES('integrity-check');", [])
+            .unwrap();
+
+        // 4. Restore edge cases:
+        //    (a) Parent currently in Trash promotes restored child to root (`promoted_to_root == true`)
+        //    (b) Parent converted to Work Item restores child at root (`parent_feature_id == None`)
+        //    (c) Purging a parent Trash group spares an earlier-trashed child group
+        //    (d) Restoring with conflicting external blocker edges prunes cycles & WI exclusions (INV-05)
+        let (child_promoted, child_conv_parent, orphan_child, f_cycle, wi_excl_pruned) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let p_trashed = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Trashed Parent".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let c_promo = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: Some(p_trashed.id),
+                    title: "Promoted Child".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            trash_item_subtree(&tx, c_promo.id).unwrap();
+            trash_item_subtree(&tx, p_trashed.id).unwrap();
+
+            let p_conv = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Soon WorkItem".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let c_conv = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: Some(p_conv.id),
+                    title: "Converted Parent Child".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            trash_item_subtree(&tx, c_conv.id).unwrap();
+            convert_feature_to_work_item(&tx, p_conv.id).unwrap();
+
+            let p_del = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Parent Group".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let c_sep = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: Some(p_del.id),
+                    title: "Earlier Trashed Child".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            trash_item_subtree(&tx, c_sep.id).unwrap();
+            trash_item_subtree(&tx, p_del.id).unwrap();
+            purge_trash_group(&tx, p_del.id).unwrap();
+
+            // Cycle + WI exclusion on restore:
+            // f_anc (root active) -> f_sub (child), f_ext (root active).
+            // f_ext blocked on f_sub; w_shared on [f_sub, f3].
+            // Trash f_sub -> while trashed, block f_anc on f_ext AND block w_shared on f_anc.
+            // Restoring f_sub must prune both f_ext->f_sub (cycle) and w_shared->f_anc (ancestor exclusion).
+            let f_anc = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "Active Ancestor".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let f_sub = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: Some(f_anc.id),
+                    title: "Subtree Restored".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let f_ext = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid_a,
+                    parent_feature_id: None,
+                    title: "External Feature".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            add_blocker(&tx, f_ext.id, f_sub.id).unwrap();
+
+            let w_shared_edge = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid_a,
+                    title: "Shared Exclusion WI".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![f_sub.id, f3.id],
+                },
+            )
+            .unwrap();
+
+            trash_item_subtree(&tx, f_sub.id).unwrap();
+            add_blocker(&tx, f_anc.id, f_ext.id).unwrap();
+            add_blocker(&tx, w_shared_edge.id, f_anc.id).unwrap();
+
+            tx.commit().unwrap();
+            (c_promo, c_conv, c_sep, f_sub, w_shared_edge)
+        };
+
+        // Earlier-trashed separate child group survived parent purge
+        assert!(!get_item(&conn, orphan_child.id).unwrap().is_active());
+        assert_eq!(get_item(&conn, orphan_child.id).unwrap().parent_feature_id, None);
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let promo_res = restore_trash_group(&tx, child_promoted.id).unwrap();
+            assert!(promo_res.promoted_to_root);
+            assert_eq!(promo_res.root.parent_feature_id, None);
+
+            let conv_res = restore_trash_group(&tx, child_conv_parent.id).unwrap();
+            assert_eq!(conv_res.root.parent_feature_id, None);
+
+            let cycle_res = restore_trash_group(&tx, f_cycle.id).unwrap();
+            assert_eq!(cycle_res.pruned_blocker_count, 2);
+            tx.commit().unwrap();
+        }
+        let snap_pruned = load_project_snapshot(&conn, pid_a).unwrap();
+        assert!(snap_pruned.direct_blockers(wi_excl_pruned.id).is_empty());
+
+        // 5. Empty Trash deletes all remaining trashed items in Project A while isolating Project B
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let emptied = empty_project_trash(&tx, pid_a).unwrap();
+            assert_eq!(emptied.purged_group_count, 2);
+            assert_eq!(emptied.purged_item_count, 2);
+            tx.commit().unwrap();
+        }
+        assert!(list_trash_groups(&conn, pid_a).unwrap().is_empty());
+        assert_eq!(list_trash_groups(&conn, pid_b).unwrap().len(), 1);
+        assert!(!get_item(&conn, fb.id).unwrap().is_active());
+        assert!(get_item(&conn, w1_shared.id).unwrap().is_active());
     }
 }
 

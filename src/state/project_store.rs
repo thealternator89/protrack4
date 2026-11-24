@@ -720,6 +720,7 @@ pub fn sample_snapshot() -> ProjectSnapshot {
         effective_block_state: HashMap::new(),
         blocker_warnings: HashMap::new(),
         trash_count: 0,
+        trash_groups: Vec::new(),
     };
     snapshot.progress_by_feature = snapshot.compute_progress_map();
     snapshot

@@ -24,7 +24,7 @@ use gpui_kit::{
 use crate::commands::{
     AddBlocker, AttachWorkItemToFeature, ConvertFeatureToWorkItem, ConvertWorkItemToFeature,
     DetachWorkItemFromFeature, RemoveBlocker, ReparentFeature, ReorderSiblingFeatures, SetItemTags,
-    SetWorkItemFeatures, UndoableCommand, UpdateItemFields,
+    SetWorkItemFeatures, TrashItemSubtree, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
     Assignee, AssigneeId, ConversionEligibility, Item, ItemId, ItemKind, ItemStatus,
@@ -841,7 +841,12 @@ impl InspectorView {
         let current_id = current_item.as_ref().map(|i| i.id);
 
         if current_id != self.loaded_item_id {
-            if let Some(prev_id) = self.loaded_item_id {
+            if let Some(prev_id) = self.loaded_item_id
+                && snapshot_opt
+                    .as_ref()
+                    .and_then(|s| s.item(prev_id))
+                    .is_some_and(Item::is_active)
+            {
                 self.flush_dirty_for_previous_item(prev_id, cx);
             }
 
@@ -1856,6 +1861,7 @@ impl Render for InspectorView {
                     let convert_tooltip = snapshot.conversion_tooltip(item.id);
                     let convert_kind = item.kind;
                     let inspector_for_convert = cx.entity();
+                    let inspector_for_trash = cx.entity();
 
                     let created = item.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
                     let updated = item.updated_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -2597,12 +2603,18 @@ impl Render for InspectorView {
                     };
 
                     v_flex()
+                        .id("inspector-viewport")
+                        .test_support()
                         .flex_1()
                         .min_h_0()
-                        .p_4()
-                        .gap_4()
-                        .overflow_y_scrollbar()
-                        .id("inspector-scroll")
+                        .overflow_hidden()
+                        .child(
+                            v_flex()
+                                .size_full()
+                                .p_4()
+                                .gap_4()
+                                .overflow_y_scrollbar()
+                                .id("inspector-scroll")
                         // Identity + disabled Convert action + Editable Title
                         .child(
                             v_flex()
@@ -3190,15 +3202,52 @@ impl Render for InspectorView {
                                         .into_any_element(),
                                 }),
                         )
-                        // Timestamps footer
+                        // Timestamps & Move to Trash footer
                         .child(
-                            div()
-                                .pt_1()
+                            h_flex()
+                                .pt_2()
+                                .gap_2()
+                                .items_center()
+                                .justify_between()
                                 .border_t_1()
                                 .border_color(cx.theme().border)
-                                .text_size(px(11.))
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("Created {created} · Updated {updated}")),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(11.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("Created {created} · Updated {updated}")),
+                                )
+                                .child(
+                                    Button::new("inspector-trash-btn")
+                                        .danger()
+                                        .xsmall()
+                                        .icon(IconName::Delete)
+                                        .label("Move to Trash")
+                                        .disabled(self.saving)
+                                        .tooltip(if item.kind == ItemKind::Feature {
+                                            "Move this Feature subtree to Trash (shared Work Items stay active)"
+                                        } else {
+                                            "Move this Work Item to Trash"
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            inspector_for_trash.update(cx, |this, cx| {
+                                                this.dirty_title = false;
+                                                this.dirty_description = false;
+                                                this.title_error = None;
+                                                this.dispatch_feature_membership_command(
+                                                    Box::new(TrashItemSubtree::new(item_id)),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                ),
+                        )
                         )
                         .into_any_element()
                 }
