@@ -1,7 +1,6 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
@@ -10,20 +9,19 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Window, div, prelude::FluentBuilder as _, px,
+    ParentElement as _, Pixels, Render, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
-use crate::domain::{ItemId, ItemKind, ProjectSnapshot};
 use crate::state::{AppState, CenterViewTab, LaunchConfig, ProjectStore, ThemePreference};
 use crate::ui::inspector::InspectorView;
 use crate::ui::modals::{open_new_project_modal, open_workspace_modal};
 use crate::ui::outline_view::OutlineView;
 use crate::ui::sidebar::render_sidebar;
+use crate::ui::table_view::TableView;
 use crate::ui::unallocated_view::UnallocatedView;
 use crate::ui::{
-    OpenWorkspace, ToggleInspector, ToggleSidebar, assignee_pill, build_project_switcher_menu,
-    domain_tag_chip, kind_badge, parse_hex_or, priority_badge, status_badge,
+    OpenWorkspace, ToggleInspector, ToggleSidebar, build_project_switcher_menu, parse_hex_or,
 };
 
 pub struct WorkspaceShell {
@@ -31,6 +29,7 @@ pub struct WorkspaceShell {
     store: Entity<ProjectStore>,
     inspector: Entity<InspectorView>,
     outline_view: Entity<OutlineView>,
+    table_view: Entity<TableView>,
     unallocated_view: Entity<UnallocatedView>,
     focus_handle: FocusHandle,
     resizable_state: Entity<ResizableState>,
@@ -57,6 +56,8 @@ impl WorkspaceShell {
         let inspector = cx.new(|cx| InspectorView::new(app_state.clone(), store.clone(), window, cx));
         let outline_view =
             cx.new(|cx| OutlineView::new(app_state.clone(), store.clone(), window, cx));
+        let table_view =
+            cx.new(|cx| TableView::new(app_state.clone(), store.clone(), window, cx));
         let unallocated_view =
             cx.new(|cx| UnallocatedView::new(app_state.clone(), store.clone(), window, cx));
         let prefs = app_state.read(cx).preferences().clone();
@@ -110,6 +111,7 @@ impl WorkspaceShell {
             store,
             inspector,
             outline_view,
+            table_view,
             unallocated_view,
             focus_handle,
             resizable_state,
@@ -136,6 +138,10 @@ impl WorkspaceShell {
 
     pub fn outline_view(&self) -> &Entity<OutlineView> {
         &self.outline_view
+    }
+
+    pub fn table_view(&self) -> &Entity<TableView> {
+        &self.table_view
     }
 
     pub fn unallocated_view(&self) -> &Entity<UnallocatedView> {
@@ -439,7 +445,6 @@ impl WorkspaceShell {
         let workspace_name = state.workspace_name();
         let workspace_path = state.workspace_path().map(|p| p.display().to_string());
         let active_tab = state.active_tab();
-        let selected_item_id = state.selected_item_id();
         let is_loading = app.is_loading();
         let last_error = app.last_error().map(str::to_string);
 
@@ -621,9 +626,7 @@ impl WorkspaceShell {
 
         let body = match active_tab {
             CenterViewTab::Outline => self.outline_view.clone().into_any_element(),
-            CenterViewTab::Table => self
-                .render_table_body(snapshot, selected_item_id, cx)
-                .into_any_element(),
+            CenterViewTab::Table => self.table_view.clone().into_any_element(),
             CenterViewTab::Unallocated => self.unallocated_view.clone().into_any_element(),
             CenterViewTab::Trash => self.render_trash_body(cx).into_any_element(),
         };
@@ -634,171 +637,6 @@ impl WorkspaceShell {
             .bg(cx.theme().background)
             .child(header)
             .child(body)
-    }
-
-    fn render_table_body(
-        &self,
-        snapshot: &ProjectSnapshot,
-        selected_item_id: Option<ItemId>,
-        cx: &App,
-    ) -> impl IntoElement {
-        let active_items = snapshot.active_items();
-
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(
-                // Header strip
-                h_flex()
-                    .w_full()
-                    .px_4()
-                    .py_2()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().table_head)
-                    .text_size(px(11.))
-                    .font_semibold()
-                    .text_color(cx.theme().table_head_foreground)
-                    .child(div().w(px(64.)).child("Key"))
-                    .child(div().w(px(88.)).child("Kind"))
-                    .child(div().flex_1().min_w_0().child("Title"))
-                    .child(div().w(px(200.)).child("Features / Parent"))
-                    .child(div().w(px(108.)).child("Status"))
-                    .child(div().w(px(76.)).child("Priority"))
-                    .child(div().w(px(48.)).child("Who")),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .id("center-table-scroll")
-                    .children(active_items.into_iter().map(|item| {
-                        let item_id = item.id;
-                        let is_selected = selected_item_id == Some(item_id);
-                        let assignee = item.assignee_id.and_then(|aid| snapshot.assignee(aid));
-                        let item_tags = snapshot.tags_for_item(item.id);
-                        let context_label = match item.kind {
-                            ItemKind::Feature => {
-                                let path = snapshot.feature_path(item.id);
-                                let ancestors: Vec<_> = path
-                                    .into_iter()
-                                    .filter(|f| f.id != item.id)
-                                    .map(|f| f.title.clone())
-                                    .collect();
-                                if ancestors.is_empty() {
-                                    "Root Feature".to_string()
-                                } else {
-                                    ancestors.join(" › ")
-                                }
-                            }
-                            ItemKind::WorkItem => {
-                                let feats = snapshot.features_for_work_item(item.id);
-                                if feats.is_empty() {
-                                    "Unallocated".to_string()
-                                } else {
-                                    feats
-                                        .into_iter()
-                                        .map(|f| f.title.clone())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                }
-                            }
-                        };
-                        let is_unallocated_wi = item.kind == ItemKind::WorkItem
-                            && snapshot.features_for_work_item(item.id).is_empty();
-
-                        h_flex()
-                            .id(("table-row", item.item_number as usize))
-                            .w_full()
-                            .px_4()
-                            .py_2()
-                            .gap_3()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(cx.theme().table_row_border)
-                            .bg(if is_selected {
-                                cx.theme().table_active
-                            } else {
-                                cx.theme().transparent
-                            })
-                            .cursor_pointer()
-                            .when(!is_selected, |this| {
-                                this.hover(|s| s.bg(cx.theme().table_hover))
-                            })
-                            .on_click({
-                                let store = self.store.clone();
-                                move |_, _, cx| {
-                                    store.update(cx, |s, cx| {
-                                        s.select_item(Some(item_id));
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .child(
-                                div()
-                                    .w(px(64.))
-                                    .text_xs()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(item.item_key.clone()),
-                            )
-                            .child(div().w(px(88.)).child(kind_badge(item.kind, cx)))
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .text_sm()
-                                            .font_medium()
-                                            .child(item.title.clone()),
-                                    )
-                                    .when(!item_tags.is_empty(), |this| {
-                                        this.child(
-                                            h_flex().gap_1().flex_shrink_0().children(
-                                                item_tags
-                                                    .into_iter()
-                                                    .map(|tag| domain_tag_chip(tag, cx)),
-                                            ),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .w(px(200.))
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(if is_unallocated_wi {
-                                        cx.theme().warning
-                                    } else {
-                                        cx.theme().muted_foreground
-                                    })
-                                    .child(context_label),
-                            )
-                            .child(div().w(px(108.)).child(status_badge(item.status, cx)))
-                            .child(div().w(px(76.)).child(priority_badge(item.priority, cx)))
-                            .child(div().w(px(48.)).child(match assignee {
-                                Some(a) => assignee_pill(a, false, cx).into_any_element(),
-                                None => div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("—")
-                                    .into_any_element(),
-                            }))
-                    })),
-            )
     }
 
     fn render_trash_body(&self, cx: &App) -> impl IntoElement {

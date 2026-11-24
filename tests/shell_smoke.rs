@@ -2679,3 +2679,404 @@ async fn phase8_strictly_guarded_feature_work_item_conversion(cx: &mut TestAppCo
     assert!(!shm_path_for(&db_path).exists());
     assert!(!lock_path_for(&db_path).exists());
 }
+
+#[gpui_kit::test]
+async fn phase9_filtered_virtualized_table_view(cx: &mut TestAppContext) {
+    use gpui_kit::component::table::ColumnSort;
+    use protrack4::commands::{AddBlocker, SetItemTags, UpsertAssignee, UpsertTag};
+    use protrack4::ui::table_view::{
+        AssigneeFilter, BlockFilter, PriorityFilter, TableSortColumn,
+    };
+
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase9.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 9 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store, table_view) = shell.read_with(cx, |view, _| {
+        (
+            view.app_state().clone(),
+            view.store().clone(),
+            view.table_view().clone(),
+        )
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Seed Project, Assignees, Tags, Features, shared 3-Feature WI, warning WI, and 50+ items
+    let pid = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Table Scale",
+                    "TBL",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let mb_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpsertAssignee::create(
+                    "Mark Benson",
+                    "MB",
+                    "#6366F1",
+                    None,
+                    "",
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_assignee_id
+        .unwrap();
+
+    let tag_core_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(UpsertTag::create(pid, "core", "#8B5CF6")), cx)
+        })
+        .await
+        .unwrap()
+        .created_tag_id
+        .unwrap();
+
+    let f_a_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Core Auth",
+                    "",
+                    ItemStatus::InProgress,
+                    Priority::High,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f_b_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "CLI Sync",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f_c_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Web Sync",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f_blocker_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Active Blocker",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Urgent,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let f_cancelled_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Cancelled Blocker",
+                    "",
+                    ItemStatus::Cancelled,
+                    Priority::Low,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    // Block Core Auth on Active Blocker -> shared WI across (Core Auth, CLI Sync, Web Sync) is PartiallyBlocked (ReadyToWork!)
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(AddBlocker::new(f_a_id, f_blocker_id)), cx)
+        })
+        .await
+        .unwrap();
+
+    let shared_wi_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "OAuth token refresh hook",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                    vec![f_a_id, f_b_id, f_c_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(UpdateItemFields {
+                    item_id: shared_wi_id,
+                    title: None,
+                    description: None,
+                    status: None,
+                    priority: None,
+                    assignee_id: Some(Some(mb_id)),
+                }),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(SetItemTags::new(shared_wi_id, vec![tag_core_id])),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    let warn_wi_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Warning task",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Medium,
+                    vec![f_c_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(AddBlocker::new(warn_wi_id, f_cancelled_id)), cx)
+        })
+        .await
+        .unwrap();
+
+    // Add 50 bulk Work Items so virtualized DataTable renders 57 total items
+    for i in 1..=50 {
+        let prio = if i % 10 == 0 {
+            Priority::High
+        } else {
+            Priority::Low
+        };
+        app_state
+            .update(cx, |app, cx| {
+                app.execute_command(
+                    Box::new(CreateWorkItem::new(
+                        pid,
+                        format!("Bulk item {i:02}"),
+                        "",
+                        ItemStatus::Todo,
+                        prio,
+                        vec![f_c_id],
+                    )),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    wait_until(cx, "57 items loaded", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.active_items().len() == 57)
+    })
+    .await;
+
+    let shared_wi_num = cx.update(|cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .unwrap()
+            .item(shared_wi_id)
+            .unwrap()
+            .item_number as usize
+    });
+
+    // 2. Switch to Table tab and verify deduplication + multi-facet filtering
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Table);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.render_frame(cx);
+
+        table_view.update(cx, |tv, cx| {
+            assert_eq!(tv.filtered_rows(cx).len(), 57);
+            assert_eq!(
+                tv.filtered_rows(cx)
+                    .iter()
+                    .filter(|r| r.item.id == shared_wi_id)
+                    .count(),
+                1
+            );
+
+            // Multi-facet filter: ReadyToWork + Priority High + Assignee MB + Tag core
+            tv.set_block_filter(BlockFilter::ReadyToWork, cx);
+            tv.set_priority_filter(PriorityFilter::Specific(Priority::High), cx);
+            tv.set_assignee_filter(AssigneeFilter::Specific(mb_id), cx);
+            tv.toggle_tag_filter(tag_core_id, cx);
+
+            let rows = tv.filtered_rows(cx);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].item.id, shared_wi_id);
+            assert_eq!(rows[0].feature_labels.len(), 3);
+        });
+        window.render_frame(cx);
+
+        // Click the rendered DataTable row and verify Inspector / store selection syncs
+        window.click(("table-row", shared_wi_num), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).selected_item_id(), Some(shared_wi_id));
+
+        // HasWarnings filter surfaces warn_wi_id
+        table_view.update(cx, |tv, cx| {
+            tv.clear_filters(None, cx);
+            tv.set_block_filter(BlockFilter::HasWarnings, cx);
+            let rows = tv.filtered_rows(cx);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].item.id, warn_wi_id);
+        });
+        window.render_frame(cx);
+
+        // Clear filters & sort by Priority descending -> Urgent (Active Blocker) first
+        window.click("table-filter-clear", cx);
+        window.render_frame(cx);
+        table_view.update(cx, |tv, cx| {
+            assert_eq!(tv.filtered_rows(cx).len(), 57);
+            tv.sort_by(TableSortColumn::Priority, ColumnSort::Descending, cx);
+            assert_eq!(tv.filtered_rows(cx)[0].item.id, f_blocker_id);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // Right-click a row in DataTable to verify ContextMenu opens cleanly
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.right_click(("table-row", shared_wi_num), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}

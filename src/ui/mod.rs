@@ -3,6 +3,7 @@ pub mod modals;
 pub mod outline_view;
 pub mod shell;
 pub mod sidebar;
+pub mod table_view;
 pub mod unallocated_view;
 
 pub use shell::WorkspaceShell;
