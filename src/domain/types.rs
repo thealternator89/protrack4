@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
-    BlockerCandidateRejection, BlockerRef, BlockerWarning, DomainError, EffectiveBlockState,
-    FeatureProgress, ItemBlocker,
+    BlockerCandidateRejection, BlockerRef, BlockerWarning, ConversionBlockReason,
+    ConversionEligibility, DomainError, EffectiveBlockState, FeatureProgress, ItemBlocker,
+    format_conversion_block_message,
 };
 
 pub const MAX_FEATURE_DEPTH: usize = 32;
@@ -844,6 +845,156 @@ impl ProjectSnapshot {
             .collect();
         items.sort_by_key(|item| item.item_number);
         items
+    }
+
+    /// Evaluates strict Feature ↔ Work Item conversion eligibility (`INV-08`, `INV-09`).
+    pub fn conversion_eligibility(&self, item_id: ItemId) -> Option<ConversionEligibility> {
+        let item = self.item(item_id)?;
+        if !item.is_active() || item.project_id != self.project.id {
+            return None;
+        }
+
+        match item.kind {
+            ItemKind::WorkItem => {
+                let attached = self.features_for_work_item(item_id);
+                match attached.len() {
+                    0 => Some(ConversionEligibility::Allowed {
+                        target_kind: ItemKind::Feature,
+                        resulting_parent: None,
+                        moves_to_unallocated: false,
+                    }),
+                    1 => {
+                        let parent = attached[0];
+                        if self.feature_depth(parent.id) + 1 >= MAX_FEATURE_DEPTH {
+                            Some(ConversionEligibility::Blocked(vec![
+                                ConversionBlockReason::ExceedsMaxFeatureDepth {
+                                    max_depth: MAX_FEATURE_DEPTH,
+                                },
+                            ]))
+                        } else {
+                            Some(ConversionEligibility::Allowed {
+                                target_kind: ItemKind::Feature,
+                                resulting_parent: Some(parent.id),
+                                moves_to_unallocated: false,
+                            })
+                        }
+                    }
+                    n => Some(ConversionEligibility::Blocked(vec![
+                        ConversionBlockReason::AttachedToMultipleFeatures(n),
+                    ])),
+                }
+            }
+            ItemKind::Feature => {
+                let mut reasons = Vec::new();
+                let child_count = self.child_features(Some(item_id)).len();
+                if child_count > 0 {
+                    reasons.push(ConversionBlockReason::HasChildFeatures(child_count));
+                }
+                let wi_count = self.work_items_for_feature(item_id).len();
+                if wi_count > 0 {
+                    reasons.push(ConversionBlockReason::HasAttachedWorkItems(wi_count));
+                }
+                let dep_count = self.dependents_of_feature(item_id).len();
+                if dep_count > 0 {
+                    reasons.push(ConversionBlockReason::HasActiveDependents(dep_count));
+                }
+
+                if !reasons.is_empty() {
+                    return Some(ConversionEligibility::Blocked(reasons));
+                }
+
+                let resulting_parent = item.parent_feature_id.filter(|pid| {
+                    self.item(*pid)
+                        .is_some_and(|p| p.is_active() && p.kind == ItemKind::Feature)
+                });
+                Some(ConversionEligibility::Allowed {
+                    target_kind: ItemKind::WorkItem,
+                    resulting_parent,
+                    moves_to_unallocated: resulting_parent.is_none(),
+                })
+            }
+        }
+    }
+
+    /// Formats a descriptive tooltip explaining either the resulting conversion target or exact block reasons.
+    pub fn conversion_tooltip(&self, item_id: ItemId) -> String {
+        let Some(item) = self.item(item_id) else {
+            return "Item not found".to_string();
+        };
+        let Some(eligibility) = self.conversion_eligibility(item_id) else {
+            return "Cannot convert item in Trash".to_string();
+        };
+
+        match eligibility {
+            ConversionEligibility::Allowed {
+                target_kind: ItemKind::Feature,
+                resulting_parent: None,
+                ..
+            } => format!(
+                "Convert {} to a root Feature (preserves key, tags, assignee, and blockers)",
+                item.item_key
+            ),
+            ConversionEligibility::Allowed {
+                target_kind: ItemKind::Feature,
+                resulting_parent: Some(pid),
+                ..
+            } => {
+                let parent_label = self
+                    .item(pid)
+                    .map(|p| format!("{} {}", p.item_key, p.title))
+                    .unwrap_or_else(|| "parent Feature".to_string());
+                format!(
+                    "Convert {} to a child Feature under {} (preserves key, tags, assignee, and blockers)",
+                    item.item_key, parent_label
+                )
+            }
+            ConversionEligibility::Allowed {
+                target_kind: ItemKind::WorkItem,
+                resulting_parent: None,
+                ..
+            } => format!(
+                "Convert {} to an Unallocated Work Item (preserves key, tags, assignee, and blockers)",
+                item.item_key
+            ),
+            ConversionEligibility::Allowed {
+                target_kind: ItemKind::WorkItem,
+                resulting_parent: Some(pid),
+                ..
+            } => {
+                let parent_label = self
+                    .item(pid)
+                    .map(|p| format!("{} {}", p.item_key, p.title))
+                    .unwrap_or_else(|| "parent Feature".to_string());
+                format!(
+                    "Convert {} to a Work Item attached to {} (preserves key, tags, assignee, and blockers)",
+                    item.item_key, parent_label
+                )
+            }
+            ConversionEligibility::Blocked(reasons) => {
+                let attached_names: Vec<String> = if item.kind == ItemKind::WorkItem {
+                    self.features_for_work_item(item_id)
+                        .into_iter()
+                        .map(|f| f.title.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let dependent_keys: Vec<String> = if item.kind == ItemKind::Feature {
+                    self.dependents_of_feature(item_id)
+                        .into_iter()
+                        .map(|d| d.item_key.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                format_conversion_block_message(
+                    item.kind,
+                    &reasons,
+                    &attached_names,
+                    &dependent_keys,
+                )
+            }
+        }
     }
 
     /// Evaluates `INV-05` eligibility of adding `candidate_feature_id` as a direct blocker of `blocked_item_id`.

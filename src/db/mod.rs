@@ -2006,5 +2006,504 @@ mod tests {
         assert!(!child_ids.contains(&f1.id));
         assert_eq!(subtree.len(), 4);
     }
+
+    #[test]
+    fn inv08_inv09_conversion_matrix_and_stale_trashed_link_pruning() {
+        use crate::db::assignee_repo::{UpsertAssigneeInput, upsert_assignee};
+        use crate::db::blocker_repo::add_blocker;
+        use crate::db::item_repo::{
+            CreateFeatureInput, CreateWorkItemInput, UpdateItemFieldsInput,
+            check_feature_to_work_item_eligibility, check_work_item_to_feature_eligibility,
+            convert_feature_to_work_item, convert_work_item_to_feature, create_feature,
+            create_work_item, get_item, query_features_for_work_item,
+            query_work_items_for_feature, update_item_fields,
+        };
+        use crate::db::project_repo::{CreateProjectInput, create_project};
+        use crate::db::tag_repo::{UpsertTagInput, set_item_tags, upsert_tag};
+        use crate::domain::{
+            ConversionBlockReason, ConversionEligibility, ItemKind, ItemStatus, MAX_FEATURE_DEPTH,
+            Priority, ProjectStatus,
+        };
+        use rusqlite::TransactionBehavior;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "ConvMatrix").unwrap();
+
+        let (pid, assignee_id, tag_id) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let p = create_project(
+                &tx,
+                CreateProjectInput {
+                    name: "Matrix".to_string(),
+                    key_prefix: "MTX".to_string(),
+                    description: String::new(),
+                    color: "#6366F1".to_string(),
+                    status: ProjectStatus::Active,
+                },
+            )
+            .unwrap();
+            let (a, _) = upsert_assignee(
+                &tx,
+                UpsertAssigneeInput {
+                    id: None,
+                    name: "Mark".to_string(),
+                    handle: "MB".to_string(),
+                    color: "#6366F1".to_string(),
+                    role: None,
+                    notes: String::new(),
+                },
+            )
+            .unwrap();
+            let (t, _) = upsert_tag(
+                &tx,
+                UpsertTagInput {
+                    id: None,
+                    project_id: p.id,
+                    name: "core".to_string(),
+                    color: "#8B5CF6".to_string(),
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (p.id, a.id, t.id)
+        };
+
+        // Helper Features: P (root), F_other (root), F_blocker (root)
+        let (f_p, f_other, f_blocker) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let p = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Parent P".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let o = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Other".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let b = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Blocker".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            (p, o, b)
+        };
+
+        // Case 1 & 5: Unallocated WI (with tags, assignee, description, outgoing blocker) -> Root Feature -> Unallocated WI
+        let w_unalloc = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let w = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Solo Task".to_string(),
+                    description: "Detailed **markdown**".to_string(),
+                    status: ItemStatus::InProgress,
+                    priority: Priority::High,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            update_item_fields(
+                &tx,
+                UpdateItemFieldsInput {
+                    item_id: w.id,
+                    assignee_id: Some(Some(assignee_id)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            set_item_tags(&tx, w.id, &[tag_id]).unwrap();
+            add_blocker(&tx, w.id, f_blocker.id).unwrap();
+            tx.commit().unwrap();
+            w
+        };
+
+        let snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(
+            snap.conversion_eligibility(w_unalloc.id),
+            Some(ConversionEligibility::Allowed {
+                target_kind: ItemKind::Feature,
+                resulting_parent: None,
+                moves_to_unallocated: false,
+            })
+        );
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let feat = convert_work_item_to_feature(&tx, w_unalloc.id).unwrap();
+            assert_eq!(feat.id, w_unalloc.id);
+            assert_eq!(feat.item_key, w_unalloc.item_key);
+            assert_eq!(feat.kind, ItemKind::Feature);
+            assert_eq!(feat.parent_feature_id, None);
+            assert_eq!(feat.assignee_id, Some(assignee_id));
+            assert_eq!(feat.description, "Detailed **markdown**");
+            tx.commit().unwrap();
+        }
+        let snap_root_feat = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap_root_feat.tags_for_item(w_unalloc.id).len(), 1);
+        assert_eq!(snap_root_feat.direct_blockers(w_unalloc.id).len(), 1);
+        assert!(snap_root_feat.unallocated_work_items().is_empty());
+
+        // Case 5: Convert that leaf root Feature back to an Unallocated Work Item
+        assert_eq!(
+            snap_root_feat.conversion_eligibility(w_unalloc.id),
+            Some(ConversionEligibility::Allowed {
+                target_kind: ItemKind::WorkItem,
+                resulting_parent: None,
+                moves_to_unallocated: true,
+            })
+        );
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let (wi_back, old_parent) = convert_feature_to_work_item(&tx, w_unalloc.id).unwrap();
+            assert_eq!(old_parent, None);
+            assert_eq!(wi_back.item_key, w_unalloc.item_key);
+            assert_eq!(wi_back.kind, ItemKind::WorkItem);
+            assert_eq!(wi_back.parent_feature_id, None);
+            assert_eq!(wi_back.assignee_id, Some(assignee_id));
+            tx.commit().unwrap();
+        }
+        let snap_back = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap_back.unallocated_work_items().len(), 1);
+        assert_eq!(snap_back.tags_for_item(w_unalloc.id).len(), 1);
+        assert_eq!(snap_back.direct_blockers(w_unalloc.id).len(), 1);
+
+        // Case 2 & 6: 1-Feature WI -> Child Feature under P -> Work Item attached to [P]
+        let w_single = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let w = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Under P".to_string(),
+                    description: "Child body".to_string(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::Medium,
+                    feature_ids: vec![f_p.id],
+                },
+            )
+            .unwrap();
+            set_item_tags(&tx, w.id, &[tag_id]).unwrap();
+            add_blocker(&tx, w.id, f_blocker.id).unwrap();
+            tx.commit().unwrap();
+            w
+        };
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let child_feat = convert_work_item_to_feature(&tx, w_single.id).unwrap();
+            assert_eq!(child_feat.kind, ItemKind::Feature);
+            assert_eq!(child_feat.parent_feature_id, Some(f_p.id));
+            assert_eq!(child_feat.item_key, w_single.item_key);
+            assert!(query_features_for_work_item(&tx, w_single.id).unwrap().is_empty());
+            tx.commit().unwrap();
+        }
+        let snap_child = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap_child.direct_blockers(w_single.id).len(), 1);
+        assert_eq!(snap_child.tags_for_item(w_single.id).len(), 1);
+
+        // Case 6: Leaf Child Feature (parent = P) -> Work Item attached to [P]
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let (wi, old_parent) = convert_feature_to_work_item(&tx, w_single.id).unwrap();
+            assert_eq!(old_parent, Some(f_p.id));
+            assert_eq!(wi.kind, ItemKind::WorkItem);
+            assert_eq!(wi.parent_feature_id, None);
+            assert_eq!(wi.item_key, w_single.item_key);
+            let feats = query_features_for_work_item(&tx, w_single.id).unwrap();
+            assert_eq!(feats.len(), 1);
+            assert_eq!(feats[0].id, f_p.id);
+            tx.commit().unwrap();
+        }
+
+        // Case 4: 2+-Feature WI -> Rejected (AttachedToMultipleFeatures)
+        let w_shared = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let w = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Shared WI".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![f_p.id, f_other.id],
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            w
+        };
+        assert_eq!(
+            check_work_item_to_feature_eligibility(&conn, w_shared.id).unwrap(),
+            ConversionEligibility::Blocked(vec![
+                ConversionBlockReason::AttachedToMultipleFeatures(2)
+            ])
+        );
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let err = convert_work_item_to_feature(&tx, w_shared.id).unwrap_err();
+            assert!(matches!(err, DomainError::ConversionBlocked(msg) if msg.contains("2 Features")));
+        }
+
+        // Case 3: 1-Feature WI attached to Feature at depth 31 -> Rejected (ExceedsMaxFeatureDepth)
+        let deep_leaf_id = {
+            let mut parent = Some(f_p.id); // f_p is depth 0; create depths 1..=31
+            for d in 1..MAX_FEATURE_DEPTH {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                let f = create_feature(
+                    &tx,
+                    CreateFeatureInput {
+                        project_id: pid,
+                        parent_feature_id: parent,
+                        title: format!("Deep {d}"),
+                        description: String::new(),
+                        status: ItemStatus::Todo,
+                        priority: Priority::None,
+                    },
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                parent = Some(f.id);
+            }
+            parent.unwrap()
+        };
+        let w_at_depth_31 = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let w = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Too deep WI".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![deep_leaf_id],
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            w
+        };
+        assert_eq!(
+            check_work_item_to_feature_eligibility(&conn, w_at_depth_31.id).unwrap(),
+            ConversionEligibility::Blocked(vec![ConversionBlockReason::ExceedsMaxFeatureDepth {
+                max_depth: MAX_FEATURE_DEPTH
+            }])
+        );
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(matches!(
+                convert_work_item_to_feature(&tx, w_at_depth_31.id),
+                Err(DomainError::ConversionBlocked(_))
+            ));
+        }
+
+        // Cases 7, 8, 9: Feature with active child Features, attached Work Items, and active dependents
+        // f_p has: 1 direct child feature (Deep 1), 2 attached WIs (w_single, w_shared)
+        let snap_guards = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(
+            snap_guards.conversion_eligibility(f_p.id),
+            Some(ConversionEligibility::Blocked(vec![
+                ConversionBlockReason::HasChildFeatures(1),
+                ConversionBlockReason::HasAttachedWorkItems(2),
+            ]))
+        );
+        assert_eq!(
+            check_feature_to_work_item_eligibility(&conn, f_p.id).unwrap(),
+            ConversionEligibility::Blocked(vec![
+                ConversionBlockReason::HasChildFeatures(1),
+                ConversionBlockReason::HasAttachedWorkItems(2),
+            ])
+        );
+        // f_blocker has 2 active dependents (w_unalloc, w_single)
+        assert_eq!(
+            check_feature_to_work_item_eligibility(&conn, f_blocker.id).unwrap(),
+            ConversionEligibility::Blocked(vec![ConversionBlockReason::HasActiveDependents(2)])
+        );
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let err_p = convert_feature_to_work_item(&tx, f_p.id).unwrap_err();
+            assert!(matches!(
+                err_p,
+                DomainError::ConversionBlocked(msg)
+                    if msg.contains("1 child Feature") && msg.contains("2 attached Work Items")
+            ));
+            let err_b = convert_feature_to_work_item(&tx, f_blocker.id).unwrap_err();
+            assert!(matches!(
+                err_b,
+                DomainError::ConversionBlocked(msg) if msg.contains("2 items")
+            ));
+        }
+
+        // Stale trashed-link pruning:
+        // (a) WI attached to 1 active Feature + 1 trashed Feature converts cleanly to Feature.
+        // (b) Leaf Feature with trashed child Feature, trashed attached WI, and trashed dependent converts cleanly to Work Item.
+        let (f_trashed_parent, f_leaf_with_trash, wi_with_trashed_link) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let ftp = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Trashed Feat".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let flt = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: None,
+                    title: "Leaf With Trash".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let trashed_child = create_feature(
+                &tx,
+                CreateFeatureInput {
+                    project_id: pid,
+                    parent_feature_id: Some(flt.id),
+                    title: "Trashed Child".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                },
+            )
+            .unwrap();
+            let trashed_wi = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Trashed Attached WI".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![flt.id],
+                },
+            )
+            .unwrap();
+            let trashed_dep = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Trashed Dependent".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![],
+                },
+            )
+            .unwrap();
+            add_blocker(&tx, trashed_dep.id, flt.id).unwrap();
+            // Outgoing blocker on flt itself MUST survive conversion
+            add_blocker(&tx, flt.id, f_blocker.id).unwrap();
+
+            let wi_stale = create_work_item(
+                &tx,
+                CreateWorkItemInput {
+                    project_id: pid,
+                    title: "Has Stale Link".to_string(),
+                    description: String::new(),
+                    status: ItemStatus::Todo,
+                    priority: Priority::None,
+                    feature_ids: vec![f_other.id, ftp.id],
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+
+            for tid in [ftp.id, trashed_child.id, trashed_wi.id, trashed_dep.id] {
+                conn.execute(
+                    "UPDATE items SET deleted_at = '2026-11-24T00:00:00Z', trash_root_id = id WHERE id = ?1;",
+                    [uuid_to_sql(tid.0)],
+                )
+                .unwrap();
+            }
+
+            (ftp, flt, wi_stale)
+        };
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let converted_wi = convert_work_item_to_feature(&tx, wi_with_trashed_link.id).unwrap();
+            assert_eq!(converted_wi.kind, ItemKind::Feature);
+            assert_eq!(converted_wi.parent_feature_id, Some(f_other.id));
+
+            let (converted_leaf, old_parent) =
+                convert_feature_to_work_item(&tx, f_leaf_with_trash.id).unwrap();
+            assert_eq!(old_parent, None);
+            assert_eq!(converted_leaf.kind, ItemKind::WorkItem);
+            assert!(
+                query_work_items_for_feature(&tx, f_trashed_parent.id)
+                    .unwrap()
+                    .is_empty()
+            );
+            tx.commit().unwrap();
+        }
+
+        let final_snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(final_snap.direct_blockers(f_leaf_with_trash.id).len(), 1);
+        assert_eq!(get_item(&conn, f_leaf_with_trash.id).unwrap().kind, ItemKind::WorkItem);
+    }
 }
 

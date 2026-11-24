@@ -271,14 +271,24 @@ impl ProjectStore {
         let Some(item) = snapshot.item(item_id) else {
             return;
         };
-        let mut cur = item.parent_feature_id;
+        let mut queue: Vec<ItemId> = if item.kind == ItemKind::WorkItem {
+            snapshot
+                .features_for_work_item(item_id)
+                .into_iter()
+                .map(|f| f.id)
+                .collect()
+        } else {
+            item.parent_feature_id.into_iter().collect()
+        };
         let mut visited = HashSet::new();
-        while let Some(pid) = cur {
+        while let Some(pid) = queue.pop() {
             if !visited.insert(pid) {
-                break;
+                continue;
             }
             self.expanded_features.insert(pid);
-            cur = snapshot.item(pid).and_then(|parent| parent.parent_feature_id);
+            if let Some(parent_id) = snapshot.item(pid).and_then(|parent| parent.parent_feature_id) {
+                queue.push(parent_id);
+            }
         }
     }
 

@@ -19,11 +19,12 @@ use gpui_kit::{
 };
 
 use crate::commands::{
-    CreateFeature, CreateWorkItem, DetachWorkItemFromFeature, UndoableCommand, UpdateItemFields,
+    ConvertFeatureToWorkItem, ConvertWorkItemToFeature, CreateFeature, CreateWorkItem,
+    DetachWorkItemFromFeature, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
-    FeatureProgress, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority,
-    ProjectSnapshot, clamped_depth_badge, visual_indent_px,
+    ConversionEligibility, FeatureProgress, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH,
+    Priority, ProjectSnapshot, clamped_depth_badge, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::open_create_feature_modal;
@@ -715,40 +716,81 @@ impl OutlineView {
                     }),
             );
 
+        let can_convert = snapshot
+            .conversion_eligibility(item_id)
+            .as_ref()
+            .is_some_and(ConversionEligibility::is_allowed);
+        let convert_label = if is_feature {
+            "Convert to Work Item"
+        } else {
+            "Convert to Feature"
+        };
+        let app_convert = app_state.clone();
+
         if is_feature {
             let store_focus = store;
             let view_focus = outline_view;
-            menu = menu.item(
-                PopupMenuItem::new("Focus Subtree")
-                    .icon(IconName::FolderOpen)
-                    .on_click(move |_, _, cx| {
-                        store_focus.update(cx, |s, cx| {
-                            s.select_item(Some(item_id));
-                            s.set_focused_feature(Some(item_id));
-                            s.expand_feature(item_id);
-                            cx.notify();
-                        });
-                        view_focus.update(cx, |this, cx| {
-                            this.set_scope(OutlineScope::SelectedSubtree, cx);
-                        });
-                    }),
-            );
+            menu = menu
+                .item(
+                    PopupMenuItem::new("Focus Subtree")
+                        .icon(IconName::FolderOpen)
+                        .on_click(move |_, _, cx| {
+                            store_focus.update(cx, |s, cx| {
+                                s.select_item(Some(item_id));
+                                s.set_focused_feature(Some(item_id));
+                                s.expand_feature(item_id);
+                                cx.notify();
+                            });
+                            view_focus.update(cx, |this, cx| {
+                                this.set_scope(OutlineScope::SelectedSubtree, cx);
+                            });
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(convert_label)
+                        .icon(IconName::Replace)
+                        .disabled(!can_convert)
+                        .on_click(move |_, window, cx| {
+                            OutlineView::dispatch_command(
+                                app_convert.clone(),
+                                Box::new(ConvertFeatureToWorkItem::new(item_id)),
+                                window,
+                                cx,
+                            );
+                        }),
+                );
         } else {
             let pfid = parent_feature.id;
             let pkey = parent_feature.item_key.clone();
             let app_detach = app_state;
-            menu = menu.separator().item(
-                PopupMenuItem::new(format!("Detach from {pkey}"))
-                    .icon(IconName::Close)
-                    .on_click(move |_, window, cx| {
-                        OutlineView::dispatch_command(
-                            app_detach.clone(),
-                            Box::new(DetachWorkItemFromFeature::new(item_id, pfid)),
-                            window,
-                            cx,
-                        );
-                    }),
-            );
+            menu = menu
+                .separator()
+                .item(
+                    PopupMenuItem::new(convert_label)
+                        .icon(IconName::Replace)
+                        .disabled(!can_convert)
+                        .on_click(move |_, window, cx| {
+                            OutlineView::dispatch_command(
+                                app_convert.clone(),
+                                Box::new(ConvertWorkItemToFeature::new(item_id)),
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(format!("Detach from {pkey}"))
+                        .icon(IconName::Close)
+                        .on_click(move |_, window, cx| {
+                            OutlineView::dispatch_command(
+                                app_detach.clone(),
+                                Box::new(DetachWorkItemFromFeature::new(item_id, pfid)),
+                                window,
+                                cx,
+                            );
+                        }),
+                );
         }
 
         menu

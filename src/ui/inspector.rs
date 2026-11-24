@@ -22,13 +22,14 @@ use gpui_kit::{
 };
 
 use crate::commands::{
-    AddBlocker, AttachWorkItemToFeature, DetachWorkItemFromFeature, RemoveBlocker,
-    ReparentFeature, ReorderSiblingFeatures, SetItemTags, SetWorkItemFeatures, UndoableCommand,
-    UpdateItemFields,
+    AddBlocker, AttachWorkItemToFeature, ConvertFeatureToWorkItem, ConvertWorkItemToFeature,
+    DetachWorkItemFromFeature, RemoveBlocker, ReparentFeature, ReorderSiblingFeatures, SetItemTags,
+    SetWorkItemFeatures, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
-    Assignee, AssigneeId, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority,
-    ProjectId, ProjectSnapshot, TagId, clamped_depth_badge, visual_indent_px,
+    Assignee, AssigneeId, ConversionEligibility, Item, ItemId, ItemKind, ItemStatus,
+    MAX_FEATURE_DEPTH, Priority, ProjectId, ProjectSnapshot, TagId, clamped_depth_badge,
+    visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::{open_create_feature_modal, open_tags_manager_modal};
@@ -143,6 +144,7 @@ pub struct InspectorView {
     app_state: Entity<AppState>,
     store: Entity<ProjectStore>,
     loaded_item_id: Option<ItemId>,
+    loaded_kind: Option<ItemKind>,
     loaded_project_id: Option<ProjectId>,
     loaded_title: String,
     loaded_description: String,
@@ -534,6 +536,7 @@ impl InspectorView {
             app_state,
             store,
             loaded_item_id: None,
+            loaded_kind: None,
             loaded_project_id: None,
             loaded_title: String::new(),
             loaded_description: String::new(),
@@ -854,6 +857,7 @@ impl InspectorView {
                 .update(cx, |inp, cx| inp.set_value("", window, cx));
             if let (Some(snapshot), Some(item)) = (&snapshot_opt, current_item) {
                 self.loaded_item_id = Some(item.id);
+                self.loaded_kind = Some(item.kind);
                 self.loaded_project_id = Some(item.project_id);
                 self.loaded_title = item.title.clone();
                 self.loaded_description = item.description.clone();
@@ -887,6 +891,7 @@ impl InspectorView {
                 }
             } else {
                 self.loaded_item_id = None;
+                self.loaded_kind = None;
                 self.loaded_project_id = None;
                 self.loaded_title.clear();
                 self.loaded_description.clear();
@@ -913,6 +918,16 @@ impl InspectorView {
         };
 
         self.syncing = true;
+        if Some(item.kind) != self.loaded_kind {
+            self.loaded_kind = Some(item.kind);
+            self.attach_popover_open = false;
+            self.loaded_parent_id = item.parent_feature_id;
+            if item.kind == ItemKind::Feature {
+                self.rebuild_parent_options(&snapshot, &item, window, cx);
+            } else {
+                self.parent_options_sig.clear();
+            }
+        }
         if item.status != self.loaded_status {
             self.loaded_status = item.status;
             self.status_select
@@ -1834,6 +1849,13 @@ impl Render for InspectorView {
                         ItemKind::Feature => "Convert to Work Item",
                         ItemKind::WorkItem => "Convert to Feature",
                     };
+                    let convert_eligibility = snapshot.conversion_eligibility(item.id);
+                    let convert_allowed = convert_eligibility
+                        .as_ref()
+                        .is_some_and(ConversionEligibility::is_allowed);
+                    let convert_tooltip = snapshot.conversion_tooltip(item.id);
+                    let convert_kind = item.kind;
+                    let inspector_for_convert = cx.entity();
 
                     let created = item.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
                     let updated = item.updated_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -2610,15 +2632,34 @@ impl Render for InspectorView {
                                                 .child(kind_badge(item.kind, cx)),
                                         )
                                         .child(
-                                            Button::new("inspector-convert-stub")
+                                            Button::new("inspector-convert-btn")
                                                 .outline()
                                                 .xsmall()
-                                                .icon(IconName::ArrowRight)
+                                                .icon(IconName::Replace)
                                                 .label(convert_label)
-                                                .disabled(true)
-                                                .tooltip(
-                                                    "Feature ↔ Work Item conversion — Available in Phase 8",
-                                                ),
+                                                .disabled(!convert_allowed)
+                                                .tooltip(convert_tooltip)
+                                                .on_click(move |_, window, cx| {
+                                                    let cmd: Box<dyn UndoableCommand> =
+                                                        match convert_kind {
+                                                            ItemKind::WorkItem => Box::new(
+                                                                ConvertWorkItemToFeature::new(
+                                                                    item_id,
+                                                                ),
+                                                            ),
+                                                            ItemKind::Feature => Box::new(
+                                                                ConvertFeatureToWorkItem::new(
+                                                                    item_id,
+                                                                ),
+                                                            ),
+                                                        };
+                                                    inspector_for_convert.update(cx, |this, cx| {
+                                                        this.flush_dirty_current(cx);
+                                                        this.dispatch_feature_membership_command(
+                                                            cmd, window, cx,
+                                                        );
+                                                    });
+                                                }),
                                         ),
                                 )
                                 .child(

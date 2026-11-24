@@ -2377,3 +2377,305 @@ async fn phase7_features_only_blocking_engine_and_transitive_propagation(cx: &mu
     assert!(!shm_path_for(&db_path).exists());
     assert!(!lock_path_for(&db_path).exists());
 }
+
+#[gpui_kit::test]
+async fn phase8_strictly_guarded_feature_work_item_conversion(cx: &mut TestAppContext) {
+    use protrack4::commands::AddBlocker;
+    use protrack4::domain::ConversionBlockReason;
+
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase8.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open Phase 8 WorkspaceShell");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    let pid = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateProject::new(
+                    "Conversion Suite",
+                    "CNV",
+                    "",
+                    "#6366F1",
+                    ProjectStatus::Active,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_project_id
+        .unwrap();
+
+    let fp_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Parent Feature",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let fleaf_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    Some(fp_id),
+                    "Leaf Subfeature",
+                    "",
+                    ItemStatus::InProgress,
+                    Priority::Medium,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let fb_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateFeature::new(
+                    pid,
+                    None,
+                    "Blocker Feature",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Urgent,
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let wi_unalloc_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Unallocated Task",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::High,
+                    vec![],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    let wi_shared_id = app_state
+        .update(cx, |app, cx| {
+            app.execute_command(
+                Box::new(CreateWorkItem::new(
+                    pid,
+                    "Shared Task",
+                    "",
+                    ItemStatus::Todo,
+                    Priority::Low,
+                    vec![fp_id, fb_id],
+                )),
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .created_item_id
+        .unwrap();
+
+    // Outgoing blockers on both fleaf_id and wi_unalloc_id pointing to fb_id (must survive conversion)
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(AddBlocker::new(fleaf_id, fb_id)), cx)
+        })
+        .await
+        .unwrap();
+    app_state
+        .update(cx, |app, cx| {
+            app.execute_command(Box::new(AddBlocker::new(wi_unalloc_id, fb_id)), cx)
+        })
+        .await
+        .unwrap();
+
+    wait_until(cx, "5 items loaded", |cx| {
+        store
+            .read(cx)
+            .snapshot()
+            .is_some_and(|s| s.active_items().len() == 5)
+    })
+    .await;
+
+    let (wi_unalloc_num, wi_unalloc_key, fleaf_key) = cx.update(|cx| {
+        let s = store.read(cx).snapshot().unwrap();
+        let w = s.item(wi_unalloc_id).unwrap();
+        let l = s.item(fleaf_id).unwrap();
+        assert_eq!(
+            s.conversion_eligibility(fp_id).unwrap().reasons(),
+            &[
+                ConversionBlockReason::HasChildFeatures(1),
+                ConversionBlockReason::HasAttachedWorkItems(1),
+            ]
+        );
+        assert!(s.conversion_tooltip(fp_id).contains("has 1 child Feature and has 1 attached Work Item"));
+        assert_eq!(
+            s.conversion_eligibility(fb_id).unwrap().reasons(),
+            &[
+                ConversionBlockReason::HasAttachedWorkItems(1),
+                ConversionBlockReason::HasActiveDependents(2),
+            ]
+        );
+        assert_eq!(
+            s.conversion_eligibility(wi_shared_id).unwrap().reasons(),
+            &[ConversionBlockReason::AttachedToMultipleFeatures(2)]
+        );
+        assert!(s.conversion_tooltip(wi_shared_id).contains("2 Features"));
+        (
+            w.item_number as usize,
+            w.item_key.clone(),
+            l.item_key.clone(),
+        )
+    });
+
+    // 1. In Unallocated View, convert wi_unalloc -> Root Feature preserving item_key and outgoing blocker
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("sidebar-unallocated-row", cx);
+        window.render_frame(cx);
+        assert_eq!(store.read(cx).active_tab(), CenterViewTab::Unallocated);
+        window.click(("unallocated-convert-btn", wi_unalloc_num), cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "wi_unalloc converted to root Feature", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.item(wi_unalloc_id).is_some_and(|i| {
+                i.kind == ItemKind::Feature
+                    && i.item_key == wi_unalloc_key
+                    && i.parent_feature_id.is_none()
+            }) && s.unallocated_work_items().is_empty()
+                && s.direct_blockers(wi_unalloc_id).len() == 1
+        })
+    })
+    .await;
+
+    // 2. In Inspector, convert that root Feature back to Unallocated Work Item
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(wi_unalloc_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("inspector-convert-btn", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "converted back to Unallocated Work Item", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.item(wi_unalloc_id)
+                .is_some_and(|i| i.kind == ItemKind::WorkItem && i.item_key == wi_unalloc_key)
+                && s.unallocated_work_items().len() == 1
+                && s.direct_blockers(wi_unalloc_id).len() == 1
+        })
+    })
+    .await;
+
+    // 3. Convert Leaf Subfeature -> Work Item attached to [Parent Feature] -> back to Child Feature under Parent Feature
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.select_item(Some(fleaf_id));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("inspector-convert-btn", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Leaf Feature converted to Work Item under Parent", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.item(fleaf_id).is_some_and(|i| {
+                i.kind == ItemKind::WorkItem
+                    && i.item_key == fleaf_key
+                    && i.parent_feature_id.is_none()
+            }) && s.features_for_work_item(fleaf_id).iter().any(|f| f.id == fp_id)
+                && s.direct_blockers(fleaf_id).len() == 1
+        })
+    })
+    .await;
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("inspector-convert-btn", cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Work Item converted back to Child Feature under Parent", |cx| {
+        store.read(cx).snapshot().is_some_and(|s| {
+            s.item(fleaf_id).is_some_and(|i| {
+                i.kind == ItemKind::Feature
+                    && i.item_key == fleaf_key
+                    && i.parent_feature_id == Some(fp_id)
+            }) && s.direct_blockers(fleaf_id).len() == 1
+        })
+    })
+    .await;
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+    assert!(!wal_path_for(&db_path).exists());
+    assert!(!shm_path_for(&db_path).exists());
+    assert!(!lock_path_for(&db_path).exists());
+}

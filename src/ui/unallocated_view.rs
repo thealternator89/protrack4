@@ -16,7 +16,7 @@ use gpui_kit::{
     Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::commands::{CreateWorkItem, SetWorkItemFeatures};
+use crate::commands::{ConvertWorkItemToFeature, CreateWorkItem, SetWorkItemFeatures};
 use crate::domain::{
     ItemId, ItemStatus, Priority, clamped_depth_badge, visual_indent_px,
 };
@@ -686,14 +686,44 @@ impl Render for UnallocatedView {
                                             )
                                     })
                             )
-                            .child(
-                                Button::new(("unallocated-convert-stub", wi_num))
+                            .child({
+                                let app_convert = self.app_state.clone();
+                                Button::new(("unallocated-convert-btn", wi_num))
                                     .ghost()
                                     .xsmall()
                                     .label("→ Feature")
-                                    .disabled(true)
-                                    .tooltip("Convert to Feature — Available in Phase 8"),
-                            )
+                                    .tooltip("Convert to root Feature (preserves key, tags, assignee, and blockers)")
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        let task = app_convert.update(cx, |app, cx| {
+                                            app.execute_command(
+                                                Box::new(ConvertWorkItemToFeature::new(wi_id)),
+                                                cx,
+                                            )
+                                        });
+                                        window
+                                            .spawn(cx, async move |cx| {
+                                                let res = task.await;
+                                                let _ = cx.update(|window, cx| match res {
+                                                    Ok(effect) => {
+                                                        if let Some(msg) = effect.toast {
+                                                            window.push_notification(
+                                                                Notification::success(msg),
+                                                                cx,
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        window.push_notification(
+                                                            Notification::error(err.to_string()),
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            })
+                                            .detach();
+                                    })
+                            })
                     }))
                     .into_any_element()
             })

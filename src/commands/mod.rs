@@ -1,4 +1,5 @@
 pub mod blocker_commands;
+pub mod conversion_commands;
 pub mod item_commands;
 pub mod meta_commands;
 
@@ -7,6 +8,7 @@ use rusqlite::Transaction;
 use crate::domain::{AssigneeId, DomainError, DomainEvent, ItemId, ProjectId, TagId};
 
 pub use blocker_commands::{AddBlocker, RemoveBlocker};
+pub use conversion_commands::{ConvertFeatureToWorkItem, ConvertWorkItemToFeature};
 pub use item_commands::{
     AttachWorkItemToFeature, CreateFeature, CreateWorkItem, DetachWorkItemFromFeature,
     ReparentFeature, ReorderSiblingFeatures, SetItemTags, SetWorkItemFeatures, UpdateItemFields,
@@ -558,5 +560,84 @@ mod tests {
             snap.effective_block_state(wi_a),
             EffectiveBlockState::Unblocked
         );
+    }
+
+    #[test]
+    fn conversion_commands_preserve_key_and_reject_blocked_cases() {
+        use crate::db::load_project_snapshot;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        inspect_and_migrate(&mut conn, None, "ConvCmdTest").unwrap();
+
+        let pid = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cp = CreateProject::new("Convert", "CNV", "", "#6366F1", ProjectStatus::Active);
+            let pid = cp.execute(&tx).unwrap().created_project_id.unwrap();
+            tx.commit().unwrap();
+            pid
+        };
+
+        let (f_parent, wi_id) = {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut cf =
+                CreateFeature::new(pid, None, "Parent", "", ItemStatus::Todo, Priority::High);
+            let fid = cf.execute(&tx).unwrap().created_item_id.unwrap();
+            let mut cwi = CreateWorkItem::new(
+                pid,
+                "Convertible",
+                "Body",
+                ItemStatus::Todo,
+                Priority::Medium,
+                vec![fid],
+            );
+            let wid = cwi.execute(&tx).unwrap().created_item_id.unwrap();
+            tx.commit().unwrap();
+            (fid, wid)
+        };
+
+        // Parent with attached WI cannot convert
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut bad = ConvertFeatureToWorkItem::new(f_parent);
+            assert!(matches!(
+                bad.execute(&tx),
+                Err(DomainError::ConversionBlocked(_))
+            ));
+        }
+
+        // Convertible WI -> Child Feature under f_parent -> back to Work Item attached to [f_parent]
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut to_feat = ConvertWorkItemToFeature::new(wi_id);
+            let eff = to_feat.execute(&tx).unwrap();
+            assert_eq!(eff.selected_item_id, Some(wi_id));
+            assert_eq!(eff.toast.as_deref(), Some("Converted CNV-2 to Feature"));
+            tx.commit().unwrap();
+        }
+        let item_as_feat = get_item(&conn, wi_id).unwrap();
+        assert_eq!(item_as_feat.item_key, "CNV-2");
+        assert_eq!(item_as_feat.parent_feature_id, Some(f_parent));
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut to_wi = ConvertFeatureToWorkItem::new(wi_id);
+            let eff = to_wi.execute(&tx).unwrap();
+            assert_eq!(eff.selected_item_id, Some(wi_id));
+            assert_eq!(eff.toast.as_deref(), Some("Converted CNV-2 to Work Item"));
+            tx.commit().unwrap();
+        }
+        let snap = load_project_snapshot(&conn, pid).unwrap();
+        assert_eq!(snap.item(wi_id).unwrap().item_key, "CNV-2");
+        assert_eq!(snap.features_for_work_item(wi_id).len(), 1);
     }
 }

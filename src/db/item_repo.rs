@@ -10,8 +10,9 @@ use crate::db::{
 };
 use crate::domain::fractional_index;
 use crate::domain::{
-    AssigneeId, DomainError, FeatureProgress, FeatureWorkItem, Item, ItemId, ItemKind,
-    ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId,
+    AssigneeId, ConversionBlockReason, ConversionEligibility, DomainError, FeatureProgress,
+    FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId,
+    format_conversion_block_message,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1474,4 +1475,331 @@ pub fn detach_work_item_from_feature(
     } else {
         Ok(false)
     }
+}
+
+/// Checks `INV-08` Work Item → Feature conversion eligibility against live SQLite state.
+pub fn check_work_item_to_feature_eligibility(
+    conn: &Connection,
+    work_item_id: ItemId,
+) -> Result<ConversionEligibility, DomainError> {
+    let item = get_item(conn, work_item_id)?;
+    if !item.is_active() {
+        return Err(DomainError::Validation(
+            "Cannot convert an item in Trash".to_string(),
+        ));
+    }
+    if item.kind != ItemKind::WorkItem {
+        return Err(DomainError::ConversionBlocked(
+            "Item is already a Feature".to_string(),
+        ));
+    }
+
+    let attached = query_features_for_work_item(conn, work_item_id)?;
+    match attached.len() {
+        0 => Ok(ConversionEligibility::Allowed {
+            target_kind: ItemKind::Feature,
+            resulting_parent: None,
+            moves_to_unallocated: false,
+        }),
+        1 => {
+            let parent = &attached[0];
+            if feature_depth(conn, parent.id)? + 1 >= MAX_FEATURE_DEPTH {
+                Ok(ConversionEligibility::Blocked(vec![
+                    ConversionBlockReason::ExceedsMaxFeatureDepth {
+                        max_depth: MAX_FEATURE_DEPTH,
+                    },
+                ]))
+            } else {
+                Ok(ConversionEligibility::Allowed {
+                    target_kind: ItemKind::Feature,
+                    resulting_parent: Some(parent.id),
+                    moves_to_unallocated: false,
+                })
+            }
+        }
+        n => Ok(ConversionEligibility::Blocked(vec![
+            ConversionBlockReason::AttachedToMultipleFeatures(n),
+        ])),
+    }
+}
+
+/// Checks `INV-09` Feature → Work Item conversion eligibility against live SQLite state.
+pub fn check_feature_to_work_item_eligibility(
+    conn: &Connection,
+    feature_id: ItemId,
+) -> Result<ConversionEligibility, DomainError> {
+    let item = get_item(conn, feature_id)?;
+    if !item.is_active() {
+        return Err(DomainError::Validation(
+            "Cannot convert an item in Trash".to_string(),
+        ));
+    }
+    if item.kind != ItemKind::Feature {
+        return Err(DomainError::ConversionBlocked(
+            "Item is already a Work Item".to_string(),
+        ));
+    }
+
+    let fid_sql = uuid_to_sql(feature_id.0);
+    let child_count_i64: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM items WHERE parent_feature_id = ?1 AND deleted_at IS NULL;",
+            params![&fid_sql],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    let wi_count_i64: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM feature_work_items fwi
+             JOIN items wi ON wi.id = fwi.work_item_id
+             WHERE fwi.feature_id = ?1 AND wi.deleted_at IS NULL;",
+            params![&fid_sql],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    let dep_count_i64: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM item_blockers ib
+             JOIN items b ON b.id = ib.blocked_item_id
+             WHERE ib.blocker_feature_id = ?1 AND b.deleted_at IS NULL;",
+            params![&fid_sql],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+
+    let mut reasons = Vec::new();
+    let child_count = usize::try_from(child_count_i64).unwrap_or(0);
+    if child_count > 0 {
+        reasons.push(ConversionBlockReason::HasChildFeatures(child_count));
+    }
+    let wi_count = usize::try_from(wi_count_i64).unwrap_or(0);
+    if wi_count > 0 {
+        reasons.push(ConversionBlockReason::HasAttachedWorkItems(wi_count));
+    }
+    let dep_count = usize::try_from(dep_count_i64).unwrap_or(0);
+    if dep_count > 0 {
+        reasons.push(ConversionBlockReason::HasActiveDependents(dep_count));
+    }
+
+    if !reasons.is_empty() {
+        return Ok(ConversionEligibility::Blocked(reasons));
+    }
+
+    let active_parent = match item.parent_feature_id {
+        Some(pid) => {
+            let parent = get_item(conn, pid)?;
+            if parent.is_active() && parent.kind == ItemKind::Feature {
+                Some(pid)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    Ok(ConversionEligibility::Allowed {
+        target_kind: ItemKind::WorkItem,
+        resulting_parent: active_parent,
+        moves_to_unallocated: active_parent.is_none(),
+    })
+}
+
+/// Losslessly converts an eligible Work Item (`0` or `1` active Feature) into a Feature (`DATA_MODEL.md` §4.6.A / `INV-08`).
+pub fn convert_work_item_to_feature(
+    tx: &Transaction<'_>,
+    work_item_id: ItemId,
+) -> Result<Item, DomainError> {
+    let item = get_item(tx, work_item_id)?;
+    if !item.is_active() {
+        return Err(DomainError::Validation(
+            "Cannot convert an item in Trash".to_string(),
+        ));
+    }
+    if item.kind != ItemKind::WorkItem {
+        return Err(DomainError::ConversionBlocked(format!(
+            "{} is already a Feature",
+            item.item_key
+        )));
+    }
+
+    let attached = query_features_for_work_item(tx, work_item_id)?;
+    let parent_id = match attached.len() {
+        0 => None,
+        1 => {
+            let parent = &attached[0];
+            if feature_depth(tx, parent.id)? + 1 >= MAX_FEATURE_DEPTH {
+                return Err(DomainError::ConversionBlocked(
+                    format_conversion_block_message(
+                        ItemKind::WorkItem,
+                        &[ConversionBlockReason::ExceedsMaxFeatureDepth {
+                            max_depth: MAX_FEATURE_DEPTH,
+                        }],
+                        &[],
+                        &[],
+                    ),
+                ));
+            }
+            Some(parent.id)
+        }
+        n => {
+            let names: Vec<String> = attached.iter().map(|f| f.title.clone()).collect();
+            return Err(DomainError::ConversionBlocked(
+                format_conversion_block_message(
+                    ItemKind::WorkItem,
+                    &[ConversionBlockReason::AttachedToMultipleFeatures(n)],
+                    &names,
+                    &[],
+                ),
+            ));
+        }
+    };
+
+    let wi_sql = uuid_to_sql(work_item_id.0);
+    // Clear all feature_work_items rows (active link + any stale links to trashed Features) before flipping kind.
+    tx.execute(
+        "DELETE FROM feature_work_items WHERE work_item_id = ?1;",
+        params![&wi_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+    let new_sort_order =
+        append_sort_order_for_parent(tx, item.project_id, parent_id, None, &now_sql)?;
+
+    tx.execute(
+        "UPDATE items
+         SET kind = 'feature',
+             parent_feature_id = ?1,
+             sort_order = ?2,
+             updated_at = ?3
+         WHERE id = ?4;",
+        params![
+            parent_id.map(|id| uuid_to_sql(id.0)),
+            &new_sort_order,
+            &now_sql,
+            &wi_sql,
+        ],
+    )
+    .map_err(map_sqlite_err)?;
+
+    Ok(Item {
+        kind: ItemKind::Feature,
+        parent_feature_id: parent_id,
+        sort_order: new_sort_order,
+        updated_at: now,
+        ..item
+    })
+}
+
+/// Losslessly converts an eligible empty leaf Feature into a Work Item (`DATA_MODEL.md` §4.6.B / `INV-09`).
+pub fn convert_feature_to_work_item(
+    tx: &Transaction<'_>,
+    feature_id: ItemId,
+) -> Result<(Item, Option<ItemId>), DomainError> {
+    let item = get_item(tx, feature_id)?;
+    if !item.is_active() {
+        return Err(DomainError::Validation(
+            "Cannot convert an item in Trash".to_string(),
+        ));
+    }
+    if item.kind != ItemKind::Feature {
+        return Err(DomainError::ConversionBlocked(format!(
+            "{} is already a Work Item",
+            item.item_key
+        )));
+    }
+
+    let eligibility = check_feature_to_work_item_eligibility(tx, feature_id)?;
+    if let ConversionEligibility::Blocked(reasons) = eligibility {
+        let mut stmt = tx
+            .prepare(
+                "SELECT b.item_key
+                 FROM item_blockers ib
+                 JOIN items b ON b.id = ib.blocked_item_id
+                 WHERE ib.blocker_feature_id = ?1
+                   AND b.deleted_at IS NULL
+                 ORDER BY b.item_number ASC;",
+            )
+            .map_err(map_sqlite_err)?;
+        let dep_keys = stmt
+            .query_map(params![uuid_to_sql(feature_id.0)], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_err)?;
+
+        return Err(DomainError::ConversionBlocked(
+            format_conversion_block_message(ItemKind::Feature, &reasons, &[], &dep_keys),
+        ));
+    }
+
+    let old_parent_id = match eligibility {
+        ConversionEligibility::Allowed {
+            resulting_parent, ..
+        } => resulting_parent,
+        ConversionEligibility::Blocked(_) => None,
+    };
+
+    let feat_sql = uuid_to_sql(feature_id.0);
+    // Prune stale references from already-trashed rows before flipping kind so trg_items_kind_guard_upd passes.
+    tx.execute(
+        "UPDATE items
+         SET parent_feature_id = NULL
+         WHERE parent_feature_id = ?1 AND deleted_at IS NOT NULL;",
+        params![&feat_sql],
+    )
+    .map_err(map_sqlite_err)?;
+    tx.execute(
+        "DELETE FROM feature_work_items WHERE feature_id = ?1;",
+        params![&feat_sql],
+    )
+    .map_err(map_sqlite_err)?;
+    tx.execute(
+        "DELETE FROM item_blockers WHERE blocker_feature_id = ?1;",
+        params![&feat_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    let now = Utc::now();
+    let now_sql = ts_to_sql(now);
+    let new_wi_sort = append_work_item_sort_order(tx, item.project_id, &now_sql)?;
+
+    tx.execute(
+        "UPDATE items
+         SET kind = 'work_item',
+             parent_feature_id = NULL,
+             sort_order = ?1,
+             updated_at = ?2
+         WHERE id = ?3;",
+        params![&new_wi_sort, &now_sql, &feat_sql],
+    )
+    .map_err(map_sqlite_err)?;
+
+    if let Some(parent_id) = old_parent_id {
+        let fwi_sort = append_fwi_sort_order(tx, item.project_id, parent_id)?;
+        tx.execute(
+            "INSERT INTO feature_work_items (project_id, feature_id, work_item_id, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5);",
+            params![
+                uuid_to_sql(item.project_id.0),
+                uuid_to_sql(parent_id.0),
+                &feat_sql,
+                &fwi_sort,
+                &now_sql,
+            ],
+        )
+        .map_err(map_sqlite_err)?;
+    }
+
+    let converted = Item {
+        kind: ItemKind::WorkItem,
+        parent_feature_id: None,
+        sort_order: new_wi_sort,
+        updated_at: now,
+        ..item
+    };
+
+    Ok((converted, old_parent_id))
 }
