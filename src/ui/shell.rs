@@ -877,7 +877,7 @@ impl Render for WorkspaceShell {
         let status_label = if is_loading {
             "Opening workspace…".to_string()
         } else if self.store.read(cx).workspace_meta().is_some() {
-            format!("v{}", env!("CARGO_PKG_VERSION"))
+            format!("v{}", crate::version::APP_VERSION)
         } else {
             "No Workspace Open".to_string()
         };

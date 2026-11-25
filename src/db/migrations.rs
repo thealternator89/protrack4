@@ -10,7 +10,7 @@ use crate::domain::{DomainError, ItemKind, ProjectId, WorkspaceMeta};
 use crate::state::sample_snapshot;
 
 pub const APP_MAX_SCHEMA_VERSION: u32 = 2;
-pub const APP_MIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const APP_MIN_VERSION: &str = crate::version::APP_VERSION;
 pub const MIGRATION_001_SQL: &str = include_str!("../../migrations/001_initial.sql");
 pub const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_item_links.sql");
 

@@ -125,7 +125,7 @@ impl ProjectStore {
             workspace_path: None,
             workspace_meta: Some(WorkspaceMeta {
                 schema_version: crate::db::APP_MAX_SCHEMA_VERSION,
-                app_min_version: env!("CARGO_PKG_VERSION").to_string(),
+                app_min_version: crate::version::APP_VERSION.to_string(),
                 workspace_name: "sample.protrack".to_string(),
                 created_at: snapshot.project.created_at,
                 updated_at: snapshot.project.updated_at,
