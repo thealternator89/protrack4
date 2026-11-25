@@ -170,7 +170,7 @@ mod tests {
         let handle_a = manager
             .create_workspace(&path_a, Some("Alpha"), true)
             .unwrap();
-        assert_eq!(handle_a.meta.schema_version, 1);
+        assert_eq!(handle_a.meta.schema_version, crate::db::APP_MAX_SCHEMA_VERSION);
         assert!(lock_path_for(&path_a).exists());
 
         let overview_a = handle_a.db.load_workspace_overview_blocking(None).unwrap();
@@ -206,7 +206,7 @@ mod tests {
             forward_err,
             DomainError::ForwardSchemaVersion {
                 file_version: 999,
-                max_supported: 1,
+                max_supported: crate::db::APP_MAX_SCHEMA_VERSION,
             }
         );
         assert_eq!(fs::read(&path_future).unwrap(), future_bytes);

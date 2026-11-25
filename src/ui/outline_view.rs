@@ -34,8 +34,8 @@ use crate::ui::dnd::{
 };
 use crate::ui::modals::open_create_feature_modal;
 use crate::ui::{
-    assignee_pill, block_state_badge, blocker_warning_pill, domain_tag_chip, parse_hex_or,
-    priority_badge, priority_color, status_badge, status_color, status_icon,
+    assignee_pill, block_state_badge, blocker_warning_pill, domain_tag_chip, item_link_pill,
+    parse_hex_or, priority_badge, priority_color, status_badge, status_color, status_icon,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -518,6 +518,18 @@ impl OutlineView {
         let header = format!("{} · {}", item.item_key, item.kind.label());
 
         menu = menu.min_w(px(210.)).label(header);
+
+        if let Some(link) = item.link.clone() {
+            menu = menu
+                .item(
+                    PopupMenuItem::new(format!("Open Link ({})", link.label))
+                        .icon(IconName::ExternalLink)
+                        .on_click(move |_, _, cx| {
+                            cx.open_url(&link.url);
+                        }),
+                )
+                .separator();
+        }
 
         // Status submenu
         let current_status = item.status;
@@ -1141,6 +1153,15 @@ impl OutlineView {
                     })
                     .child(feature.title.clone()),
             )
+            .when_some(feature.link.as_ref(), |this, link| {
+                this.child(
+                    div()
+                        .id(("outline-feature-link-wrap", feat_num))
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(item_link_pill(("outline-feature-link", feat_num), link, cx)),
+                )
+            })
             .when_some(depth_badge, |this, badge| {
                 this.child(Tag::secondary().xsmall().child(badge))
             })
@@ -1344,6 +1365,15 @@ impl OutlineView {
                     .when(wi.status.is_cancelled(), |this| this.line_through())
                     .child(wi.title.clone()),
             )
+            .when_some(wi.link.as_ref(), |this, link| {
+                this.child(
+                    div()
+                        .id(("outline-wi-link-wrap", row_key))
+                        .test_support()
+                        .flex_shrink_0()
+                        .child(item_link_pill(("outline-wi-link", row_key), link, cx)),
+                )
+            })
             .when_some(block_badge, |this, badge| {
                 this.child(
                     div()
@@ -2136,6 +2166,7 @@ mod tests {
             status,
             priority: Priority::None,
             assignee_id: None,
+            link: None,
             sort_order: format!("a{num}"),
             deleted_at: None,
             trash_root_id: None,

@@ -11,7 +11,7 @@ use protrack4::commands::{
 };
 use protrack4::db::inspect_and_migrate;
 use protrack4::db::item_repo::{get_item, trash_item_subtree};
-use protrack4::domain::{ItemId, ItemStatus, Priority, ProjectId, ProjectStatus};
+use protrack4::domain::{ItemId, ItemLink, ItemStatus, Priority, ProjectId, ProjectStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DbSnapshotState {
@@ -76,9 +76,9 @@ fn capture_db_state(conn: &Connection) -> DbSnapshotState {
             conn,
             "SELECT id, project_id, item_number, item_key, kind, parent_feature_id,
                     title, description, status, priority, assignee_id, sort_order,
-                    deleted_at, trash_root_id, created_at, updated_at
+                    deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
              FROM items ORDER BY id ASC;",
-            16,
+            18,
         ),
         feature_work_items: query_rows(
             conn,
@@ -274,6 +274,10 @@ fn layer2_all_commands_round_trip_undo_and_redo_with_exact_equality() {
                 Box::new(
                     CreateFeature::new(pid, None, "Feature 1", "Body", ItemStatus::Todo, Priority::High)
                         .with_assignee(Some(assignee_id))
+                        .with_link(Some(ItemLink {
+                            url: "https://acme.atlassian.net/browse/ABC-101".to_string(),
+                            label: "ABC-101".to_string(),
+                        }))
                         .with_tags(vec![tag1_id]),
                 ),
             )
@@ -332,6 +336,10 @@ fn layer2_all_commands_round_trip_undo_and_redo_with_exact_equality() {
                         vec![f1],
                     )
                     .with_assignee(Some(assignee_id))
+                    .with_link(Some(ItemLink {
+                        url: "https://github.com/org/repo/issues/42".to_string(),
+                        label: "#42".to_string(),
+                    }))
                     .with_tags(vec![tag1_id, tag2_id]),
                 ),
             )
@@ -401,8 +409,18 @@ fn layer2_all_commands_round_trip_undo_and_redo_with_exact_equality() {
                 .with_description("## Updated")
                 .with_status(ItemStatus::InProgress)
                 .with_priority(Priority::Urgent)
-                .with_assignee_id(None),
+                .with_assignee_id(None)
+                .with_link(Some(ItemLink {
+                    url: "https://dev.azure.com/org/proj/_workitems/edit/999".to_string(),
+                    label: "#999".to_string(),
+                })),
         ),
+    );
+    assert_round_trip(
+        &mut conn,
+        &mut mgr,
+        "UpdateItemFields(clear link)",
+        Box::new(UpdateItemFields::new(wi1).with_link(None)),
     );
     assert_round_trip(
         &mut conn,

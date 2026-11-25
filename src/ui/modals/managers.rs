@@ -27,6 +27,7 @@ use crate::db::project_repo::{validate_hex_color, validate_key_prefix, validate_
 use crate::db::tag_repo::validate_tag_name;
 use crate::domain::{
     AssigneeId, ItemId, ItemStatus, Priority, Project, ProjectId, ProjectStatus, TagId,
+    suggest_link_label, validate_item_link,
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::{
@@ -623,6 +624,11 @@ pub struct CreateFeatureModalView {
     project_id: ProjectId,
     parent: Option<(ItemId, String, usize)>,
     title_input: Entity<InputState>,
+    link_url_input: Entity<InputState>,
+    link_label_input: Entity<InputState>,
+    link_label_edited_manually: bool,
+    suppress_link_label_change: bool,
+    last_auto_link_label: Option<String>,
     status_select: Entity<SelectState<Vec<StatusSelectOption>>>,
     priority_select: Entity<SelectState<Vec<PrioritySelectOption>>>,
     selected_status: ItemStatus,
@@ -642,6 +648,12 @@ impl CreateFeatureModalView {
     ) -> Self {
         let title_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("e.g., Authentication & Session Sync")
+        });
+        let link_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Optional URL (Jira, GitHub, Azure DevOps)…")
+        });
+        let link_label_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Auto-filled label")
         });
 
         let status_options = all_status_options();
@@ -697,18 +709,91 @@ impl CreateFeatureModalView {
             },
         );
 
+        let link_url_sub = cx.subscribe_in(
+            &link_url_input,
+            window,
+            |this, inp, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.error = None;
+                    let url = inp.read(cx).value().to_string();
+                    let current_label = this.link_label_input.read(cx).value().to_string();
+                    if url.trim().is_empty() {
+                        this.link_label_edited_manually = false;
+                        this.last_auto_link_label = None;
+                        this.suppress_link_label_change = true;
+                        this.link_label_input
+                            .update(cx, |lbl, cx| lbl.set_value("", window, cx));
+                        this.suppress_link_label_change = false;
+                    } else if !this.link_label_edited_manually || current_label.trim().is_empty() {
+                        let suggested = suggest_link_label(&url).unwrap_or_default();
+                        this.last_auto_link_label = if suggested.is_empty() {
+                            None
+                        } else {
+                            Some(suggested.clone())
+                        };
+                        this.suppress_link_label_change = true;
+                        this.link_label_input
+                            .update(cx, |lbl, cx| lbl.set_value(suggested, window, cx));
+                        this.suppress_link_label_change = false;
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.submit(window, cx);
+                }
+                _ => {}
+            },
+        );
+
+        let link_label_sub = cx.subscribe_in(
+            &link_label_input,
+            window,
+            |this, inp, event: &InputEvent, window, cx| {
+                if this.suppress_link_label_change {
+                    return;
+                }
+                match event {
+                    InputEvent::Change => {
+                        this.error = None;
+                        let val = inp.read(cx).value().to_string();
+                        if val.trim().is_empty() {
+                            this.link_label_edited_manually = false;
+                        } else if this.last_auto_link_label.as_deref() != Some(val.as_str()) {
+                            this.link_label_edited_manually = true;
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.submit(window, cx);
+                    }
+                    _ => {}
+                }
+            },
+        );
+
         Self {
             app_state,
             project_id,
             parent,
             title_input,
+            link_url_input,
+            link_label_input,
+            link_label_edited_manually: false,
+            suppress_link_label_change: false,
+            last_auto_link_label: None,
             status_select,
             priority_select,
             selected_status: ItemStatus::Todo,
             selected_priority: Priority::None,
             error: None,
             busy: false,
-            _subscriptions: vec![title_sub, status_sub, priority_sub],
+            _subscriptions: vec![
+                title_sub,
+                status_sub,
+                priority_sub,
+                link_url_sub,
+                link_label_sub,
+            ],
         }
     }
 
@@ -724,18 +809,36 @@ impl CreateFeatureModalView {
             return;
         }
 
+        let link_url = self.link_url_input.read(cx).value().to_string();
+        let link_label = self.link_label_input.read(cx).value().to_string();
+        let link = if link_url.trim().is_empty() {
+            None
+        } else {
+            match validate_item_link(&link_url, &link_label) {
+                Ok(validated) => Some(validated),
+                Err(err) => {
+                    self.error = Some(err.to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+
         self.busy = true;
         self.error = None;
         cx.notify();
 
-        let command = Box::new(CreateFeature::new(
-            self.project_id,
-            self.parent.as_ref().map(|(id, _, _)| *id),
-            trimmed,
-            String::new(),
-            self.selected_status,
-            self.selected_priority,
-        ));
+        let command = Box::new(
+            CreateFeature::new(
+                self.project_id,
+                self.parent.as_ref().map(|(id, _, _)| *id),
+                trimmed,
+                String::new(),
+                self.selected_status,
+                self.selected_priority,
+            )
+            .with_link(link),
+        );
 
         let task = self
             .app_state
@@ -841,6 +944,34 @@ impl Render for CreateFeatureModalView {
                                 Select::new(&self.priority_select)
                                     .small()
                                     .disabled(self.busy),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().font_medium().child("Link"))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&self.link_url_input)
+                                        .id("create-feature-link-url")
+                                        .small()
+                                        .cleanable(true)
+                                        .disabled(self.busy),
+                                ),
+                            )
+                            .child(
+                                div().w(px(140.)).child(
+                                    Input::new(&self.link_label_input)
+                                        .id("create-feature-link-label")
+                                        .small()
+                                        .cleanable(true)
+                                        .disabled(self.busy),
+                                ),
                             ),
                     ),
             )

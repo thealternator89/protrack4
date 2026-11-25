@@ -28,8 +28,8 @@ use crate::domain::{
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::{
-    assignee_pill, block_state_badge, blocker_warning_pill, domain_tag_chip, kind_badge,
-    parse_hex_or, priority_badge, priority_color, status_badge, status_icon,
+    assignee_pill, block_state_badge, blocker_warning_pill, domain_tag_chip, item_link_pill,
+    kind_badge, parse_hex_or, priority_badge, priority_color, status_badge, status_icon,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -343,6 +343,10 @@ pub fn project_table_rows(
             if !query.is_empty() {
                 let mut matched = item.item_key.to_lowercase().contains(&query)
                     || item.title.to_lowercase().contains(&query)
+                    || item.link.as_ref().is_some_and(|l| {
+                        l.label.to_lowercase().contains(&query)
+                            || l.url.to_lowercase().contains(&query)
+                    })
                     || tags.iter().any(|t| t.name.to_lowercase().contains(&query))
                     || assignee.as_ref().is_some_and(|a| {
                         a.name.to_lowercase().contains(&query)
@@ -493,7 +497,7 @@ impl ItemTableDelegate {
 
 impl TableDelegate for ItemTableDelegate {
     fn columns_count(&self, _: &App) -> usize {
-        8
+        9
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -528,10 +532,13 @@ impl TableDelegate for ItemTableDelegate {
             6 => Column::new("assignee", "Assignee")
                 .width(px(84.))
                 .min_width(px(64.)),
-            _ => Column::new("block", "Block State")
+            7 => Column::new("block", "Block State")
                 .width(px(148.))
                 .min_width(px(110.))
                 .sort(self.col_sort(TableSortColumn::BlockState)),
+            _ => Column::new("link", "Link")
+                .width(px(124.))
+                .min_width(px(90.)),
         }
     }
 
@@ -596,6 +603,18 @@ impl TableDelegate for ItemTableDelegate {
         let header = format!("{} · {}", item.item_key, item.kind.label());
 
         menu = menu.min_w(px(210.)).label(header);
+
+        if let Some(link) = item.link.clone() {
+            menu = menu
+                .item(
+                    PopupMenuItem::new(format!("Open Link ({})", link.label))
+                        .icon(IconName::ExternalLink)
+                        .on_click(move |_, _, cx| {
+                            cx.open_url(&link.url);
+                        }),
+                )
+                .separator();
+        }
 
         // Status submenu
         let current_status = item.status;
@@ -963,7 +982,7 @@ impl TableDelegate for ItemTableDelegate {
                         .into_any_element(),
                 })
                 .into_any_element(),
-            _ => h_flex()
+            7 => h_flex()
                 .h_full()
                 .items_center()
                 .gap_1()
@@ -984,6 +1003,23 @@ impl TableDelegate for ItemTableDelegate {
                             .into_any_element()
                     },
                 )
+                .into_any_element(),
+            _ => h_flex()
+                .h_full()
+                .items_center()
+                .child(match &row.item.link {
+                    Some(link) => item_link_pill(
+                        ("table-link", row.item.item_number as usize),
+                        link,
+                        cx,
+                    )
+                    .into_any_element(),
+                    None => div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("—")
+                        .into_any_element(),
+                })
                 .into_any_element(),
         }
     }
@@ -1676,6 +1712,7 @@ mod tests {
             status,
             priority: prio,
             assignee_id: assignee,
+            link: None,
             sort_order: format!("a{num}"),
             deleted_at: None,
             trash_root_id: None,

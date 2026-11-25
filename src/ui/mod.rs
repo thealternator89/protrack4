@@ -12,18 +12,20 @@ pub use shell::WorkspaceShell;
 
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::select::SelectItem;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Colorize as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     tag::Tag,
 };
 use gpui_kit::{
-    AnyElement, App, Context, Entity, Hsla, IntoElement, KeyBinding, ParentElement as _,
-    SharedString, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, Context, ElementId, Entity, Hsla, InteractiveElement as _, IntoElement,
+    KeyBinding, MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, TestSupportExt as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::domain::{
-    Assignee, BlockerWarning, EffectiveBlockState, ItemKind, ItemStatus, Priority, Project,
-    ProjectStatus, Tag as DomainTag,
+    Assignee, BlockerWarning, EffectiveBlockState, ItemKind, ItemLink, ItemStatus, LinkKind,
+    Priority, Project, ProjectStatus, Tag as DomainTag, parse_link_url,
 };
 use crate::state::AppState;
 use crate::ui::modals::{open_new_project_modal, open_project_settings_modal};
@@ -254,6 +256,55 @@ pub fn domain_tag_chip(tag: &DomainTag, cx: &App) -> impl IntoElement {
     Tag::custom(bg, color, border)
         .xsmall()
         .child(SharedString::from(tag.name.clone()))
+}
+
+pub fn item_link_pill(id: impl Into<ElementId>, link: &ItemLink, cx: &App) -> impl IntoElement {
+    let link_color = cx.theme().link;
+    let bg = link_color.opacity(if cx.theme().is_dark() { 0.16 } else { 0.09 });
+    let border = link_color.opacity(if cx.theme().is_dark() { 0.36 } else { 0.24 });
+    let hover_bg = link_color.opacity(if cx.theme().is_dark() { 0.24 } else { 0.16 });
+    let icon = match parse_link_url(&link.url) {
+        Some(parsed) if parsed.kind == LinkKind::GitHub => IconName::Github,
+        _ => IconName::ExternalLink,
+    };
+    let url = link.url.clone();
+    let tooltip_url = link.url.clone();
+    let label = link.label.clone();
+
+    h_flex()
+        .id(id)
+        .test_support()
+        .px_1p5()
+        .py_0p5()
+        .gap_1()
+        .items_center()
+        .flex_shrink_0()
+        .rounded(px(4.))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .tooltip(move |window, cx| Tooltip::new(tooltip_url.clone()).build(window, cx))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            cx.open_url(&url);
+        })
+        .child(Icon::new(icon).xsmall().text_color(link_color))
+        .child(
+            div()
+                .max_w(px(140.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(11.))
+                .font_medium()
+                .text_color(link_color)
+                .child(label),
+        )
 }
 
 pub fn block_state_badge(

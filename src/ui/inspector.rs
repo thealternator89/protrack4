@@ -16,9 +16,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, TestSupportExt as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 
 use crate::commands::{
@@ -27,16 +27,16 @@ use crate::commands::{
     SetWorkItemFeatures, TrashItemSubtree, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
-    Assignee, AssigneeId, ConversionEligibility, Item, ItemId, ItemKind, ItemStatus,
+    Assignee, AssigneeId, ConversionEligibility, Item, ItemId, ItemKind, ItemLink, ItemStatus,
     MAX_FEATURE_DEPTH, Priority, ProjectId, ProjectSnapshot, TagId, clamped_depth_badge,
-    visual_indent_px,
+    suggest_link_label, validate_item_link, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::{open_create_feature_modal, open_tags_manager_modal};
 use crate::ui::{
     PrioritySelectOption, StatusSelectOption, all_priority_options, all_status_options,
-    assignee_pill, block_state_badge, blocker_warning_pill, kind_badge, parse_hex_or, status_badge,
-    status_color, status_icon,
+    assignee_pill, block_state_badge, blocker_warning_pill, item_link_pill, kind_badge,
+    parse_hex_or, status_badge, status_color, status_icon,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,12 +151,20 @@ pub struct InspectorView {
     loaded_status: ItemStatus,
     loaded_priority: Priority,
     loaded_assignee_id: Option<AssigneeId>,
+    loaded_link: Option<ItemLink>,
     loaded_parent_id: Option<ItemId>,
     parent_options_sig: Vec<(ItemId, String, String, Option<ItemId>)>,
     blocker_edges_sig: Vec<(ItemId, ItemId)>,
     assignee_options_sig: Vec<(AssigneeId, String, String, String, Option<String>, bool)>,
     title_input: Entity<InputState>,
     description_input: Entity<TextareaState>,
+    link_url_input: Entity<InputState>,
+    link_label_input: Entity<InputState>,
+    editing_link: bool,
+    link_label_edited_manually: bool,
+    suppress_link_label_change: bool,
+    last_auto_link_label: Option<String>,
+    link_error: Option<String>,
     status_select: Entity<SelectState<Vec<StatusSelectOption>>>,
     priority_select: Entity<SelectState<Vec<PrioritySelectOption>>>,
     assignee_select: Entity<SelectState<SearchableVec<AssigneeSelectOption>>>,
@@ -191,6 +199,12 @@ impl InspectorView {
                 .auto_grow(8, 18)
                 .soft_wrap(true)
                 .placeholder("Write Markdown notes, acceptance criteria, or context…")
+        });
+        let link_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("https://… (Jira, GitHub, Azure DevOps)")
+        });
+        let link_label_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Label (e.g. ABC-123 or #456)")
         });
 
         let status_options = all_status_options();
@@ -512,6 +526,74 @@ impl InspectorView {
             },
         );
 
+        let link_url_sub = cx.subscribe_in(
+            &link_url_input,
+            window,
+            |this, inp, event: &InputEvent, window, cx| {
+                if this.syncing {
+                    return;
+                }
+                match event {
+                    InputEvent::Change => {
+                        this.link_error = None;
+                        let url = inp.read(cx).value().to_string();
+                        let current_label = this.link_label_input.read(cx).value().to_string();
+                        if url.trim().is_empty() {
+                            this.link_label_edited_manually = false;
+                            this.last_auto_link_label = None;
+                            this.suppress_link_label_change = true;
+                            this.link_label_input
+                                .update(cx, |lbl, cx| lbl.set_value("", window, cx));
+                            this.suppress_link_label_change = false;
+                        } else if !this.link_label_edited_manually || current_label.trim().is_empty()
+                        {
+                            let suggested = suggest_link_label(&url).unwrap_or_default();
+                            this.last_auto_link_label = if suggested.is_empty() {
+                                None
+                            } else {
+                                Some(suggested.clone())
+                            };
+                            this.suppress_link_label_change = true;
+                            this.link_label_input
+                                .update(cx, |lbl, cx| lbl.set_value(suggested, window, cx));
+                            this.suppress_link_label_change = false;
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.save_link_edit(window, cx);
+                    }
+                    InputEvent::Focus | InputEvent::Blur => {}
+                }
+            },
+        );
+
+        let link_label_sub = cx.subscribe_in(
+            &link_label_input,
+            window,
+            |this, inp, event: &InputEvent, window, cx| {
+                if this.syncing || this.suppress_link_label_change {
+                    return;
+                }
+                match event {
+                    InputEvent::Change => {
+                        this.link_error = None;
+                        let val = inp.read(cx).value().to_string();
+                        if val.trim().is_empty() {
+                            this.link_label_edited_manually = false;
+                        } else if this.last_auto_link_label.as_deref() != Some(val.as_str()) {
+                            this.link_label_edited_manually = true;
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.save_link_edit(window, cx);
+                    }
+                    InputEvent::Focus | InputEvent::Blur => {}
+                }
+            },
+        );
+
         Self {
             app_state,
             store,
@@ -523,12 +605,20 @@ impl InspectorView {
             loaded_status: ItemStatus::Todo,
             loaded_priority: Priority::None,
             loaded_assignee_id: None,
+            loaded_link: None,
             loaded_parent_id: None,
             parent_options_sig: Vec::new(),
             blocker_edges_sig: Vec::new(),
             assignee_options_sig: Vec::new(),
             title_input,
             description_input,
+            link_url_input,
+            link_label_input,
+            editing_link: false,
+            link_label_edited_manually: false,
+            suppress_link_label_change: false,
+            last_auto_link_label: None,
+            link_error: None,
             status_select,
             priority_select,
             assignee_select,
@@ -558,6 +648,8 @@ impl InspectorView {
                 priority_sub,
                 assignee_sub,
                 parent_sub,
+                link_url_sub,
+                link_label_sub,
             ],
         }
     }
@@ -589,6 +681,80 @@ impl InspectorView {
 
     pub fn description_input(&self) -> &Entity<TextareaState> {
         &self.description_input
+    }
+
+    pub fn link_url_input(&self) -> &Entity<InputState> {
+        &self.link_url_input
+    }
+
+    pub fn link_label_input(&self) -> &Entity<InputState> {
+        &self.link_label_input
+    }
+
+    pub fn start_link_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_link = true;
+        self.link_error = None;
+        let (url, label, manual) = match &self.loaded_link {
+            Some(link) => {
+                let manual = suggest_link_label(&link.url).as_deref() != Some(link.label.as_str());
+                (link.url.clone(), link.label.clone(), manual)
+            }
+            None => (String::new(), String::new(), false),
+        };
+        self.link_label_edited_manually = manual;
+        self.last_auto_link_label = if manual {
+            None
+        } else {
+            self.loaded_link.as_ref().map(|l| l.label.clone())
+        };
+        self.suppress_link_label_change = true;
+        self.link_url_input.update(cx, |inp, cx| {
+            inp.set_value(url, window, cx);
+            inp.focus(window, cx);
+        });
+        self.link_label_input
+            .update(cx, |inp, cx| inp.set_value(label, window, cx));
+        self.suppress_link_label_change = false;
+        cx.notify();
+    }
+
+    pub fn cancel_link_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing_link = false;
+        self.link_error = None;
+        cx.notify();
+    }
+
+    pub fn save_link_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item_id) = self.loaded_item_id else {
+            return;
+        };
+        let url = self.link_url_input.read(cx).value().to_string();
+        let label = self.link_label_input.read(cx).value().to_string();
+        let next_link = if url.trim().is_empty() {
+            None
+        } else {
+            match validate_item_link(&url, &label) {
+                Ok(validated) => Some(validated),
+                Err(err) => {
+                    self.link_error = Some(err.to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+
+        self.editing_link = false;
+        self.link_error = None;
+        if next_link == self.loaded_link {
+            cx.notify();
+            return;
+        }
+        self.loaded_link = next_link.clone();
+        self.dispatch_item_command(
+            Box::new(UpdateItemFields::new(item_id).with_link(next_link)),
+            None,
+            cx,
+        );
     }
 
     pub fn flush_pending_edits_for_shutdown(&mut self, cx: &mut Context<Self>) {
@@ -821,6 +987,10 @@ impl InspectorView {
             self.attach_popover_open = false;
             self.tag_popover_open = false;
             self.blocker_popover_open = false;
+            self.editing_link = false;
+            self.link_error = None;
+            self.link_label_edited_manually = false;
+            self.last_auto_link_label = None;
             self.syncing = true;
             self.attach_search_input
                 .update(cx, |inp, cx| inp.set_value("", window, cx));
@@ -837,6 +1007,7 @@ impl InspectorView {
                 self.loaded_status = item.status;
                 self.loaded_priority = item.priority;
                 self.loaded_assignee_id = item.assignee_id;
+                self.loaded_link = item.link.clone();
                 self.loaded_parent_id = item.parent_feature_id;
                 self.dirty_title = false;
                 self.dirty_description = false;
@@ -869,6 +1040,7 @@ impl InspectorView {
                 self.loaded_title.clear();
                 self.loaded_description.clear();
                 self.loaded_assignee_id = None;
+                self.loaded_link = None;
                 self.loaded_parent_id = None;
                 self.parent_options_sig.clear();
                 self.blocker_edges_sig.clear();
@@ -919,6 +1091,10 @@ impl InspectorView {
         {
             self.loaded_assignee_id = item.assignee_id;
             self.rebuild_assignee_options(&snapshot, &item, window, cx);
+        }
+
+        if item.link != self.loaded_link {
+            self.loaded_link = item.link.clone();
         }
 
         if item.kind == ItemKind::Feature {
@@ -2589,8 +2765,8 @@ impl Render for InspectorView {
                         .child(
                             v_flex()
                                 .size_full()
-                                .p_4()
-                                .gap_4()
+                                .p_3()
+                                .gap_3()
                                 .overflow_y_scrollbar()
                                 .id("inspector-scroll")
                         // Identity + disabled Convert action + Editable Title
@@ -2674,8 +2850,8 @@ impl Render for InspectorView {
                         // Metadata rows (Editable Status & Priority; Assignee/Tags in Phase 5)
                         .child(
                             v_flex()
-                                .gap_2p5()
-                                .p_3()
+                                .gap_2()
+                                .p_2p5()
                                 .rounded(cx.theme().radius)
                                 .border_1()
                                 .border_color(cx.theme().border)
@@ -3096,7 +3272,190 @@ impl Render for InspectorView {
                                                         }),
                                                 ),
                                         )
-                                }),
+                                })
+                                .child({
+                                    let link_opt = item.link.clone();
+                                    let link_error = self.link_error.clone();
+                                    let editing_link = self.editing_link;
+                                    let url_input = self.link_url_input.clone();
+                                    let label_input = self.link_label_input.clone();
+
+                                    h_flex()
+                                        .gap_2()
+                                        .items_start()
+                                        .child(
+                                            div()
+                                                .w(px(76.))
+                                                .pt_0p5()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Link"),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1p5()
+                                                .child(if editing_link {
+                                                    v_flex()
+                                                        .gap_1p5()
+                                                        .on_key_down(cx.listener(
+                                                            |this, event: &KeyDownEvent, _, cx| {
+                                                                if event.keystroke.key == "escape" {
+                                                                    this.cancel_link_edit(cx);
+                                                                    cx.stop_propagation();
+                                                                }
+                                                            },
+                                                        ))
+                                                        .child(
+                                                            Input::new(&url_input)
+                                                                .id("inspector-link-url-input")
+                                                                .small()
+                                                                .cleanable(true),
+                                                        )
+                                                        .child(
+                                                            Input::new(&label_input)
+                                                                .id("inspector-link-label-input")
+                                                                .small()
+                                                                .cleanable(true),
+                                                        )
+                                                        .when_some(link_error, |this, err| {
+                                                            this.child(
+                                                                div()
+                                                                    .text_size(px(11.))
+                                                                    .text_color(cx.theme().danger)
+                                                                    .child(err),
+                                                            )
+                                                        })
+                                                        .child(
+                                                            h_flex()
+                                                                .gap_1p5()
+                                                                .child(
+                                                                    Button::new(
+                                                                        "inspector-link-save-btn",
+                                                                    )
+                                                                    .primary()
+                                                                    .xsmall()
+                                                                    .label("Save")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, window, cx| {
+                                                                            this.save_link_edit(
+                                                                                window, cx,
+                                                                            );
+                                                                        },
+                                                                    )),
+                                                                )
+                                                                .child(
+                                                                    Button::new(
+                                                                        "inspector-link-cancel-btn",
+                                                                    )
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .label("Cancel")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, _, cx| {
+                                                                            this.cancel_link_edit(
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    )),
+                                                                ),
+                                                        )
+                                                        .into_any_element()
+                                                } else if let Some(link) = link_opt {
+                                                    v_flex()
+                                                        .gap_1()
+                                                        .child(
+                                                            h_flex()
+                                                                .gap_1p5()
+                                                                .items_center()
+                                                                .child(
+                                                                    div()
+                                                                        .id("inspector-link-open")
+                                                                        .test_support()
+                                                                        .child(item_link_pill(
+                                                                            "inspector-link-pill",
+                                                                            &link,
+                                                                            cx,
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    Button::new(
+                                                                        "inspector-link-edit-btn",
+                                                                    )
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .compact()
+                                                                    .label("Edit")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, window, cx| {
+                                                                            this.start_link_edit(
+                                                                                window, cx,
+                                                                            );
+                                                                        },
+                                                                    )),
+                                                                )
+                                                                .child(
+                                                                    Button::new(
+                                                                        "inspector-link-remove-btn",
+                                                                    )
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .compact()
+                                                                    .accessibility_label(
+                                                                        "Remove link",
+                                                                    )
+                                                                    .icon(IconName::Close)
+                                                                    .tooltip("Remove link")
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            this.loaded_link = None;
+                                                                            this.dispatch_item_command(
+                                                                                Box::new(
+                                                                                    UpdateItemFields::new(item_id)
+                                                                                        .with_link(None),
+                                                                                ),
+                                                                                None,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    )),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w_full()
+                                                                .min_w_0()
+                                                                .overflow_hidden()
+                                                                .whitespace_nowrap()
+                                                                .text_ellipsis()
+                                                                .text_size(px(10.))
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(link.url),
+                                                        )
+                                                        .into_any_element()
+                                                } else {
+                                                    h_flex()
+                                                        .child(
+                                                            Button::new("inspector-add-link-btn")
+                                                                .outline()
+                                                                .xsmall()
+                                                                .icon(IconName::Plus)
+                                                                .label("Add Link")
+                                                                .on_click(cx.listener(
+                                                                    |this, _, window, cx| {
+                                                                        this.start_link_edit(
+                                                                            window, cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                        )
+                                                        .into_any_element()
+                                                }),
+                                        )
+                                })
                         )
                         // Hierarchy or Attached Features
                         .child(relation_section)

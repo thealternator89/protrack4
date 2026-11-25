@@ -11,8 +11,8 @@ use crate::db::{
 use crate::domain::fractional_index;
 use crate::domain::{
     AssigneeId, ConversionBlockReason, ConversionEligibility, DomainError, FeatureProgress,
-    FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId,
-    TrashGroup, format_conversion_block_message,
+    FeatureWorkItem, Item, ItemId, ItemKind, ItemLink, ItemStatus, MAX_FEATURE_DEPTH, Priority,
+    ProjectId, TrashGroup, format_conversion_block_message, suggest_link_label, validate_item_link,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,7 @@ pub struct UpdateItemFieldsInput {
     pub status: Option<ItemStatus>,
     pub priority: Option<Priority>,
     pub assignee_id: Option<Option<AssigneeId>>,
+    pub link: Option<Option<ItemLink>>,
 }
 
 pub fn validate_item_title(title: &str) -> Result<String, DomainError> {
@@ -93,6 +94,25 @@ pub(crate) fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let trash_root_id = trash_root_opt
         .map(|raw| parse_uuid_col(13, raw).map(ItemId::from_uuid))
         .transpose()?;
+    let link_url_opt: Option<String> = row.get(16)?;
+    let link_label_opt: Option<String> = row.get(17)?;
+    let link = link_url_opt.and_then(|raw_url| {
+        let trimmed_url = raw_url.trim();
+        if trimmed_url.is_empty() {
+            return None;
+        }
+        let label = link_label_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| suggest_link_label(trimmed_url))
+            .unwrap_or_else(|| "Link".to_string());
+        Some(ItemLink {
+            url: trimmed_url.to_string(),
+            label,
+        })
+    });
 
     Ok(Item {
         id: ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
@@ -106,6 +126,7 @@ pub(crate) fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         status,
         priority,
         assignee_id,
+        link,
         sort_order: row.get(11)?,
         deleted_at,
         trash_root_id,
@@ -118,7 +139,7 @@ pub fn get_item(conn: &Connection, item_id: ItemId) -> Result<Item, DomainError>
     conn.query_row(
         "SELECT id, project_id, item_number, item_key, kind, parent_feature_id,
                 title, description, status, priority, assignee_id, sort_order,
-                deleted_at, trash_root_id, created_at, updated_at
+                deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
          FROM items
          WHERE id = ?1;",
         params![uuid_to_sql(item_id.0)],
@@ -619,6 +640,7 @@ pub fn create_feature(tx: &Transaction<'_>, input: CreateFeatureInput) -> Result
         status: input.status,
         priority: input.priority,
         assignee_id: None,
+        link: None,
         sort_order,
         deleted_at: None,
         trash_root_id: None,
@@ -630,8 +652,8 @@ pub fn create_feature(tx: &Transaction<'_>, input: CreateFeatureInput) -> Result
         "INSERT INTO items (
             id, project_id, item_number, item_key, kind, parent_feature_id,
             title, description, status, priority, assignee_id, sort_order,
-            deleted_at, trash_root_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14);",
+            deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, NULL, NULL);",
         params![
             uuid_to_sql(item.id.0),
             uuid_to_sql(item.project_id.0),
@@ -686,6 +708,15 @@ pub fn update_item_fields(
         Some(None) => None,
         None => existing.assignee_id,
     };
+    let link = match input.link {
+        Some(Some(raw_link)) => Some(validate_item_link(&raw_link.url, &raw_link.label)?),
+        Some(None) => None,
+        None => existing.link.clone(),
+    };
+    let (link_url, link_label) = match &link {
+        Some(l) => (Some(l.url.as_str()), Some(l.label.as_str())),
+        None => (None, None),
+    };
 
     let now = Utc::now();
     let now_sql = ts_to_sql(now);
@@ -697,14 +728,18 @@ pub fn update_item_fields(
              status = ?3,
              priority = ?4,
              assignee_id = ?5,
-             updated_at = ?6
-         WHERE id = ?7;",
+             link_url = ?6,
+             link_label = ?7,
+             updated_at = ?8
+         WHERE id = ?9;",
         params![
             &title,
             &description,
             status.as_str(),
             priority.as_str(),
             assignee_id.map(|id| uuid_to_sql(id.0)),
+            link_url,
+            link_label,
             &now_sql,
             uuid_to_sql(existing.id.0),
         ],
@@ -717,6 +752,7 @@ pub fn update_item_fields(
         status,
         priority,
         assignee_id,
+        link,
         updated_at: now,
         ..existing
     })
@@ -1114,6 +1150,7 @@ pub fn create_work_item(
         status: input.status,
         priority: input.priority,
         assignee_id: None,
+        link: None,
         sort_order,
         deleted_at: None,
         trash_root_id: None,
@@ -1128,8 +1165,8 @@ pub fn create_work_item(
         "INSERT INTO items (
             id, project_id, item_number, item_key, kind, parent_feature_id,
             title, description, status, priority, assignee_id, sort_order,
-            deleted_at, trash_root_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 'work_item', NULL, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11, ?12);",
+            deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
+         ) VALUES (?1, ?2, ?3, ?4, 'work_item', NULL, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11, ?12, NULL, NULL);",
         params![
             &item_sql,
             &project_sql,
@@ -1175,7 +1212,7 @@ pub fn query_unallocated_work_items(
         .prepare(
             "SELECT i.id, i.project_id, i.item_number, i.item_key, i.kind, i.parent_feature_id,
                     i.title, i.description, i.status, i.priority, i.assignee_id, i.sort_order,
-                    i.deleted_at, i.trash_root_id, i.created_at, i.updated_at
+                    i.deleted_at, i.trash_root_id, i.created_at, i.updated_at, i.link_url, i.link_label
              FROM items i
              WHERE i.project_id = ?1
                AND i.kind = 'work_item'
@@ -1207,7 +1244,7 @@ pub fn query_features_for_work_item(
         .prepare(
             "SELECT f.id, f.project_id, f.item_number, f.item_key, f.kind, f.parent_feature_id,
                     f.title, f.description, f.status, f.priority, f.assignee_id, f.sort_order,
-                    f.deleted_at, f.trash_root_id, f.created_at, f.updated_at
+                    f.deleted_at, f.trash_root_id, f.created_at, f.updated_at, f.link_url, f.link_label
              FROM feature_work_items fwi
              JOIN items f ON f.id = fwi.feature_id
              WHERE fwi.work_item_id = ?1
@@ -1264,7 +1301,7 @@ pub fn query_work_items_for_feature(
         .prepare(
             "SELECT wi.id, wi.project_id, wi.item_number, wi.item_key, wi.kind, wi.parent_feature_id,
                     wi.title, wi.description, wi.status, wi.priority, wi.assignee_id, wi.sort_order,
-                    wi.deleted_at, wi.trash_root_id, wi.created_at, wi.updated_at
+                    wi.deleted_at, wi.trash_root_id, wi.created_at, wi.updated_at, wi.link_url, wi.link_label
              FROM feature_work_items fwi
              JOIN items wi ON wi.id = fwi.work_item_id
              WHERE fwi.feature_id = ?1
@@ -2020,7 +2057,7 @@ pub fn list_trash_groups(
         .prepare(
             "SELECT r.id, r.project_id, r.item_number, r.item_key, r.kind, r.parent_feature_id,
                     r.title, r.description, r.status, r.priority, r.assignee_id, r.sort_order,
-                    r.deleted_at, r.trash_root_id, r.created_at, r.updated_at,
+                    r.deleted_at, r.trash_root_id, r.created_at, r.updated_at, r.link_url, r.link_label,
                     COUNT(m.id) AS total_count,
                     SUM(CASE WHEN m.id != r.id AND m.kind = 'feature' THEN 1 ELSE 0 END) AS desc_feat_count,
                     SUM(CASE WHEN m.id != r.id AND m.kind = 'work_item' THEN 1 ELSE 0 END) AS desc_wi_count
@@ -2040,9 +2077,9 @@ pub fn list_trash_groups(
     let rows = stmt
         .query_map(params![uuid_to_sql(project_id.0)], |row| {
             let root = row_to_item(row)?;
-            let total_i64: i64 = row.get(16)?;
-            let feat_i64: i64 = row.get(17)?;
-            let wi_i64: i64 = row.get(18)?;
+            let total_i64: i64 = row.get(18)?;
+            let feat_i64: i64 = row.get(19)?;
+            let wi_i64: i64 = row.get(20)?;
             let deleted_at = root.deleted_at.unwrap_or(root.updated_at);
             Ok(TrashGroup {
                 root,
@@ -2114,7 +2151,7 @@ pub fn restore_trash_group(
             .prepare(
                 "SELECT id, project_id, item_number, item_key, kind, parent_feature_id,
                         title, description, status, priority, assignee_id, sort_order,
-                        deleted_at, trash_root_id, created_at, updated_at
+                        deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
                  FROM items
                  WHERE project_id = ?1
                    AND trash_root_id = ?2
@@ -2804,6 +2841,7 @@ pub struct SearchResultItem {
     pub title: String,
     pub status: ItemStatus,
     pub priority: Priority,
+    pub link: Option<ItemLink>,
     pub rank: f64,
 }
 
@@ -2864,7 +2902,9 @@ pub fn search_items_fts(
                 i.title,
                 i.status,
                 i.priority,
-                bm25(items_fts, 10.0, 5.0, 1.0) AS rank
+                i.link_url,
+                i.link_label,
+                bm25(items_fts, 10.0, 5.0, 1.0, 4.0) AS rank
              FROM items_fts
              JOIN items i ON i.rowid = items_fts.rowid
              JOIN projects p ON p.id = i.project_id
@@ -2891,6 +2931,25 @@ pub fn search_items_fts(
             let status = parse_domain_col(8, ItemStatus::from_db_str(&status_raw))?;
             let priority_raw: String = row.get(9)?;
             let priority = parse_domain_col(9, Priority::from_db_str(&priority_raw))?;
+            let link_url_opt: Option<String> = row.get(10)?;
+            let link_label_opt: Option<String> = row.get(11)?;
+            let link = link_url_opt.and_then(|raw_url| {
+                let trimmed_url = raw_url.trim();
+                if trimmed_url.is_empty() {
+                    return None;
+                }
+                let label = link_label_opt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| suggest_link_label(trimmed_url))
+                    .unwrap_or_else(|| "Link".to_string());
+                Some(ItemLink {
+                    url: trimmed_url.to_string(),
+                    label,
+                })
+            });
 
             Ok(SearchResultItem {
                 id: ItemId::from_uuid(parse_uuid_col(0, row.get(0)?)?),
@@ -2903,7 +2962,8 @@ pub fn search_items_fts(
                 title: row.get(7)?,
                 status,
                 priority,
-                rank: row.get(10)?,
+                link,
+                rank: row.get(12)?,
             })
         })
         .map_err(map_sqlite_err)?;

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::domain::{
     BlockerCandidateRejection, BlockerRef, BlockerWarning, ConversionBlockReason,
     ConversionEligibility, DomainError, EffectiveBlockState, FeatureProgress, ItemBlocker,
-    format_conversion_block_message,
+    ItemLink, format_conversion_block_message,
 };
 
 pub const MAX_FEATURE_DEPTH: usize = 32;
@@ -253,6 +253,8 @@ pub struct Item {
     pub status: ItemStatus,
     pub priority: Priority,
     pub assignee_id: Option<AssigneeId>,
+    #[serde(default)]
+    pub link: Option<ItemLink>,
     pub sort_order: String,
     pub deleted_at: Option<DateTime<Utc>>,
     pub trash_root_id: Option<ItemId>,
@@ -1311,6 +1313,7 @@ mod tests {
             status,
             priority: Priority::None,
             assignee_id: None,
+            link: None,
             sort_order: format!("a{num}"),
             deleted_at: None,
             trash_root_id: None,

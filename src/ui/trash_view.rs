@@ -600,6 +600,7 @@ mod tests {
             status: ItemStatus::Todo,
             priority: Priority::None,
             assignee_id: None,
+            link: None,
             sort_order: "a0".to_string(),
             deleted_at: Some(now),
             trash_root_id: Some(ItemId::from_uuid(Uuid::nil())),

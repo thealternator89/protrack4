@@ -602,6 +602,7 @@ mod tests {
             status: ItemStatus::Todo,
             priority: Priority::None,
             assignee_id: None,
+            link: None,
             sort_order: format!("a{num}"),
             deleted_at: None,
             trash_root_id: None,

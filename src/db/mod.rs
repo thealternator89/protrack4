@@ -129,7 +129,7 @@ pub fn load_project_snapshot(
             .prepare(
                 "SELECT id, project_id, item_number, item_key, kind, parent_feature_id,
                         title, description, status, priority, assignee_id, sort_order,
-                        deleted_at, trash_root_id, created_at, updated_at
+                        deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
                  FROM items
                  WHERE project_id = ?1 AND deleted_at IS NULL
                  ORDER BY item_number ASC;",
@@ -253,7 +253,7 @@ mod tests {
     fn schema_001_creates_tables_triggers_fts5_and_rejects_cross_project_fks() {
         let mut conn = Connection::open_in_memory().unwrap();
         let meta = inspect_and_migrate(&mut conn, None, "Test Workspace").unwrap();
-        assert_eq!(meta.schema_version, 1);
+        assert_eq!(meta.schema_version, APP_MAX_SCHEMA_VERSION);
         assert_eq!(meta.workspace_name, "Test Workspace");
 
         let expected_tables = [
@@ -461,22 +461,22 @@ mod tests {
             inspect_and_migrate(&mut conn, Some(&db_path), "Upgrade").unwrap();
             checkpoint_and_switch_to_delete_mode(&conn).unwrap();
         }
-        let v1_bytes = fs::read(&db_path).unwrap();
+        let v2_bytes = fs::read(&db_path).unwrap();
 
         let mut conn = Connection::open(&db_path).unwrap();
-        let step_v2 = MigrationStep {
-            target_version: 2,
+        let step_v3 = MigrationStep {
+            target_version: 3,
             sql: "ALTER TABLE workspace_meta ADD COLUMN notes TEXT NOT NULL DEFAULT '';",
         };
-        let meta = apply_migrations_with_steps(&mut conn, Some(&db_path), "Upgrade", 2, &[step_v2])
+        let meta = apply_migrations_with_steps(&mut conn, Some(&db_path), "Upgrade", 3, &[step_v3])
             .unwrap();
-        assert_eq!(meta.schema_version, 2);
+        assert_eq!(meta.schema_version, 3);
         checkpoint_and_switch_to_delete_mode(&conn).unwrap();
         drop(conn);
 
-        let bak_path = dir.path().join("upgrade.protrack.v1.bak");
+        let bak_path = dir.path().join("upgrade.protrack.v2.bak");
         assert!(bak_path.exists());
-        assert_eq!(fs::read(&bak_path).unwrap(), v1_bytes);
+        assert_eq!(fs::read(&bak_path).unwrap(), v2_bytes);
     }
 
     #[test]
@@ -3329,6 +3329,134 @@ mod tests {
                 .iter()
                 .any(|i| i.id == w3.id)
         );
+    }
+
+    #[test]
+    fn migration_001_to_002_upgrades_existing_db_with_backup_and_supports_item_links() {
+        use crate::db::item_repo::{
+            UpdateItemFieldsInput, get_item, search_items_fts, update_item_fields,
+        };
+        use crate::db::migrations::MIGRATION_001_SQL;
+        use crate::domain::ItemLink;
+        use rusqlite::TransactionBehavior;
+
+        let dir = TempDir::new().unwrap();
+        let fresh_path = dir.path().join("fresh_v2.protrack");
+        {
+            let mut conn = Connection::open(&fresh_path).unwrap();
+            let meta = inspect_and_migrate(&mut conn, Some(&fresh_path), "Fresh").unwrap();
+            assert_eq!(meta.schema_version, APP_MAX_SCHEMA_VERSION);
+            checkpoint_and_switch_to_delete_mode(&conn).unwrap();
+        }
+        assert!(
+            !dir.path().join("fresh_v2.protrack.v1.bak").exists(),
+            "fresh v2 workspace must not create a spurious .v1.bak"
+        );
+
+        let db_path = dir.path().join("legacy_v1.protrack");
+        let now = "2026-11-23T12:00:00Z";
+        let proj_id = ProjectId::new();
+        let item_id = ItemId::new();
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute_batch(MIGRATION_001_SQL).unwrap();
+            tx.execute(
+                "INSERT INTO workspace_meta (id, schema_version, app_min_version, workspace_name, created_at, updated_at)
+                 VALUES (1, 1, '0.1.0', 'Legacy', ?1, ?1);",
+                [now],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO projects (id, name, key_prefix, sort_order, created_at, updated_at)
+                 VALUES (?1, 'Legacy', 'LEG', 'a0', ?2, ?2);",
+                params![uuid_to_sql(proj_id.0), now],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO items (id, project_id, item_number, item_key, kind, title, sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, 1, 'LEG-1', 'feature', 'Legacy Feature', 'a0', ?3, ?3);",
+                params![uuid_to_sql(item_id.0), uuid_to_sql(proj_id.0), now],
+            )
+            .unwrap();
+            tx.execute_batch("PRAGMA user_version = 1;").unwrap();
+            tx.commit().unwrap();
+            checkpoint_and_switch_to_delete_mode(&conn).unwrap();
+        }
+
+        let v1_bytes = fs::read(&db_path).unwrap();
+        let mut conn = Connection::open(&db_path).unwrap();
+        let meta = inspect_and_migrate(&mut conn, Some(&db_path), "Legacy").unwrap();
+        assert_eq!(meta.schema_version, APP_MAX_SCHEMA_VERSION);
+        let bak_path = dir.path().join("legacy_v1.protrack.v1.bak");
+        assert!(bak_path.exists());
+        assert_eq!(fs::read(&bak_path).unwrap(), v1_bytes);
+
+        let existing = get_item(&conn, item_id).unwrap();
+        assert_eq!(existing.link, None);
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let updated = update_item_fields(
+                &tx,
+                UpdateItemFieldsInput {
+                    item_id,
+                    link: Some(Some(ItemLink {
+                        url: "https://acme.atlassian.net/browse/abc-123".to_string(),
+                        label: "".to_string(),
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                updated.link,
+                Some(ItemLink {
+                    url: "https://acme.atlassian.net/browse/abc-123".to_string(),
+                    label: "ABC-123".to_string(),
+                })
+            );
+            tx.commit().unwrap();
+        }
+
+        let hits = search_items_fts(&conn, "ABC-123", Some(proj_id), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, item_id);
+        assert_eq!(
+            hits[0].link,
+            Some(ItemLink {
+                url: "https://acme.atlassian.net/browse/abc-123".to_string(),
+                label: "ABC-123".to_string(),
+            })
+        );
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let cleared = update_item_fields(
+                &tx,
+                UpdateItemFieldsInput {
+                    item_id,
+                    link: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(cleared.link, None);
+            tx.commit().unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO items_fts(items_fts) VALUES ('integrity-check');",
+            [],
+        )
+        .unwrap();
     }
 }
 

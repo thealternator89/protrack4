@@ -267,7 +267,7 @@ impl UndoableCommand for RestoreTrashGroup {
                     .prepare(
                         "SELECT id, project_id, item_number, item_key, kind, parent_feature_id,
                                 title, description, status, priority, assignee_id, sort_order,
-                                deleted_at, trash_root_id, created_at, updated_at
+                                deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
                          FROM items
                          WHERE project_id = ?1
                            AND trash_root_id = ?2

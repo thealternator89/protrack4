@@ -27,7 +27,7 @@ use crate::ui::dnd::{
     DragPayload, dispatch_dnd_command, is_valid_unallocated_gap, make_drag_ghost, render_drop_gap,
 };
 use crate::ui::{
-    assignee_pill, domain_tag_chip, priority_badge, status_color, status_icon,
+    assignee_pill, domain_tag_chip, item_link_pill, priority_badge, status_color, status_icon,
 };
 
 pub struct UnallocatedView {
@@ -425,6 +425,19 @@ impl Render for UnallocatedView {
                                     .font_medium()
                                     .child(wi.title.clone()),
                             )
+                            .when_some(wi.link.as_ref(), |this, link| {
+                                this.child(
+                                    div()
+                                        .id(("unallocated-link-wrap", wi_num))
+                                        .test_support()
+                                        .flex_shrink_0()
+                                        .child(item_link_pill(
+                                            ("unallocated-link", wi_num),
+                                            link,
+                                            cx,
+                                        )),
+                                )
+                            })
                             .when(!tags.is_empty(), |this| {
                                 this.child(
                                     h_flex()

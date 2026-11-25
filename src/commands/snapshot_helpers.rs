@@ -503,12 +503,16 @@ pub(crate) fn insert_blocker_row(
 }
 
 pub(crate) fn insert_exact_item_row(tx: &Transaction<'_>, item: &Item) -> Result<(), DomainError> {
+    let (link_url, link_label) = match &item.link {
+        Some(link) => (Some(link.url.as_str()), Some(link.label.as_str())),
+        None => (None, None),
+    };
     tx.execute(
         "INSERT INTO items (
             id, project_id, item_number, item_key, kind, parent_feature_id,
             title, description, status, priority, assignee_id, sort_order,
-            deleted_at, trash_root_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);",
+            deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
         params![
             uuid_to_sql(item.id.0),
             uuid_to_sql(item.project_id.0),
@@ -526,6 +530,8 @@ pub(crate) fn insert_exact_item_row(tx: &Transaction<'_>, item: &Item) -> Result
             item.trash_root_id.map(|id| uuid_to_sql(id.0)),
             ts_to_sql(item.created_at),
             ts_to_sql(item.updated_at),
+            link_url,
+            link_label,
         ],
     )
     .map_err(map_sqlite_err)?;

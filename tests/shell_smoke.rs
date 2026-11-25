@@ -4372,3 +4372,230 @@ async fn phase12_undo_redo_shortcuts_input_isolation_locked_modal_and_shutdown(
     assert_eq!(bytes[18], 1);
     assert_eq!(bytes[19], 1);
 }
+
+#[gpui_kit::test]
+async fn item_links_auto_populate_persist_undo_search_and_open_urls(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("links.protrack");
+    let prefs_path = dir.path().join("preferences.json");
+
+    {
+        let mut manager = WorkspaceManager::new();
+        manager
+            .create_workspace(&db_path, Some("Links"), true)
+            .unwrap();
+        manager.close_workspace().unwrap();
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        protrack4::ui::register_keybindings(cx);
+    });
+
+    let config = LaunchConfig {
+        db_override: Some(db_path.clone()),
+        preferences_path: Some(prefs_path),
+    };
+
+    let (handle, shell) = cx.update(|cx| {
+        let bounds = Bounds {
+            origin: Default::default(),
+            size: size(px(1280.), px(820.)),
+        };
+        let (window, shell) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| WorkspaceShell::new_with_config(config, window, cx)),
+        )
+        .expect("open WorkspaceShell test window");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    });
+
+    let (app_state, store) = shell.read_with(cx, |view, _| {
+        (view.app_state().clone(), view.store().clone())
+    });
+
+    wait_for_workspace_idle(cx, &app_state).await;
+
+    // 1. Add a Jira URL in Inspector -> auto-populates "ABC-123" and saves
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("inspector-add-link-btn", cx);
+        window.render_frame(cx);
+        window.input("https://acme.atlassian.net/browse/abc-123", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-link-label-input").value(),
+            Some("ABC-123")
+        );
+        window.click("inspector-link-save-btn", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Jira link persisted on PRO-1", |cx| {
+        store
+            .read(cx)
+            .selected_item()
+            .and_then(|i| i.link.as_ref())
+            .is_some_and(|l| l.label == "ABC-123")
+    })
+    .await;
+
+    // 2. Render Inspector link pill, click it, and verify cx.opened_url()
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("inspector-link-open").is_some());
+        window.click("inspector-link-pill", cx);
+    })
+    .unwrap();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://acme.atlassian.net/browse/abc-123")
+    );
+
+    // 3. Edit URL to GitHub -> auto-updates to "#456"; then customize label and change URL to AzDO -> preserves custom label
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("inspector-link-edit-btn", cx);
+        window.render_frame(cx);
+        window.press("secondary-a", cx);
+        window.input("https://github.com/org/repo/issues/456", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-link-label-input").value(),
+            Some("#456")
+        );
+        window.click("inspector-link-label-input", cx);
+        window.press("secondary-a", cx);
+        window.input("Custom Tracker", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("inspector-link-url-input", cx);
+        window.press("secondary-a", cx);
+        window.input("https://dev.azure.com/org/proj/_workitems/edit/789", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-link-label-input").value(),
+            Some("Custom Tracker")
+        );
+        window.click("inspector-link-save-btn", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Custom Tracker link persisted", |cx| {
+        store
+            .read(cx)
+            .selected_item()
+            .and_then(|i| i.link.as_ref())
+            .is_some_and(|l| l.label == "Custom Tracker")
+    })
+    .await;
+
+    // 4. Verify Table view renders link column and filters by link label, and Outline/Unallocated render cleanly
+    cx.update_window(handle.into(), |_, window, cx| {
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Table);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Unallocated);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        store.update(cx, |s, cx| {
+            s.set_active_tab(CenterViewTab::Outline);
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 5. Remove link and Undo (Cmd+Z) to restore it
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("inspector-link-remove-btn", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "link removed", |cx| {
+        store
+            .read(cx)
+            .selected_item()
+            .is_some_and(|i| i.link.is_none())
+    })
+    .await;
+
+    let shell_focus = shell.read_with(cx, |view, _| view.focus_handle().clone());
+    cx.update_window(handle.into(), |_, window, cx| {
+        shell_focus.focus(window, cx);
+        window.render_frame(cx);
+        window.press("secondary-z", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "link restored via Undo", |cx| {
+        store
+            .read(cx)
+            .selected_item()
+            .and_then(|i| i.link.as_ref())
+            .is_some_and(|l| l.label == "Custom Tracker")
+    })
+    .await;
+
+    // 6. Quick Add modal auto-populates AzDO link label "#987" and creates item with link persisted
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.press("secondary-n", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        window.input("Quick Linked Task", cx);
+        window.click("quick-add-link-url", cx);
+        window.input("https://dev.azure.com/org/proj/_workitems/edit/987", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("quick-add-link-label").value(),
+            Some("#987")
+        );
+        window.click("quick-add-submit", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    wait_until(cx, "Quick Add item created with #987 link", |cx| {
+        store
+            .read(cx)
+            .selected_item()
+            .is_some_and(|i| {
+                i.title == "Quick Linked Task"
+                    && i.link.as_ref().is_some_and(|l| l.label == "#987")
+            })
+    })
+    .await;
+
+    app_state.update(cx, |app, cx| {
+        app.close_workspace_sync(cx).unwrap();
+    });
+}

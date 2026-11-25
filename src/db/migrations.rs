@@ -9,9 +9,15 @@ use crate::db::{load_workspace_meta, map_sqlite_err, ts_to_sql, uuid_to_sql};
 use crate::domain::{DomainError, ItemKind, ProjectId, WorkspaceMeta};
 use crate::state::sample_snapshot;
 
-pub const APP_MAX_SCHEMA_VERSION: u32 = 1;
+pub const APP_MAX_SCHEMA_VERSION: u32 = 2;
 pub const APP_MIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MIGRATION_001_SQL: &str = include_str!("../../migrations/001_initial.sql");
+pub const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_item_links.sql");
+
+pub const BUILTIN_MIGRATIONS: &[MigrationStep] = &[MigrationStep {
+    target_version: 2,
+    sql: MIGRATION_002_SQL,
+}];
 
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationStep {
@@ -180,7 +186,7 @@ pub fn inspect_and_migrate(
         db_path,
         default_workspace_name,
         APP_MAX_SCHEMA_VERSION,
-        &[],
+        BUILTIN_MIGRATIONS,
     )
 }
 
@@ -230,7 +236,9 @@ pub fn apply_migrations_with_steps(
 
     let current_version = if file_version == 0 { 1 } else { file_version };
     if current_version < max_supported_version {
-        if let Some(path) = db_path {
+        if file_version > 0
+            && let Some(path) = db_path
+        {
             create_pre_migration_backup(path, current_version)?;
         }
 
@@ -407,12 +415,16 @@ pub fn seed_sample_project(conn: &mut Connection) -> Result<ProjectId, DomainErr
 }
 
 fn insert_item_row(tx: &rusqlite::Transaction<'_>, item: &crate::domain::Item) -> Result<(), DomainError> {
+    let (link_url, link_label) = match &item.link {
+        Some(link) => (Some(link.url.as_str()), Some(link.label.as_str())),
+        None => (None, None),
+    };
     tx.execute(
         "INSERT INTO items (
             id, project_id, item_number, item_key, kind, parent_feature_id,
             title, description, status, priority, assignee_id, sort_order,
-            deleted_at, trash_root_id, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);",
+            deleted_at, trash_root_id, created_at, updated_at, link_url, link_label
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
         params![
             uuid_to_sql(item.id.0),
             uuid_to_sql(item.project_id.0),
@@ -430,6 +442,8 @@ fn insert_item_row(tx: &rusqlite::Transaction<'_>, item: &crate::domain::Item) -
             item.trash_root_id.map(|id| uuid_to_sql(id.0)),
             ts_to_sql(item.created_at),
             ts_to_sql(item.updated_at),
+            link_url,
+            link_label,
         ],
     )
     .map_err(map_sqlite_err)?;

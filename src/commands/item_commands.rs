@@ -25,8 +25,8 @@ use crate::db::project_repo::get_project;
 use crate::db::tag_repo::set_item_tags;
 use crate::db::{map_sqlite_err, ts_to_sql, uuid_to_sql};
 use crate::domain::{
-    AssigneeId, DomainError, DomainEvent, FeatureWorkItem, Item, ItemId, ItemKind, ItemStatus,
-    MAX_FEATURE_DEPTH, Priority, ProjectId, TagId,
+    AssigneeId, DomainError, DomainEvent, FeatureWorkItem, Item, ItemId, ItemKind, ItemLink,
+    ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId, TagId,
 };
 
 #[derive(Debug, Clone)]
@@ -48,6 +48,7 @@ pub struct CreateFeature {
     pub status: ItemStatus,
     pub priority: Priority,
     pub assignee_id: Option<AssigneeId>,
+    pub link: Option<ItemLink>,
     pub tag_ids: Vec<TagId>,
     created_id: Option<ItemId>,
     snapshot: Option<CreateFeatureSnapshot>,
@@ -70,6 +71,7 @@ impl CreateFeature {
             status,
             priority,
             assignee_id: None,
+            link: None,
             tag_ids: Vec::new(),
             created_id: None,
             snapshot: None,
@@ -78,6 +80,11 @@ impl CreateFeature {
 
     pub fn with_assignee(mut self, assignee_id: Option<AssigneeId>) -> Self {
         self.assignee_id = assignee_id;
+        self
+    }
+
+    pub fn with_link(mut self, link: Option<ItemLink>) -> Self {
+        self.link = link;
         self
     }
 
@@ -148,12 +155,13 @@ impl UndoableCommand for CreateFeature {
                     priority: self.priority,
                 },
             )?;
-            if self.assignee_id.is_some() {
+            if self.assignee_id.is_some() || self.link.is_some() {
                 item = update_item_fields(
                     tx,
                     UpdateItemFieldsInput {
                         item_id: item.id,
-                        assignee_id: Some(self.assignee_id),
+                        assignee_id: self.assignee_id.map(Some),
+                        link: self.link.clone().map(Some),
                         ..Default::default()
                     },
                 )?;
@@ -245,6 +253,7 @@ pub struct CreateWorkItem {
     pub priority: Priority,
     pub feature_ids: Vec<ItemId>,
     pub assignee_id: Option<AssigneeId>,
+    pub link: Option<ItemLink>,
     pub tag_ids: Vec<TagId>,
     created_id: Option<ItemId>,
     snapshot: Option<CreateWorkItemSnapshot>,
@@ -267,6 +276,7 @@ impl CreateWorkItem {
             priority,
             feature_ids,
             assignee_id: None,
+            link: None,
             tag_ids: Vec::new(),
             created_id: None,
             snapshot: None,
@@ -275,6 +285,11 @@ impl CreateWorkItem {
 
     pub fn with_assignee(mut self, assignee_id: Option<AssigneeId>) -> Self {
         self.assignee_id = assignee_id;
+        self
+    }
+
+    pub fn with_link(mut self, link: Option<ItemLink>) -> Self {
+        self.link = link;
         self
     }
 
@@ -345,12 +360,13 @@ impl UndoableCommand for CreateWorkItem {
                     feature_ids: self.feature_ids.clone(),
                 },
             )?;
-            if self.assignee_id.is_some() {
+            if self.assignee_id.is_some() || self.link.is_some() {
                 item = update_item_fields(
                     tx,
                     UpdateItemFieldsInput {
                         item_id: item.id,
-                        assignee_id: Some(self.assignee_id),
+                        assignee_id: self.assignee_id.map(Some),
+                        link: self.link.clone().map(Some),
                         ..Default::default()
                     },
                 )?;
@@ -437,12 +453,14 @@ struct UpdateItemFieldsSnapshot {
     prior_status: ItemStatus,
     prior_priority: Priority,
     prior_assignee_id: Option<AssigneeId>,
+    prior_link: Option<ItemLink>,
     prior_updated_at: DateTime<Utc>,
     forward_title: String,
     forward_description: String,
     forward_status: ItemStatus,
     forward_priority: Priority,
     forward_assignee_id: Option<AssigneeId>,
+    forward_link: Option<ItemLink>,
     forward_updated_at: DateTime<Utc>,
 }
 
@@ -454,6 +472,7 @@ pub struct UpdateItemFields {
     pub status: Option<ItemStatus>,
     pub priority: Option<Priority>,
     pub assignee_id: Option<Option<AssigneeId>>,
+    pub link: Option<Option<ItemLink>>,
     snapshot: Option<UpdateItemFieldsSnapshot>,
 }
 
@@ -466,6 +485,7 @@ impl UpdateItemFields {
             status: None,
             priority: None,
             assignee_id: None,
+            link: None,
             snapshot: None,
         }
     }
@@ -492,6 +512,11 @@ impl UpdateItemFields {
 
     pub fn with_assignee_id(mut self, assignee_id: Option<AssigneeId>) -> Self {
         self.assignee_id = Some(assignee_id);
+        self
+    }
+
+    pub fn with_link(mut self, link: Option<ItemLink>) -> Self {
+        self.link = Some(link);
         self
     }
 }
@@ -542,6 +567,10 @@ impl UndoableCommand for UpdateItemFields {
                     "Cannot edit an item in Trash".to_string(),
                 ));
             }
+            let (link_url, link_label) = match &snap.forward_link {
+                Some(l) => (Some(l.url.as_str()), Some(l.label.as_str())),
+                None => (None, None),
+            };
             tx.execute(
                 "UPDATE items
                  SET title = ?1,
@@ -549,14 +578,18 @@ impl UndoableCommand for UpdateItemFields {
                      status = ?3,
                      priority = ?4,
                      assignee_id = ?5,
-                     updated_at = ?6
-                 WHERE id = ?7;",
+                     link_url = ?6,
+                     link_label = ?7,
+                     updated_at = ?8
+                 WHERE id = ?9;",
                 params![
                     &snap.forward_title,
                     &snap.forward_description,
                     snap.forward_status.as_str(),
                     snap.forward_priority.as_str(),
                     snap.forward_assignee_id.map(|id| uuid_to_sql(id.0)),
+                    link_url,
+                    link_label,
                     ts_to_sql(snap.forward_updated_at),
                     uuid_to_sql(self.item_id.0),
                 ],
@@ -583,6 +616,7 @@ impl UndoableCommand for UpdateItemFields {
                     status: self.status,
                     priority: self.priority,
                     assignee_id: self.assignee_id,
+                    link: self.link.clone(),
                 },
             )?;
             let warning_toast = compute_in_progress_warning_toast(
@@ -601,12 +635,14 @@ impl UndoableCommand for UpdateItemFields {
                 prior_status: prior.status,
                 prior_priority: prior.priority,
                 prior_assignee_id: prior.assignee_id,
+                prior_link: prior.link,
                 prior_updated_at: prior.updated_at,
                 forward_title: item.title,
                 forward_description: item.description,
                 forward_status: item.status,
                 forward_priority: item.priority,
                 forward_assignee_id: item.assignee_id,
+                forward_link: item.link,
                 forward_updated_at: item.updated_at,
             });
             (item.project_id, warning_toast)
@@ -623,6 +659,10 @@ impl UndoableCommand for UpdateItemFields {
         let snap = self.snapshot.as_ref().ok_or_else(|| {
             DomainError::Validation("UpdateItemFields has not been executed".to_string())
         })?;
+        let (link_url, link_label) = match &snap.prior_link {
+            Some(l) => (Some(l.url.as_str()), Some(l.label.as_str())),
+            None => (None, None),
+        };
         tx.execute(
             "UPDATE items
              SET title = ?1,
@@ -630,14 +670,18 @@ impl UndoableCommand for UpdateItemFields {
                  status = ?3,
                  priority = ?4,
                  assignee_id = ?5,
-                 updated_at = ?6
-             WHERE id = ?7;",
+                 link_url = ?6,
+                 link_label = ?7,
+                 updated_at = ?8
+             WHERE id = ?9;",
             params![
                 &snap.prior_title,
                 &snap.prior_description,
                 snap.prior_status.as_str(),
                 snap.prior_priority.as_str(),
                 snap.prior_assignee_id.map(|id| uuid_to_sql(id.0)),
+                link_url,
+                link_label,
                 ts_to_sql(snap.prior_updated_at),
                 uuid_to_sql(self.item_id.0),
             ],

@@ -83,7 +83,7 @@ impl QuickSearchModalView {
 
         let query_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search items by key (PRO-12), title, description, or command…")
+                .placeholder("Search items by key (PRO-12), title, description, link, or command…")
         });
 
         let input_sub = cx.subscribe_in(
@@ -281,6 +281,7 @@ impl QuickSearchModalView {
                 title: item.title.clone(),
                 status: item.status,
                 priority: item.priority,
+                link: item.link.clone(),
                 rank: 0.0,
             })
             .collect()
@@ -461,6 +462,15 @@ impl QuickSearchModalView {
                             .font_medium()
                             .child(item.title.clone()),
                     )
+                    .when_some(item.link.clone(), |this, link| {
+                        this.child(
+                            Tag::secondary()
+                                .xsmall()
+                                .gap_1()
+                                .child(Icon::new(IconName::ExternalLink).xsmall())
+                                .child(link.label),
+                        )
+                    })
                     .child(kind_badge(item.kind, cx))
                     .when(item.priority != Priority::None, |this| {
                         this.child(priority_badge(item.priority, cx))
