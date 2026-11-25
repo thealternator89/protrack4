@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use chrono::{DateTime, Local, Utc};
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::list::ListItem;
@@ -27,9 +29,9 @@ use crate::commands::{
     SetWorkItemFeatures, TrashItemSubtree, UndoableCommand, UpdateItemFields,
 };
 use crate::domain::{
-    Assignee, AssigneeId, ConversionEligibility, Item, ItemId, ItemKind, ItemLink, ItemStatus,
-    MAX_FEATURE_DEPTH, Priority, ProjectId, ProjectSnapshot, TagId, clamped_depth_badge,
-    suggest_link_label, validate_item_link, visual_indent_px,
+    Assignee, AssigneeId, ConversionEligibility, EffectiveBlockState, Item, ItemId, ItemKind,
+    ItemLink, ItemStatus, MAX_FEATURE_DEPTH, Priority, ProjectId, ProjectSnapshot, TagId,
+    clamped_depth_badge, suggest_link_label, validate_item_link, visual_indent_px,
 };
 use crate::state::{AppState, ProjectStore};
 use crate::ui::modals::{open_create_feature_modal, open_tags_manager_modal};
@@ -43,6 +45,31 @@ use crate::ui::{
 pub enum DescriptionMode {
     Edit,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectorSectionTab {
+    Attributes,
+    Hierarchy,
+    Dependencies,
+}
+
+impl InspectorSectionTab {
+    fn index(self) -> usize {
+        match self {
+            Self::Attributes => 0,
+            Self::Hierarchy => 1,
+            Self::Dependencies => 2,
+        }
+    }
+
+    fn from_index(ix: usize) -> Self {
+        match ix {
+            0 => Self::Attributes,
+            1 => Self::Hierarchy,
+            _ => Self::Dependencies,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +202,7 @@ pub struct InspectorView {
     tag_search_input: Entity<InputState>,
     blocker_popover_open: bool,
     blocker_search_input: Entity<InputState>,
+    active_section_tab: InspectorSectionTab,
     description_mode: DescriptionMode,
     preview_revision: u64,
     dirty_title: bool,
@@ -629,6 +657,7 @@ impl InspectorView {
             tag_search_input,
             blocker_popover_open: false,
             blocker_search_input,
+            active_section_tab: InspectorSectionTab::Attributes,
             description_mode: DescriptionMode::Preview,
             preview_revision: 0,
             dirty_title: false,
@@ -652,6 +681,25 @@ impl InspectorView {
                 link_label_sub,
             ],
         }
+    }
+
+    pub fn active_section_tab(&self) -> InspectorSectionTab {
+        self.active_section_tab
+    }
+
+    pub fn set_active_section_tab(
+        &mut self,
+        tab: InspectorSectionTab,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_section_tab == tab {
+            return;
+        }
+        self.attach_popover_open = false;
+        self.tag_popover_open = false;
+        self.blocker_popover_open = false;
+        self.active_section_tab = tab;
+        cx.notify();
     }
 
     pub fn description_mode(&self) -> DescriptionMode {
@@ -1206,6 +1254,26 @@ impl InspectorView {
             .detach();
     }
 
+    fn render_block_state_header_badge(
+        snapshot: &ProjectSnapshot,
+        item_id: ItemId,
+        cx: &App,
+    ) -> gpui_kit::AnyElement {
+        let block_state = snapshot.effective_block_state(item_id);
+        let primary_blocker_key = snapshot.primary_active_direct_blocker_key(item_id);
+        block_state_badge(block_state, primary_blocker_key, cx).unwrap_or_else(|| {
+            let ok = cx.theme().success;
+            Tag::custom(
+                ok.opacity(if cx.theme().is_dark() { 0.16 } else { 0.10 }),
+                ok,
+                ok.opacity(if cx.theme().is_dark() { 0.34 } else { 0.22 }),
+            )
+            .xsmall()
+            .child("Ready")
+            .into_any_element()
+        })
+    }
+
     fn render_dependencies_section(
         &self,
         snapshot: &ProjectSnapshot,
@@ -1213,8 +1281,6 @@ impl InspectorView {
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let item_id = item.id;
-        let block_state = snapshot.effective_block_state(item_id);
-        let primary_blocker_key = snapshot.primary_active_direct_blocker_key(item_id);
         let direct_blockers = snapshot.direct_blockers(item_id);
         let inherited_blockers = snapshot.inherited_blockers(item_id);
         let warnings = snapshot.blocker_warnings(item_id);
@@ -1229,45 +1295,8 @@ impl InspectorView {
         let inspector_for_change = inspector_entity.clone();
         let inspector_for_content = inspector_entity.clone();
 
-        let status_header_badge = block_state_badge(block_state, primary_blocker_key, cx)
-            .unwrap_or_else(|| {
-                let ok = cx.theme().success;
-                Tag::custom(
-                    ok.opacity(if cx.theme().is_dark() { 0.16 } else { 0.10 }),
-                    ok,
-                    ok.opacity(if cx.theme().is_dark() { 0.34 } else { 0.22 }),
-                )
-                .xsmall()
-                .child("Ready")
-                .into_any_element()
-            });
-
         v_flex()
             .gap_2p5()
-            .p_3()
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().muted.opacity(0.45))
-            .border_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .font_semibold()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("DEPENDENCIES"),
-                    )
-                    .child(
-                        div()
-                            .id("inspector-block-state-badge")
-                            .test_support()
-                            .child(status_header_badge),
-                    ),
-            )
             // Blocker warnings (Cancelled / InTrash)
             .when(!warnings.is_empty(), |this| {
                 this.child(
@@ -2011,10 +2040,29 @@ impl Render for InspectorView {
                     let inspector_for_convert = cx.entity();
                     let inspector_for_trash = cx.entity();
 
-                    let created = item.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
-                    let updated = item.updated_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                    let created = format_local_timestamp(item.created_at);
+                    let updated = format_local_timestamp(item.updated_at);
 
-                    let relation_section = match item.kind {
+                    let attached_len = if item.kind == ItemKind::WorkItem {
+                        snapshot.features_for_work_item(item.id).len()
+                    } else {
+                        0
+                    };
+                    let direct_blocker_count = snapshot.direct_blockers(item.id).len();
+                    let inherited_blocker_count = snapshot.inherited_blockers(item.id).len();
+                    let warning_count = snapshot.blocker_warnings(item.id).len();
+                    let dep_badge_count =
+                        direct_blocker_count + inherited_blocker_count + warning_count;
+                    let has_block_or_warning =
+                        snapshot.effective_block_state(item.id) != EffectiveBlockState::Unblocked
+                            || warning_count > 0;
+                    let status_header_badge =
+                        Self::render_block_state_header_badge(&snapshot, item.id, cx);
+
+                    let relation_section = if self.active_section_tab
+                        == InspectorSectionTab::Hierarchy
+                    {
+                        Some(match item.kind {
                         ItemKind::Feature => {
                             let path = snapshot.feature_path(item.id);
                             let ancestors: Vec<_> =
@@ -2053,30 +2101,6 @@ impl Render for InspectorView {
 
                             v_flex()
                                 .gap_2p5()
-                                .p_3()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().muted.opacity(0.45))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .font_semibold()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("HIERARCHY & PROGRESS"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .font_family(cx.theme().mono_font_family.clone())
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!("Depth {}/{}", depth + 1, MAX_FEATURE_DEPTH)),
-                                        ),
-                                )
                                 .child(
                                     h_flex()
                                         .gap_2()
@@ -2225,10 +2249,23 @@ impl Render for InspectorView {
                                         )
                                         .child(
                                             div()
+                                                .flex_1()
+                                                .min_w_0()
                                                 .text_xs()
                                                 .text_color(cx.theme().foreground)
                                                 .child(format!(
                                                     "{child_features} sub-feature(s) · {attached_wis} work item(s)"
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!(
+                                                    "Depth {}/{}",
+                                                    depth + 1,
+                                                    MAX_FEATURE_DEPTH
                                                 )),
                                         ),
                                 )
@@ -2336,18 +2373,6 @@ impl Render for InspectorView {
 
                             v_flex()
                                 .gap_2()
-                                .p_3()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().muted.opacity(0.45))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .font_semibold()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("ATTACHED FEATURES ({attached_len})")),
-                                )
                                 .child(if attached.is_empty() {
                                     h_flex()
                                         .gap_1p5()
@@ -2744,6 +2769,9 @@ impl Render for InspectorView {
                                         }),
                                 )
                         }
+                        })
+                    } else {
+                        None
                     };
 
                     let live_description = if self.dirty_description {
@@ -2757,18 +2785,23 @@ impl Render for InspectorView {
                     };
 
                     v_flex()
-                        .id("inspector-viewport")
-                        .test_support()
                         .flex_1()
                         .min_h_0()
                         .overflow_hidden()
                         .child(
-                            v_flex()
-                                .size_full()
-                                .p_3()
-                                .gap_3()
-                                .overflow_y_scrollbar()
-                                .id("inspector-scroll")
+                            div()
+                                .id("inspector-viewport")
+                                .test_support()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(
+                                    v_flex()
+                                        .size_full()
+                                        .p_3()
+                                        .gap_3()
+                                        .overflow_y_scrollbar()
+                                        .id("inspector-scroll")
                         // Identity + disabled Convert action + Editable Title
                         .child(
                             v_flex()
@@ -2780,8 +2813,11 @@ impl Render for InspectorView {
                                         .gap_2()
                                         .child(
                                             h_flex()
-                                                .gap_2()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1p5()
                                                 .items_center()
+                                                .flex_wrap()
                                                 .child(
                                                     div()
                                                         .px_2()
@@ -2795,37 +2831,52 @@ impl Render for InspectorView {
                                                         )
                                                         .child(item.item_key.clone()),
                                                 )
-                                                .child(kind_badge(item.kind, cx)),
+                                                .child(kind_badge(item.kind, cx))
+                                                .child(
+                                                    div()
+                                                        .id("inspector-block-state-badge")
+                                                        .test_support()
+                                                        .cursor_pointer()
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_active_section_tab(
+                                                                InspectorSectionTab::Dependencies,
+                                                                cx,
+                                                            );
+                                                        }))
+                                                        .child(status_header_badge),
+                                                ),
                                         )
                                         .child(
-                                            Button::new("inspector-convert-btn")
-                                                .outline()
-                                                .xsmall()
-                                                .icon(IconName::Replace)
-                                                .label(convert_label)
-                                                .disabled(!convert_allowed)
-                                                .tooltip(convert_tooltip)
-                                                .on_click(move |_, window, cx| {
-                                                    let cmd: Box<dyn UndoableCommand> =
-                                                        match convert_kind {
-                                                            ItemKind::WorkItem => Box::new(
-                                                                ConvertWorkItemToFeature::new(
-                                                                    item_id,
+                                            div().flex_shrink_0().child(
+                                                Button::new("inspector-convert-btn")
+                                                    .outline()
+                                                    .xsmall()
+                                                    .icon(IconName::Replace)
+                                                    .label(convert_label)
+                                                    .disabled(!convert_allowed)
+                                                    .tooltip(convert_tooltip)
+                                                    .on_click(move |_, window, cx| {
+                                                        let cmd: Box<dyn UndoableCommand> =
+                                                            match convert_kind {
+                                                                ItemKind::WorkItem => Box::new(
+                                                                    ConvertWorkItemToFeature::new(
+                                                                        item_id,
+                                                                    ),
                                                                 ),
-                                                            ),
-                                                            ItemKind::Feature => Box::new(
-                                                                ConvertFeatureToWorkItem::new(
-                                                                    item_id,
+                                                                ItemKind::Feature => Box::new(
+                                                                    ConvertFeatureToWorkItem::new(
+                                                                        item_id,
+                                                                    ),
                                                                 ),
-                                                            ),
-                                                        };
-                                                    inspector_for_convert.update(cx, |this, cx| {
-                                                        this.flush_dirty_current(cx);
-                                                        this.dispatch_feature_membership_command(
-                                                            cmd, window, cx,
-                                                        );
-                                                    });
-                                                }),
+                                                            };
+                                                        inspector_for_convert.update(cx, |this, cx| {
+                                                            this.flush_dirty_current(cx);
+                                                            this.dispatch_feature_membership_command(
+                                                                cmd, window, cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            ),
                                         ),
                                 )
                                 .child(
@@ -2847,15 +2898,73 @@ impl Render for InspectorView {
                                         }),
                                 ),
                         )
-                        // Metadata rows (Editable Status & Priority; Assignee/Tags in Phase 5)
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .p_2p5()
-                                .rounded(cx.theme().radius)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .child(
+                        // Combined tabbed panel: Attributes | Hierarchy / Features | Dependencies
+                        .child({
+                            let mut hierarchy_tab = Tab::new().label(if item.kind == ItemKind::Feature {
+                                "Hierarchy"
+                            } else {
+                                "Features"
+                            });
+                            if item.kind == ItemKind::WorkItem && attached_len > 0 {
+                                hierarchy_tab = hierarchy_tab.suffix(
+                                    div()
+                                        .ml_1p5()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(px(999.))
+                                        .bg(cx.theme().muted)
+                                        .text_size(px(10.))
+                                        .font_semibold()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(attached_len.to_string()),
+                                );
+                            }
+
+                            let mut deps_tab = Tab::new().label("Dependencies");
+                            if dep_badge_count > 0 {
+                                let badge_color = if has_block_or_warning {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().muted_foreground
+                                };
+                                let badge_bg = if has_block_or_warning {
+                                    badge_color.opacity(if cx.theme().is_dark() { 0.22 } else { 0.12 })
+                                } else {
+                                    cx.theme().muted
+                                };
+                                deps_tab = deps_tab.suffix(
+                                    div()
+                                        .ml_1p5()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(px(999.))
+                                        .bg(badge_bg)
+                                        .text_size(px(10.))
+                                        .font_semibold()
+                                        .text_color(badge_color)
+                                        .child(dep_badge_count.to_string()),
+                                );
+                            }
+
+                            let tab_bar = TabBar::new("inspector-section-tabs")
+                                .segmented()
+                                .small()
+                                .w_full()
+                                .selected_index(self.active_section_tab.index())
+                                .child(Tab::new().label("Attributes"))
+                                .child(hierarchy_tab)
+                                .child(deps_tab)
+                                .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                                    this.set_active_section_tab(
+                                        InspectorSectionTab::from_index(*ix),
+                                        cx,
+                                    );
+                                }));
+
+                            let tab_body = match self.active_section_tab {
+                                InspectorSectionTab::Attributes => v_flex()
+                                    .gap_2()
+                                    .child(
                                     h_flex()
                                         .gap_2()
                                         .items_center()
@@ -3456,11 +3565,32 @@ impl Render for InspectorView {
                                                 }),
                                         )
                                 })
-                        )
-                        // Hierarchy or Attached Features
-                        .child(relation_section)
-                        // Dependencies (Blockers, Inherited, Dependents)
-                        .child(self.render_dependencies_section(&snapshot, &item, cx))
+                                .into_any_element(),
+                                InspectorSectionTab::Hierarchy => relation_section
+                                    .map(|el| el.into_any_element())
+                                    .unwrap_or_else(|| div().into_any_element()),
+                                InspectorSectionTab::Dependencies => {
+                                    self.render_dependencies_section(&snapshot, &item, cx)
+                                }
+                            };
+
+                            v_flex()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().muted.opacity(0.25))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1p5()
+                                        .border_b_1()
+                                        .border_color(cx.theme().border)
+                                        .bg(cx.theme().muted.opacity(0.4))
+                                        .child(tab_bar),
+                                )
+                                .child(div().p_2p5().child(tab_body))
+                        })
                         // Description (Edit | Preview)
                         .child(
                             v_flex()
@@ -3546,13 +3676,18 @@ impl Render for InspectorView {
                                         .into_any_element(),
                                 }),
                         )
-                        // Timestamps & Move to Trash footer
+                                )
+                        )
+                        // Docked Timestamps & Move to Trash footer
                         .child(
                             h_flex()
-                                .pt_2()
+                                .flex_shrink_0()
+                                .px_3()
+                                .py_2()
                                 .gap_2()
                                 .items_center()
                                 .justify_between()
+                                .bg(cx.theme().background)
                                 .border_t_1()
                                 .border_color(cx.theme().border)
                                 .child(
@@ -3592,7 +3727,6 @@ impl Render for InspectorView {
                                         }),
                                 ),
                         )
-                        )
                         .into_any_element()
                 }
             })
@@ -3617,4 +3751,26 @@ fn empty_inspector_message(message: &'static str, cx: &App) -> impl IntoElement 
                 .text_color(cx.theme().muted_foreground)
                 .child(message),
         )
+}
+
+fn format_local_timestamp(dt: DateTime<Utc>) -> String {
+    dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_timestamp_in_local_time_without_tz_suffix() {
+        let dt = DateTime::parse_from_rfc3339("2026-11-25T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let formatted = format_local_timestamp(dt);
+        assert_eq!(
+            formatted,
+            dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
+        );
+        assert!(!formatted.contains("UTC"));
+    }
 }

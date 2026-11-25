@@ -16,7 +16,7 @@ use protrack4::domain::{
 };
 use protrack4::state::{AppState, CenterViewTab, LaunchConfig, ThemePreference};
 use protrack4::ui::WorkspaceShell;
-use protrack4::ui::inspector::DescriptionMode;
+use protrack4::ui::inspector::{DescriptionMode, InspectorSectionTab};
 use protrack4::workspace::{WorkspaceManager, lock_path_for, shm_path_for, wal_path_for};
 use tempfile::TempDir;
 
@@ -991,6 +991,12 @@ async fn phase4_work_items_multi_feature_and_unallocated_triage(cx: &mut TestApp
         store.update(cx, |s, cx| {
             s.select_item(Some(wi1_id));
             cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("inspector-block-state-badge").is_some());
+        let inspector = shell.read(cx).inspector().clone();
+        inspector.update(cx, |view, cx| {
+            view.set_active_section_tab(InspectorSectionTab::Hierarchy, cx);
         });
         window.render_frame(cx);
         assert!(window.try_find(("inspector-detach-feature", f1_num)).is_some());
@@ -2167,6 +2173,17 @@ async fn phase7_features_only_blocking_engine_and_transitive_propagation(cx: &mu
             cx.notify();
         });
         window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).inspector().read(cx).active_section_tab(),
+            InspectorSectionTab::Attributes
+        );
+        assert!(window.try_find("inspector-block-state-badge").is_some());
+        window.click("inspector-block-state-badge", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).inspector().read(cx).active_section_tab(),
+            InspectorSectionTab::Dependencies
+        );
         window.click("inspector-add-blocker-btn", cx);
         window.render_frame(cx);
         window.render_frame(cx);
@@ -3237,6 +3254,7 @@ async fn phase10_full_cascade_trash_restore_and_permanent_purge(cx: &mut TestApp
             cx.notify();
         });
         window.render_frame(cx);
+        assert!(window.try_find("inspector-trash-btn").is_some());
         window.scroll(
             "inspector-viewport",
             ScrollDelta::Pixels(point(px(0.), px(-600.))),
