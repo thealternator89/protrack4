@@ -876,8 +876,8 @@ impl Render for WorkspaceShell {
 
         let status_label = if is_loading {
             "Opening workspace…".to_string()
-        } else if let Some(meta) = self.store.read(cx).workspace_meta() {
-            format!("SQLite · Schema v{}", meta.schema_version)
+        } else if self.store.read(cx).workspace_meta().is_some() {
+            format!("v{}", env!("CARGO_PKG_VERSION"))
         } else {
             "No Workspace Open".to_string()
         };
